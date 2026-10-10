@@ -51,8 +51,10 @@ pub(super) fn write_vtu(path: &Path, model: &Model, solution: &Solution) -> std:
     s.push_str("        <DataArray type=\"Int64\" Name=\"types\" format=\"ascii\">\n          ");
     for e in elements {
         let vtk_type = match e.kind {
-            ElemKind::Cps3 => 5, // VTK_TRIANGLE
-            ElemKind::Cps4 => 9, // VTK_QUAD
+            ElemKind::Cps3 => 5,  // VTK_TRIANGLE
+            ElemKind::Cps4 => 9,  // VTK_QUAD
+            ElemKind::C3d8 => 12, // VTK_HEXAHEDRON
+            ElemKind::C3d4 => 10, // VTK_TETRA
         };
         s.push_str(&format!("{vtk_type} "));
     }

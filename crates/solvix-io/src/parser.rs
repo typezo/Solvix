@@ -103,6 +103,8 @@ pub(super) fn parse_inp(text: &str) -> Result<(Model, ParseReport), ParseError> 
                 let kind = match ty.as_deref() {
                     Some("CPS4") => Some(ElemKind::Cps4),
                     Some("CPS3") => Some(ElemKind::Cps3),
+                    Some("C3D8") => Some(ElemKind::C3d8),
+                    Some("C3D4") => Some(ElemKind::C3d4),
                     _ => None,
                 };
                 let Some(kind) = kind else {
@@ -111,7 +113,7 @@ pub(super) fn parse_inp(text: &str) -> Result<(Model, ParseReport), ParseError> 
                         |t| format!("element TYPE={t}"),
                     );
                     report.warnings.push(format!(
-                        "line {}: unsupported {what} — block skipped (v0.1 supports CPS4/CPS3)",
+                        "line {}: unsupported {what} — block skipped (supported: CPS4/CPS3/C3D8/C3D4)",
                         kw.line
                     ));
                     j += 1;

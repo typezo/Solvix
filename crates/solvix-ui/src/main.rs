@@ -246,6 +246,8 @@ fn kind_name(k: ElemKind) -> &'static str {
     match k {
         ElemKind::Cps3 => "cps3",
         ElemKind::Cps4 => "cps4",
+        ElemKind::C3d8 => "c3d8",
+        ElemKind::C3d4 => "c3d4",
     }
 }
 

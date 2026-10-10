@@ -9,24 +9,87 @@ permissions:
   contents: write
 
 jobs:
-  release:
-    runs-on: ubuntu-latest
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-pc-windows-gnu
+            os: ubuntu-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
+        with:
+          target: ${{ matrix.target }}
 
-      - name: Build release binary
-        run: cargo build --release
+      - name: Install MinGW toolchain
+        if: matrix.target == 'x86_64-pc-windows-gnu'
+        run: sudo apt-get update && sudo apt-get install -y mingw-w64
 
-      - name: Package Linux binary
-        run: tar -czf solvix-linux-amd64.tar.gz -C target/release solvix
+      - name: Build release binaries
+        run: cargo build --release --locked --target ${{ matrix.target }} --workspace
+
+      # Linux deliberately uses the target-specific archive name, replacing the
+      # older generic solvix-linux-amd64.tar.gz asset name.
+      - name: Smoke test Linux build
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          ./target/x86_64-unknown-linux-gnu/release/solvix --help
+          cargo run -q -p solvix-cli -- bench
+
+      - name: Package target archive
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          extension=""
+          if [ "$target" = "x86_64-pc-windows-gnu" ]; then
+            extension=".exe"
+          fi
+          staging="package/$target"
+          mkdir -p "$staging"
+          cp "target/$target/release/solvix$extension" "$staging/"
+          cp "target/$target/release/solvix-ui$extension" "$staging/"
+          tar -czf "solvix-$target.tar.gz" -C "$staging" .
+
+      - name: Upload target archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: solvix-${{ matrix.target }}
+          path: solvix-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download target archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: solvix-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum solvix-*.tar.gz > SHA256SUMS.txt
+          cat SHA256SUMS.txt
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: solvix-linux-amd64.tar.gz
+          files: |
+            dist/solvix-*.tar.gz
+            dist/SHA256SUMS.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

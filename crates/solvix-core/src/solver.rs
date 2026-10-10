@@ -10,8 +10,12 @@ pub(crate) struct ConstrainedDof {
     pub(crate) dof: usize,
 }
 
-/// Expand boundary conditions to constrained dof rows.
-pub(crate) fn constrained_dofs(model: &Model) -> Result<Vec<ConstrainedDof>, SolveError> {
+/// Expand boundary conditions to constrained dof rows. `ndof` is the
+/// model's dof count per node (2 or 3).
+pub(crate) fn constrained_dofs(
+    model: &Model,
+    ndof: usize,
+) -> Result<Vec<ConstrainedDof>, SolveError> {
     let mut out = Vec::new();
     for bc in &model.boundary_conditions {
         for &nid in &bc.node_ids {
@@ -19,13 +23,13 @@ pub(crate) fn constrained_dofs(model: &Model) -> Result<Vec<ConstrainedDof>, Sol
                 SolveError::InvalidModel(format!("boundary condition on unknown node {nid}"))
             })?;
             for &dof in &bc.dofs {
-                if dof != 1 && dof != 2 {
+                if dof == 0 || dof > ndof {
                     return Err(SolveError::InvalidModel(format!(
                         "boundary condition on node {nid} has unsupported dof {dof}"
                     )));
                 }
                 out.push(ConstrainedDof {
-                    row: idx * 2 + dof - 1,
+                    row: idx * ndof + dof - 1,
                     node_id: nid,
                     dof,
                 });
