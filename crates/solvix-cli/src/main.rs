@@ -16,6 +16,7 @@ use solvix_core::{ElemKind, Model, Solution, SolveError};
 use solvix_io::ParseReport;
 
 mod bench;
+mod mcp;
 
 const USAGE: &str = "\
 solvix 0.1.0 — the agent-era FEA CLI
@@ -26,6 +27,7 @@ Usage:
   solvix run <job.inp> [-o outdir] [--json]   parse, solve, write <jobname>.vtu
   solvix info <job.inp> [--json]              parse-only model report, never solves
   solvix bench [--json]                       built-in verification suite (all-pass exit 0, else 3)
+  solvix mcp                                  MCP server on stdio (JSON-RPC 2.0, one object per line)
   solvix help | --help | -h                   show this text
 
 Exit codes: 0 ok · 1 usage/IO · 2 parse error · 3 solve error.
@@ -74,6 +76,7 @@ enum Command {
     Bench {
         json: bool,
     },
+    Mcp,
     Help,
 }
 
@@ -133,6 +136,12 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                 }
             }
             Ok(Command::Bench { json })
+        }
+        "mcp" => {
+            if let Some(extra) = it.next() {
+                return Err(format!("unexpected argument for mcp: {extra}"));
+            }
+            Ok(Command::Mcp)
         }
         other => Err(format!("unknown subcommand: {other}")),
     }
@@ -516,6 +525,7 @@ fn cli(args: &[String]) -> i32 {
         Command::Info { inp, json } => finish(do_info(&inp, json), json),
         Command::Run { inp, outdir, json } => finish(do_run(&inp, &outdir, json), json),
         Command::Bench { json } => bench::run(json),
+        Command::Mcp => mcp::serve(),
     }
 }
 
