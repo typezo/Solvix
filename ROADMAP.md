@@ -49,12 +49,12 @@ CPS3/CPS4 plane stress · `.inp` subset parser · VTU out · `solvix run/info --
 - [ ] Orthotropic + thermal expansion material models (#22)
 
 ### v0.4.0 — Multiphysics I: heat
-- [ ] Steady-state conduction (DC1/heat quads+hexes), flux/conv BCs (#30)
-- [ ] Thermal stress coupling (sequential)
+- [x] Steady-state conduction (scalar quads/hexes/tets), flux BCs (#27)
+- [x] Thermal stress coupling (sequential, E*a*dT exact to 5e-11) (#27)
 
 ### v0.4.x — Multiphysics II: time
-- [ ] Transient dynamics: Newmark implicit, Rayleigh damping
-- [ ] Thermal transient
+- [x] Transient dynamics: Newmark implicit, Rayleigh damping (#28)
+- [ ] Thermal transient (v0.5 candidate)
 
 ### v0.5.0 — Nonlinearity
 - [ ] Geometric: Updated Lagrangian + Newton–Raphson (#27)
