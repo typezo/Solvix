@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="430" viewBox="0 0 820 430" role="img" aria-labelledby="ktitle kdesc">
+<title id="ktitle">Kirsch maximum von Mises comparison</title>
+<desc id="kdesc">The bundled plate-hole model reports a maximum centroid von Mises stress of 1.479 MPa. The dashed Kirsch reference for a 1 MPa nominal far-field stress is 3.0 MPa.</desc>
+<defs><style>.grid{stroke:#d9e2ec;stroke-width:1}.axis{stroke:#334e68;stroke-width:1.5}.tick{fill:#486581;font:13px system-ui,sans-serif}.label{fill:#102a43;font:700:15px system-ui,sans-serif}.bar{fill:#176b87}.ref{fill:none;stroke:#c81d25;stroke-width:2.5;stroke-dasharray:8 7}.value{fill:#102a43;font:700:15px system-ui,sans-serif}.note{fill:#52606d;font:13px system-ui,sans-serif}</style></defs>
+<rect width="820" height="430" fill="white"/>
+<text x="410" y="32" text-anchor="middle" class="label">Plate with a hole: maximum von Mises stress</text>
+<line x1="115" y1="365.0" x2="760" y2="365.0" class="grid"/>
+<text x="103" y="369.0" text-anchor="end" class="tick">0</text>
+<line x1="115" y1="277.1" x2="760" y2="277.1" class="grid"/>
+<text x="103" y="281.1" text-anchor="end" class="tick">1</text>
+<line x1="115" y1="189.2" x2="760" y2="189.2" class="grid"/>
+<text x="103" y="193.2" text-anchor="end" class="tick">2</text>
+<line x1="115" y1="101.4" x2="760" y2="101.4" class="grid"/>
+<text x="103" y="105.4" text-anchor="end" class="tick">3</text>
+<rect x="352.5" y="235.0" width="170" height="130.0" class="bar"/>
+<text x="437.5" y="223.0" text-anchor="middle" class="value">1.479</text>
+<line x1="115" y1="101.4" x2="760" y2="101.4" class="ref"/>
+<text x="760" y="91.4" text-anchor="end" class="tick" fill="#c81d25">Kirsch 3.0</text>
+<line x1="115" y1="75" x2="115" y2="365" class="axis"/>
+<line x1="115" y1="365" x2="760" y2="365" class="axis"/>
+<text x="437.5" y="396" text-anchor="middle" class="tick">Solvix 64-element quarter model</text>
+<text x="437.5" y="430" text-anchor="middle" class="label">Maximum element-centroid von Mises (MPa)</text>
+<text x="115" y="406" class="note">The red dashed line is the elastic stress-concentration reference.</text>
+</svg>

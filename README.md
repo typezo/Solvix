@@ -103,7 +103,34 @@ v0.2 development is tracked on the
 - Eigenvalue/modal analysis
 - An MCP server so agents can call Solvix through a standard tool interface
 
-## Benchmark (QA #4 will fill)
+## Benchmark
+
+The bundled cantilever benchmark uses fixed-free CPS4 plane-stress meshes,
+a 1,000 N downward tip load, and the project's 15.238 mm Euler-Bernoulli
+reference. The coarse bilinear quads converge from below because of parasitic
+shear locking; the refined 160×8 mesh is within 1% of the reference.
+
+| Mesh (CPS4) | Active DOFs | Iterations | `solve_ms` | `max_disp_mm` | Error vs. 15.238 mm |
+|------------:|------------:|-----------:|-----------:|--------------:|--------------------:|
+| 10×4 | 100 | 201 | 16 | 5.985 | −60.72% |
+| 20×4 | 200 | 315 | 47 | 10.953 | −28.12% |
+| 40×4 | 400 | 390 | 119 | 13.832 | −9.23% |
+| 80×8 | 1,440 | 838 | 911 | 14.877 | −2.37% |
+| 160×8 | 2,880 | 943 | 2,040 | 15.147 | −0.60% |
+
+![Cantilever convergence plot](docs/benchmarks/cantilever-convergence.svg)
+
+The exact JSON run for the bundled 40×4 deck was:
+
+```console
+$ cargo run -q -p solvix-cli -- run examples/cantilever.inp --json
+{"ok":true,"job":"cantilever","nodes":205,"elements":160,"iterations":390,"residual":6.933e-11,"solve_ms":119,"max_disp_mm":13.832,"max_von_mises_mpa":79.483,"outputs":["./cantilever.vtu"]}
+```
+
+See [docs/benchmarks/cantilever.md](docs/benchmarks/cantilever.md) for the mesh
+generation and locking discussion, and
+[docs/benchmarks/kirsch.md](docs/benchmarks/kirsch.md) for the plate-with-a-hole
+stress benchmark.
 
 ## License
 

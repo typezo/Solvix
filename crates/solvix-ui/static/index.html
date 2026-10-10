@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>Solvix CAE</title>
+    <link rel="stylesheet" href="style.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="top-bar">
+        <div class="brand-bar">
+          <div class="brand">
+            <span class="brand-mark" aria-hidden="true">S</span>
+            <span><strong>Solvix</strong> <span class="brand-sub">CAE</span></span>
+          </div>
+          <nav class="module-bar" aria-label="CAE modules">
+            <button type="button" class="module-button is-active" data-module="model">Model</button>
+            <button type="button" class="module-button" data-module="mesh">Mesh</button>
+            <button type="button" class="module-button" data-module="job">Job</button>
+            <button type="button" class="module-button" data-module="results">Results</button>
+          </nav>
+          <div class="data-source" id="data-source" title="Active model/result source">standby</div>
+        </div>
+
+        <form class="job-bar" id="job-form" autocomplete="off">
+          <label class="field-label" for="deck-path">Deck</label>
+          <input
+            id="deck-path"
+            class="text-input deck-input"
+            name="path"
+            type="text"
+            spellcheck="false"
+            value="examples/cantilever.inp"
+            aria-describedby="job-bar-help"
+          >
+          <button class="button primary" type="submit" id="run-button">Run</button>
+          <span class="job-select-wrap" id="job-select-wrap">
+            <label class="field-label" for="job-select">Job</label>
+            <select id="job-select" class="select-input" aria-label="Active job"></select>
+          </span>
+          <button
+            type="button"
+            class="button ghost copy-button"
+            data-copy="job"
+            title="Copy the job panel JSON"
+          >Copy JSON</button>
+        </form>
+      </header>
+
+      <div class="workspace">
+        <aside class="panel model-tree-panel" aria-label="Model database tree">
+          <div class="panel-header">
+            <h2>Model DB</h2>
+            <button type="button" class="icon-button copy-button" data-copy="model" title="Copy complete model JSON">Copy JSON</button>
+          </div>
+
+          <div class="tree-scroll">
+            <details class="tree-group" open>
+              <summary>
+                <span class="tree-name">Nodes</span>
+                <span class="tree-count" id="node-count">0</span>
+                <button type="button" class="mini-copy copy-button" data-copy="tree.nodes">JSON</button>
+              </summary>
+              <ul class="option-list">
+                <li>
+                  <label><input type="checkbox" id="show-node-dots"> <span>Node symbols</span></label>
+                </li>
+                <li>
+                  <label><input type="checkbox" id="show-node-ids"> <span>Node numbers</span></label>
+                </li>
+              </ul>
+            </details>
+
+            <details class="tree-group" open>
+              <summary>
+                <span class="tree-name">Elements</span>
+                <span class="tree-count" id="element-count">0</span>
+                <button type="button" class="mini-copy copy-button" data-copy="tree.elements">JSON</button>
+              </summary>
+              <ul class="option-list">
+                <li>
+                  <label><input type="checkbox" id="show-element-ids"> <span>Element IDs</span></label>
+                </li>
+                <li id="element-types" class="muted-line">No elements</li>
+              </ul>
+            </details>
+
+            <details class="tree-group" open>
+              <summary>
+                <span class="tree-name">Sets</span>
+                <span class="tree-count" id="set-count">0</span>
+                <button type="button" class="mini-copy copy-button" data-copy="tree.sets">JSON</button>
+              </summary>
+              <ul class="option-list">
+                <li>
+                  <label><input type="checkbox" id="highlight-sets"> <span>Highlight selected sets</span></label>
+                </li>
+              </ul>
+              <div id="set-list" class="set-list"></div>
+            </details>
+
+            <details class="tree-group" open>
+              <summary>
+                <span class="tree-name">Materials</span>
+                <span class="tree-count" id="material-count">0</span>
+                <button type="button" class="mini-copy copy-button" data-copy="tree.materials">JSON</button>
+              </summary>
+              <ul class="plain-list" id="material-list"></ul>
+            </details>
+
+            <details class="tree-group" open>
+              <summary>
+                <span class="tree-name">BCs</span>
+                <span class="tree-count" id="bc-count">0</span>
+                <button type="button" class="mini-copy copy-button" data-copy="tree.bcs">JSON</button>
+              </summary>
+              <ul class="option-list">
+                <li>
+                  <label><input type="checkbox" id="show-bcs" checked> <span>Fixed DOF glyphs (orange squares)</span></label>
+                </li>
+              </ul>
+              <ul class="plain-list" id="bc-list"></ul>
+            </details>
+
+            <details class="tree-group" open>
+              <summary>
+                <span class="tree-name">Loads</span>
+                <span class="tree-count" id="load-count">0</span>
+                <button type="button" class="mini-copy copy-button" data-copy="tree.loads">JSON</button>
+              </summary>
+              <ul class="option-list">
+                <li>
+                  <label><input type="checkbox" id="show-loads" checked> <span>CLOAD glyphs (red arrows)</span></label>
+                </li>
+              </ul>
+              <ul class="plain-list" id="load-list"></ul>
+            </details>
+
+            <details class="tree-group" open>
+              <summary>
+                <span class="tree-name">Result overlays</span>
+                <span class="tree-count">1</span>
+                <button type="button" class="mini-copy copy-button" data-copy="results">JSON</button>
+              </summary>
+              <ul class="option-list">
+                <li>
+                  <label><input type="checkbox" id="show-undeformed-overlay" checked> <span>Undeformed wireframe</span></label>
+                </li>
+              </ul>
+            </details>
+
+            <details class="tree-group">
+              <summary>
+                <span class="tree-name">Steps</span>
+                <span class="tree-count" id="step-count">0</span>
+                <button type="button" class="mini-copy copy-button" data-copy="tree.steps">JSON</button>
+              </summary>
+              <ul class="plain-list" id="step-list"></ul>
+            </details>
+
+            <details class="tree-group" open>
+              <summary>
+                <span class="tree-name">Jobs</span>
+                <span class="tree-count" id="job-tree-count">1</span>
+                <button type="button" class="mini-copy copy-button" data-copy="tree.jobs">JSON</button>
+              </summary>
+              <ul class="plain-list" id="job-list"></ul>
+            </details>
+          </div>
+        </aside>
+
+        <main class="panel viewport-panel" aria-label="Viewport">
+          <div class="panel-header viewport-header">
+            <div class="viewport-title">
+              <h2>Viewport</h2>
+              <span id="viewport-mode-label" class="mode-label">Undeformed</span>
+            </div>
+            <div class="viewport-actions">
+              <button type="button" class="button" id="fit-button" title="Fit model to viewport">Fit</button>
+              <button type="button" class="button toggle" id="wireframe-button" aria-pressed="true">Wireframe</button>
+              <button type="button" class="button toggle" id="contour-u-button" aria-pressed="false" title="Contour displacement magnitude">Contour |U|</button>
+              <button type="button" class="button toggle" id="contour-vm-button" aria-pressed="false" title="Contour element von Mises">Contour VM</button>
+              <button type="button" class="button toggle" id="undeformed-overlay-button" aria-pressed="true">Undeformed</button>
+              <label class="deform-control" for="deform-slider">
+                <span>Deform</span>
+                <input id="deform-slider" type="range" min="0" max="20" step="0.1" value="5">
+                <output id="deform-output" for="deform-slider">5.0% bbox</output>
+              </label>
+              <button type="button" class="button ghost copy-button" data-copy="viewport" title="Copy viewport state JSON">Copy JSON</button>
+              <button type="button" class="button ghost copy-button" data-copy="results" title="Copy active result JSON">Copy result</button>
+            </div>
+          </div>
+
+          <div class="canvas-frame">
+            <canvas id="viewport" role="img" aria-label="Finite element model viewport"></canvas>
+            <div class="result-chips" id="result-chips">
+              <span class="chip">No result</span>
+            </div>
+          </div>
+        </main>
+      </div>
+
+      <section class="panel console-panel" aria-label="Message console and command REPL">
+        <div class="panel-header console-header">
+          <div>
+            <h2>Messages / Console</h2>
+            <span class="muted-line">JSON responses · agent-ready REPL</span>
+          </div>
+          <div class="console-actions">
+            <button type="button" class="button command-hint" data-command="run examples/cantilever.inp">run examples/cantilever.inp</button>
+            <button type="button" class="button command-hint" data-command="model cantilever">model cantilever</button>
+            <button type="button" class="button command-hint" data-command="results cantilever">results cantilever</button>
+            <button type="button" class="button command-hint" data-command="agent">agent</button>
+            <button type="button" class="button ghost copy-button" data-copy="console" title="Copy the complete JSON console transcript">Copy JSON</button>
+          </div>
+        </div>
+        <div id="console-output" class="console-output" aria-live="polite" aria-relevant="additions"></div>
+        <form id="console-form" class="console-form" autocomplete="off">
+          <label class="prompt" for="command-input">&gt;</label>
+          <input
+            id="command-input"
+            class="console-input"
+            type="text"
+            spellcheck="false"
+            placeholder="run examples/cantilever.inp · model cantilever · results cantilever · agent · help"
+            aria-describedby="command-hint"
+          >
+          <button class="button primary" type="submit">Execute</button>
+        </form>
+        <div id="command-hint" class="command-suggestion">Tab completes a command · ↑/↓ recalls history</div>
+      </section>
+
+      <footer class="status-bar">
+        <span id="status-job">job: —</span>
+        <span id="status-mesh">nodes: 0 · elements: 0</span>
+        <span>units: m · Pa</span>
+        <span id="status-cursor">x: — y: —</span>
+        <span id="status-zoom">zoom: —</span>
+        <span id="status-message" class="status-message">Ready</span>
+      </footer>
+    </div>
+
+    <script src="app.js" defer></script>
+  </body>
+</html>
