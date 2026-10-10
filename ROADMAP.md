@@ -21,21 +21,21 @@ CPS3/CPS4 plane stress · `.inp` subset parser · VTU out · `solvix run/info --
 (13.832→14.877 mm converging to 15.238 Euler–Bernoulli; exit codes 0/1/2/3).
 
 ### v0.1.x — Harden the flagship
-- [ ] README/UI screenshots + UI integration smoke in CI (#16)
-- [ ] `solvix bench` built-in verification suite (#17)
-- [ ] Cross-platform release binaries: linux/windows/macos (#33)
+- [x] README/UI screenshots + UI integration smoke in CI (#16)
+- [x] `solvix bench` built-in verification suite (#17)
+- [x] Cross-platform release binaries: linux/windows/macos (#33)
 - [ ] `solvix --version`, job naming polish, VTU binary format option
 
 ### v0.2.0 — Into 3D
-- [ ] C3D8 hex + C3D4 tet, 3 dof/node (#6)
-- [ ] 3D BCs/loads, VTU volume cells, patch + cube benchmarks
-- [ ] Direct sparse LDLT solver fallback + condition estimate (#18)
-- [ ] UI 3D viewport: software renderer, rotate/pan/zoom (#20)
+- [x] C3D8 hex + C3D4 tet, 3 dof/node (#6)
+- [x] 3D BCs/loads, VTU volume cells, patch + cube benchmarks
+- [x] Direct sparse LDLT solver fallback + condition estimate (#18)
+- [x] UI 3D viewport: software renderer, rotate/pan/zoom (#20)
 
 ### v0.2.x — Real Abaqus decks
 - [ ] `*DLOAD` edge pressure, gravity, `*NSET/*ELSET` hardening, multi-step (#9)
 - [ ] Gmsh `.msh` import (#19)
-- [ ] MCP server crate: tools run/info/model/results/bench (#8)
+- [x] MCP server crate: tools run/info/model/results/bench (#8)
 - [ ] Keyword coverage matrix auto-published to docs (#32)
 
 ### v0.3.0 — Dynamics of structures
