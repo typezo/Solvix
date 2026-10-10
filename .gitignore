@@ -1,0 +1,6 @@
+/target
+Cargo.lock.bak
+*.vtu
+*.png
+!docs/**/*.png
+.DS_Store

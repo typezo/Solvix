@@ -1,0 +1,15 @@
+[package]
+name = "solvix-cli"
+description = "Command-line interface for Solvix"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "solvix"
+path = "src/main.rs"
+
+[dependencies]
+solvix-core = { path = "../solvix-core" }
+solvix-io = { path = "../solvix-io" }

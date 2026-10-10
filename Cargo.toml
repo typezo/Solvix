@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/solvix-core",
+    "crates/solvix-io",
+    "crates/solvix-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/typezo/Solvix"
+description = "Solvix — the agent-era, open-source finite element solver (Abaqus-compatible)"
+
+[profile.release]
+lto = true
+codegen-units = 1

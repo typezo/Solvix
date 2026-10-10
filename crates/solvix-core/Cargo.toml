@@ -1,0 +1,9 @@
+[package]
+name = "solvix-core"
+description = "FEM kernel: elements, assembly, linear solver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

@@ -1,0 +1,26 @@
+** Test: cantilever beam, plane stress, SI units (m, Pa, N)
+** L=2.0 m, h=0.1 m, thickness 0.01 m, tip load 1000 N total.
+*HEADING
+    cantilever benchmark
+*NODE
+1, 0.0, 0.0
+2, 0.0, 0.05
+3, 0.0, 0.1
+** ... generated mesh in examples/cantilever.inp (full deck)
+*ELEMENT, TYPE=CPS4, ELSET=ALL
+1, 1, 2, 5, 4
+*NSET, NSET=FIX
+1, 2, 3
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210.0E9, 0.3
+*SOLID SECTION, ELSET=ALL, MATERIAL=STEEL
+0.01
+*STEP
+*STATIC
+*BOUNDARY
+FIX, 1, 2
+*CLOAD
+101, 2, -500.0
+102, 2, -500.0
+*END STEP
