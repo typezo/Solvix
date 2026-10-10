@@ -257,3 +257,31 @@ Agents should use the JSON payload as the manifest:
 | Singularity or constraint failure | Exit `3` | Whether rigid-body motion is constrained |
 | No convergence | Exit `3` | Mesh quality, material positivity, and load/boundary data |
 | JSON parse fails on stdout | Contract failure | Check whether another program wrote to stdout or `--json` was omitted |
+
+## Driving Solvix via MCP (v0.2)
+
+`solvix mcp` speaks Model Context Protocol over stdio (newline-delimited
+JSON-RPC 2.0). Register it with any MCP client:
+
+```json
+{
+  "mcpServers": {
+    "solvix": { "command": "/path/to/solvix", "args": ["mcp"] }
+  }
+}
+```
+
+Tools exposed: `solvix_info` (deck stats), `solvix_run` (solve + summary),
+`solvix_results` (displacements mm + von Mises MPa arrays), `solvix_bench`
+(verification suite — exit-equivalent green means the binary self-checks).
+
+Example raw session:
+
+```console
+$ echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"solvix_run","arguments":{"path":"examples/cantilever3d.inp"}}}' | solvix mcp
+{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"ok\":true,...\"max_disp_mm\":13.719...}"}],"isError":false}}
+```
+
+Agent pattern: `solvix_info` first (cheap), then `solvix_run`, then
+`solvix_results` only if you need arrays. `solvix_bench` after install or
+upgrade to verify the binary on your machine.
