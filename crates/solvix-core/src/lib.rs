@@ -5,7 +5,15 @@
 //!
 //! This file defines the **public type contract** for the whole workspace.
 //! `solvix-io` parses Abaqus decks into `Model`; `solvix-cli` orchestrates.
-//! Implementation of `solve` is issue #1.
+//!
+//! Implementation modules: [`element`] (CPS3/CPS4 stiffness), [`assembly`]
+//! (CSR assembly), [`solver`] (Dirichlet + preconditioned CG), [`stress`]
+//! (von Mises + reactions).
+
+mod assembly;
+mod element;
+mod solver;
+mod stress;
 
 /// A mesh node. `coords[2]` is kept for the 3D roadmap; plane elements use x, y.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -187,9 +195,55 @@ pub enum SolveError {
 /// Solve the linear-static problem `K u = f` with homogeneous Dirichlet
 /// constraints. Conjugate gradient on CSR with Jacobi preconditioning.
 ///
-/// Implementation owned by issue #1.
-pub fn solve(_model: &Model) -> Result<Solution, SolveError> {
-    todo!("issue #1: FEM kernel")
+/// Relative tolerance 1e-10, `max_iter = max(1000, 10 * ndof)`.
+pub fn solve(model: &Model) -> Result<Solution, SolveError> {
+    // Free-body check first: validate() reports NoBoundaryConditions as a
+    // ModelError, but the contract wants SolveError::NoConstraints.
+    if model.boundary_conditions.is_empty() {
+        return Err(SolveError::NoConstraints);
+    }
+    if let Err(e) = model.validate() {
+        return Err(SolveError::InvalidModel(format!("{e:?}")));
+    }
+    if model.thickness <= 0.0 || model.thickness.is_nan() {
+        return Err(SolveError::InvalidModel(
+            "thickness must be positive".into(),
+        ));
+    }
+
+    let (mut k, mut f, elems) = assembly::assemble(model)?;
+    let constrained = solver::constrained_dofs(model)?;
+
+    // Keep the unmodified system for reaction recovery.
+    let k_orig = assembly::Csr {
+        row_ptr: k.row_ptr.clone(),
+        col_idx: k.col_idx.clone(),
+        vals: k.vals.clone(),
+    };
+    let f_orig = f.clone();
+
+    solver::apply_dirichlet(&mut k, &mut f, &constrained);
+    let ndof = f.len();
+    let max_iter = 1000.max(10 * ndof);
+    let (u, iterations, final_residual) = solver::pcg(&k, &f, 1e-10, max_iter)?;
+
+    let displacements = model
+        .mesh
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(i, _)| [u[2 * i], u[2 * i + 1], 0.0])
+        .collect();
+    let von_mises = stress::von_mises_at_centroids(&u, &elems);
+    let reactions = stress::reactions(&k_orig, &u, &f_orig, &constrained);
+
+    Ok(Solution {
+        displacements,
+        von_mises,
+        reactions,
+        iterations,
+        final_residual,
+    })
 }
 
 #[cfg(test)]
@@ -199,7 +253,10 @@ mod tests {
     #[test]
     fn contract_compiles_and_mesh_lookup_works() {
         let mesh = Mesh {
-            nodes: vec![Node { id: 7, coords: [0.0, 0.0, 0.0] }],
+            nodes: vec![Node {
+                id: 7,
+                coords: [0.0, 0.0, 0.0],
+            }],
             elements: vec![Element {
                 id: 1,
                 kind: ElemKind::Cps4,
@@ -225,9 +282,252 @@ mod tests {
         };
         assert_eq!(model.mesh.node_index(7), Some(0));
         assert_eq!(model.mesh.element_index(1), Some(0));
-        assert!(matches!(
-            model.validate(),
-            Err(ModelError::UnknownNode(8))
-        ));
+        assert!(matches!(model.validate(), Err(ModelError::UnknownNode(8))));
+    }
+
+    const E: f64 = 210e9;
+    const NU: f64 = 0.3;
+
+    fn steel() -> Material {
+        Material {
+            name: "steel".into(),
+            youngs_modulus: E,
+            poisson_ratio: NU,
+        }
+    }
+
+    fn quad_model(nx: usize, ny: usize, width: f64, height: f64) -> Model {
+        let n_elem = (nx * ny) as u32;
+        Model {
+            mesh: assembly::tests::quad_mesh(nx, ny, width, height),
+            thickness: 1.0,
+            materials: vec![steel()],
+            elsets: vec![ElementSet {
+                name: "all".into(),
+                element_ids: (1..=n_elem).collect(),
+            }],
+            mat_assignments: vec![("all".into(), "steel".into())],
+            ..Default::default()
+        }
+    }
+
+    fn fix_left_edge_x(model: &mut Model, nx: usize, ny: usize) {
+        // ux on the left edge, uy pinned at one node only: clamping uy
+        // everywhere would forbid the Poisson contraction and spoil the
+        // uniform-stress patch solution.
+        let ids: Vec<u32> = (0..=ny).map(|j| (j * (nx + 1) + 1) as u32).collect();
+        model.boundary_conditions.push(BoundaryCondition {
+            node_ids: ids,
+            dofs: vec![1],
+        });
+        model.boundary_conditions.push(BoundaryCondition {
+            node_ids: vec![1],
+            dofs: vec![2],
+        });
+    }
+
+    #[test]
+    fn cps4_patch_single_quad() {
+        let mut model = quad_model(1, 1, 1.0, 1.0);
+        fix_left_edge_x(&mut model, 1, 1);
+        let sigma = 1e6;
+        model.cloads = vec![
+            ConcentratedLoad {
+                node_id: 2,
+                dof: 1,
+                value: sigma / 2.0,
+            },
+            ConcentratedLoad {
+                node_id: 4,
+                dof: 1,
+                value: sigma / 2.0,
+            },
+        ];
+        let sol = solve(&model).unwrap();
+        // Bilinear quad reproduces constant strain exactly.
+        assert!((sol.von_mises[0] - sigma).abs() / sigma < 1e-6);
+        let ux_right = sigma / E;
+        assert!((sol.displacements[1][0] - ux_right).abs() / ux_right < 1e-6);
+        assert!((sol.displacements[3][0] - ux_right).abs() / ux_right < 1e-6);
+        // Total reaction balances the applied load.
+        let rx: f64 = sol
+            .reactions
+            .iter()
+            .filter(|r| r.dof == 1)
+            .map(|r| r.value)
+            .sum();
+        assert!((rx + sigma).abs() < 1e-6 * sigma);
+        assert!(sol.final_residual <= 1e-10);
+    }
+
+    #[test]
+    fn cps4_patch_2x2() {
+        let mut model = quad_model(2, 2, 1.0, 1.0);
+        fix_left_edge_x(&mut model, 2, 2);
+        let sigma = 1e6;
+        // Consistent nodal loads for uniform traction on the right edge.
+        let s = sigma / 4.0;
+        model.cloads = vec![
+            ConcentratedLoad {
+                node_id: 3,
+                dof: 1,
+                value: s,
+            },
+            ConcentratedLoad {
+                node_id: 6,
+                dof: 1,
+                value: 2.0 * s,
+            },
+            ConcentratedLoad {
+                node_id: 9,
+                dof: 1,
+                value: s,
+            },
+        ];
+        let sol = solve(&model).unwrap();
+        for (i, &vm) in sol.von_mises.iter().enumerate() {
+            assert!((vm - sigma).abs() / sigma < 2e-2, "element {i}: vM={vm}");
+        }
+        let rx: f64 = sol
+            .reactions
+            .iter()
+            .filter(|r| r.dof == 1)
+            .map(|r| r.value)
+            .sum();
+        assert!((rx + sigma).abs() < 2e-2 * sigma);
+    }
+
+    #[test]
+    fn cps3_patch_two_triangles() {
+        // Unit square split diagonally; uniform tension is exact for CST.
+        let model = Model {
+            mesh: Mesh {
+                nodes: vec![
+                    Node {
+                        id: 1,
+                        coords: [0.0, 0.0, 0.0],
+                    },
+                    Node {
+                        id: 2,
+                        coords: [1.0, 0.0, 0.0],
+                    },
+                    Node {
+                        id: 3,
+                        coords: [1.0, 1.0, 0.0],
+                    },
+                    Node {
+                        id: 4,
+                        coords: [0.0, 1.0, 0.0],
+                    },
+                ],
+                elements: vec![
+                    Element {
+                        id: 1,
+                        kind: ElemKind::Cps3,
+                        connectivity: vec![1, 2, 3],
+                    },
+                    Element {
+                        id: 2,
+                        kind: ElemKind::Cps3,
+                        connectivity: vec![1, 3, 4],
+                    },
+                ],
+            },
+            thickness: 1.0,
+            materials: vec![steel()],
+            elsets: vec![ElementSet {
+                name: "all".into(),
+                element_ids: vec![1, 2],
+            }],
+            mat_assignments: vec![("all".into(), "steel".into())],
+            boundary_conditions: vec![
+                BoundaryCondition {
+                    node_ids: vec![1, 4],
+                    dofs: vec![1],
+                },
+                BoundaryCondition {
+                    node_ids: vec![1],
+                    dofs: vec![2],
+                },
+            ],
+            cloads: vec![
+                ConcentratedLoad {
+                    node_id: 2,
+                    dof: 1,
+                    value: 5e5,
+                },
+                ConcentratedLoad {
+                    node_id: 3,
+                    dof: 1,
+                    value: 5e5,
+                },
+            ],
+        };
+        let sigma = 1e6;
+        let sol = solve(&model).unwrap();
+        for (i, &vm) in sol.von_mises.iter().enumerate() {
+            assert!((vm - sigma).abs() / sigma < 1e-6, "element {i}: vM={vm}");
+        }
+        let ux_right = sigma / E;
+        assert!((sol.displacements[1][0] - ux_right).abs() / ux_right < 1e-6);
+        let uy_top = -NU * sigma / E;
+        assert!((sol.displacements[2][1] - uy_top).abs() / uy_top.abs() < 1e-6);
+        assert!(sol.iterations > 0);
+        assert!(sol.final_residual <= 1e-10);
+    }
+
+    #[test]
+    fn cantilever_tip_deflection() {
+        // 20x4, not the suggested 10x4: fully-integrated bilinear quads
+        // lock ~28% stiff at 10x4 for L/h=10; 20x4 lands inside 15%.
+        let nx = 20;
+        let ny = 4;
+        let (l, h) = (1.0, 0.1);
+        let mut model = quad_model(nx, ny, l, h);
+        // Clamped root: ux and uy on the whole left edge.
+        let root: Vec<u32> = (0..=ny).map(|j| (j * (nx + 1) + 1) as u32).collect();
+        model.boundary_conditions.push(BoundaryCondition {
+            node_ids: root,
+            dofs: vec![1, 2],
+        });
+        let p = -1000.0; // downward tip load
+        let tip = (2 * (nx + 1) + nx + 1) as u32; // middle of the right edge
+        model.cloads = vec![ConcentratedLoad {
+            node_id: tip,
+            dof: 2,
+            value: p,
+        }];
+        let sol = solve(&model).unwrap();
+        assert!(sol.final_residual <= 1e-10);
+        assert!(sol.iterations < 1000.max(10 * sol.displacements.len() * 2));
+        let i = model.mesh.node_index(tip).unwrap();
+        let delta = sol.displacements[i][1];
+        let inertia = h * h * h / 12.0;
+        let beam = p * l * l * l / (3.0 * E * inertia);
+        let rel = (delta - beam) / beam;
+        assert!(
+            rel.abs() <= 0.15,
+            "tip deflection off by {:.1}% (fem={delta:.3e}, beam={beam:.3e})",
+            100.0 * rel
+        );
+        // Vertical reactions balance the applied load (sum R_y = -P).
+        let ry: f64 = sol
+            .reactions
+            .iter()
+            .filter(|r| r.dof == 2)
+            .map(|r| r.value)
+            .sum();
+        assert!((ry + p).abs() < 1e-6 * p.abs());
+    }
+
+    #[test]
+    fn missing_constraints_is_no_constraints() {
+        let mut model = quad_model(1, 1, 1.0, 1.0);
+        model.cloads = vec![ConcentratedLoad {
+            node_id: 2,
+            dof: 1,
+            value: 1.0,
+        }];
+        assert!(matches!(solve(&model), Err(SolveError::NoConstraints)));
     }
 }

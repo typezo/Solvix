@@ -4,6 +4,9 @@
 //!
 //! Implementation owned by issue #2 (parser) — this file fixes the interface.
 
+mod parser;
+mod vtu;
+
 use solvix_core::{Model, Solution};
 
 /// Non-fatal notes collected while parsing (skipped keywords, defaults used).
@@ -20,20 +23,16 @@ pub struct ParseError {
 }
 
 /// Parse an Abaqus input deck (v0.1 keyword subset, see issue #2).
-///
-/// Implementation owned by issue #2.
-pub fn parse_inp(_text: &str) -> Result<(Model, ParseReport), ParseError> {
-    todo!("issue #2: .inp parser")
+pub fn parse_inp(text: &str) -> Result<(Model, ParseReport), ParseError> {
+    parser::parse_inp(text)
 }
 
 /// Write nodal displacements and element von Mises stress as an
 /// ASCII inline-XML VTK UnstructuredGrid `.vtu` file (ParaView-ready).
-///
-/// Implementation owned by issue #2.
 pub fn write_vtu(
-    _path: &std::path::Path,
-    _model: &Model,
-    _solution: &Solution,
+    path: &std::path::Path,
+    model: &Model,
+    solution: &Solution,
 ) -> std::io::Result<()> {
-    todo!("issue #2: VTU writer")
+    vtu::write_vtu(path, model, solution)
 }

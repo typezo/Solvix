@@ -1,0 +1,28 @@
+** Intentionally malformed node coordinate for parser failure testing.
+** The only malformed numeric field is x.y on line 7; the rest is valid.
+*HEADING
+    broken deck: malformed node coordinate
+*NODE
+1, 0.000000, 0.000000
+2, x.y, 0.000000
+3, 1.000000, 1.000000
+4, 0.000000, 1.000000
+*ELEMENT, TYPE=CPS4, ELSET=ALL
+1, 1, 2, 3, 4
+*NSET, NSET=FIX
+1, 4
+*NSET, NSET=TIP
+2, 3
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210e9, 0.3
+*SOLID SECTION, ELSET=ALL, MATERIAL=STEEL
+0.01
+*STEP
+*STATIC
+*BOUNDARY
+FIX, 1, 2
+*CLOAD
+2, 2, -50.0
+3, 2, -50.0
+*END STEP
