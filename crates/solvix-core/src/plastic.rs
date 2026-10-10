@@ -493,6 +493,7 @@ fn stress_solution(
                 value: ev.f_int[c.row] - f_ext[c.row],
             })
             .collect(),
+        contact_forces: Vec::new(),
         iterations,
         final_residual: residual,
         solver_method: "newton-j2".to_string(),

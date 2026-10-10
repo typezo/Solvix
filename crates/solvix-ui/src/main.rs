@@ -938,6 +938,7 @@ fn api_run(state: &AppState, body: &[u8]) -> Response {
             iterations: dyn_sol.iterations_total,
             final_residual: 0.0,
             solver_method: "newmark".into(),
+            contact_forces: Vec::new(),
             cond_estimate: 0.0,
         };
         (final_sol, None, Some(info))

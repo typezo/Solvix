@@ -2,8 +2,9 @@
 //! with multi-step, `*DLOAD` and `*DENSITY` (issue #26), the thermal
 //! keywords `*CONDUCTIVITY`, `*EXPANSION`, `*TEMPERATURE`, `*DFLUX`
 //! (issue #27), transient dynamics `*DYNAMIC` + `*DAMPING` (#28),
-//! `*STEP, NLGEOM=YES` geometric nonlinearity (#29), and `*PLASTIC`
-//! J2 linear hardening (#30).
+//! `*STEP, NLGEOM=YES` geometric nonlinearity (#29), `*PLASTIC`
+//! J2 linear hardening (#30), and `*SURFACE`/`*CONTACT PAIR` contact
+//! definitions (#31 — NODE surfaces only, frictionless).
 //!
 //! Line model: `**…` comments and blank lines are dropped up front; every
 //! remaining line is either a keyword line (`*NAME, KEY=VALUE, …`, parsed
@@ -27,8 +28,8 @@ use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 use solvix_core::{
-    BoundaryCondition, ConcentratedLoad, DistributedLoad, DynamicsSpec, ElemKind, Element,
-    ElementSet, HeatFlux, Material, Model, Node, PlasticitySpec, Step, TempBc,
+    BoundaryCondition, ConcentratedLoad, ContactPair, DistributedLoad, DynamicsSpec, ElemKind,
+    Element, ElementSet, HeatFlux, Material, Model, Node, PlasticitySpec, Step, TempBc,
 };
 
 use super::{ParseError, ParseReport};
@@ -91,6 +92,8 @@ pub(super) fn parse_inp(text: &str) -> Result<(Model, ParseReport), ParseError> 
     };
     let mut report = ParseReport::default();
     let mut nsets: HashMap<String, Vec<u32>> = HashMap::new();
+    // *SURFACE (TYPE=NODE) node lists (issue #31).
+    let mut surfaces: HashMap<String, Vec<u32>> = HashMap::new();
     let mut node_ids: HashSet<u32> = HashSet::new();
     let mut elem_ids: HashSet<u32> = HashSet::new();
     let mut pending_material: Option<String> = None;
@@ -632,6 +635,107 @@ pub(super) fn parse_inp(text: &str) -> Result<(Model, ParseReport), ParseError> 
                             j += 1;
                         }
                     }
+                }
+            }
+
+            "surface" => {
+                // v0.5 (issue #31): NODE surfaces only — each data field
+                // is a node set name or a bare node id; the union builds
+                // the surface's node list. Element-edge surfaces are not
+                // supported (warned and skipped).
+                let skip = |report: &mut ParseReport, kw: &KwLine, why: &str| {
+                    report.warnings.push(format!(
+                        "line {}: *SURFACE {} — block skipped",
+                        kw.line, why
+                    ));
+                };
+                if !kw.params.contains_key("name") {
+                    skip(&mut report, kw, "without NAME");
+                    j += 1;
+                    while matches!(items.get(j), Some(Item::Data { .. })) {
+                        j += 1;
+                    }
+                    continue;
+                }
+                if let Some(ty) = kw.params.get("type") {
+                    if !ty.eq_ignore_ascii_case("node") {
+                        skip(
+                            &mut report,
+                            kw,
+                            &format!("TYPE={ty} unsupported (v0.5: TYPE=NODE node lists only)"),
+                        );
+                        j += 1;
+                        while matches!(items.get(j), Some(Item::Data { .. })) {
+                            j += 1;
+                        }
+                        continue;
+                    }
+                }
+                let name = kw.params.get("name").unwrap().to_uppercase();
+                j += 1;
+                while let Some(Item::Data { line: dno, text }) = items.get(j) {
+                    let f = fields(text);
+                    if f.is_empty() {
+                        return err(
+                            *dno,
+                            "*SURFACE expects node set names or node ids".to_string(),
+                        );
+                    }
+                    for field in f {
+                        let ids = resolve_nodes(&nsets, field, *dno)?;
+                        surfaces.entry(name.clone()).or_default().extend(ids);
+                    }
+                    j += 1;
+                }
+            }
+
+            "surface interaction" => {
+                report.warnings.push(format!(
+                    "line {}: *SURFACE INTERACTION unsupported (v0.5: frictionless contact only) — block skipped",
+                    kw.line
+                ));
+                j += 1;
+                while matches!(items.get(j), Some(Item::Data { .. })) {
+                    j += 1;
+                }
+            }
+
+            "friction" => {
+                report.warnings.push(format!(
+                    "line {}: *FRICTION unsupported (v0.5: frictionless contact only) — block skipped",
+                    kw.line
+                ));
+                j += 1;
+                while matches!(items.get(j), Some(Item::Data { .. })) {
+                    j += 1;
+                }
+            }
+
+            "contact pair" => {
+                // Data: 'slave_surface, master_surface'. Pairs live at
+                // model level and are active in all steps (v1).
+                if let Some(i) = kw.params.get("interaction") {
+                    report.warnings.push(format!(
+                        "line {}: *CONTACT PAIR INTERACTION='{i}' ignored (v0.5: frictionless)",
+                        kw.line
+                    ));
+                }
+                j += 1;
+                while let Some(Item::Data { line: dno, text }) = items.get(j) {
+                    let f = fields(text);
+                    if f.len() != 2 {
+                        return err(
+                            *dno,
+                            format!(
+                                "*CONTACT PAIR expects slave, master; got {} field(s)",
+                                f.len()
+                            ),
+                        );
+                    }
+                    let slave = resolve_surface(&surfaces, &nsets, f[0], *dno)?;
+                    let master = resolve_surface(&surfaces, &nsets, f[1], *dno)?;
+                    model.contact_pairs.push(ContactPair { slave, master });
+                    j += 1;
                 }
             }
 
@@ -1350,6 +1454,27 @@ fn resolve_elements(model: &Model, target: &str) -> Option<Vec<u32>> {
         return Some(s.element_ids.clone());
     }
     target.parse::<u32>().ok().map(|id| vec![id])
+}
+
+/// Resolve a *CONTACT PAIR surface: *SURFACE name first, then a bare
+/// node set, then error.
+fn resolve_surface(
+    surfaces: &HashMap<String, Vec<u32>>,
+    nsets: &HashMap<String, Vec<u32>>,
+    target: &str,
+    line: usize,
+) -> Result<Vec<u32>, ParseError> {
+    let key = target.to_uppercase();
+    if let Some(v) = surfaces.get(&key) {
+        return Ok(v.clone());
+    }
+    if let Some(v) = nsets.get(&key) {
+        return Ok(v.clone());
+    }
+    Err(ParseError {
+        line,
+        message: format!("unknown surface '{target}'"),
+    })
 }
 
 fn kind_name(k: ElemKind) -> &'static str {
@@ -2248,5 +2373,120 @@ TIP, 2, -50.0
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
         assert!(m.steps[0].nlgeom);
         assert!(!m.steps[1].nlgeom);
+    }
+
+    // ---- issue #31: *SURFACE + *CONTACT PAIR ----
+
+    /// Small block-on-floor deck with node surfaces: block 1x1 CPS4 grid
+    /// (ids row-major), fixed floor line at y=0 offset ids, gravity step.
+    fn contact_deck(surface_type: &str) -> String {
+        format!(
+            concat!(
+                "*NODE\n",
+                "1, 0.0, 0.0\n2, 0.5, 0.0\n3, 1.0, 0.0\n",
+                "4, 0.0, 1.0\n5, 0.5, 1.0\n6, 1.0, 1.0\n",
+                "*ELEMENT, TYPE=CPS4, ELSET=BLOCK\n",
+                "1, 1, 2, 5, 4\n2, 2, 3, 6, 5\n",
+                "*NSET, NSET=BOTS\n1, 2, 3\n",
+                "*NODE\n1000, -0.1, 0.0\n1001, 0.5, 0.0\n1002, 1.1, 0.0\n",
+                "*NSET, NSET=FLOOR\n1000, 1001, 1002\n",
+                "*SURFACE, NAME=BOTTOM, TYPE={stype}\n",
+                "BOTS\n",
+                "*SURFACE, NAME=RIGID\n",
+                "FLOOR\n",
+                "*CONTACT PAIR\n",
+                "BOTTOM, RIGID\n",
+                "*MATERIAL, NAME=STEEL\n*ELASTIC\n210.0E9, 0.3\n",
+                "*SOLID SECTION, ELSET=BLOCK, MATERIAL=STEEL\n1.0\n",
+                "*DENSITY\n7850.,\n",
+                "*STEP, NAME=GRAV\n*STATIC\n",
+                "*BOUNDARY\nFLOOR, 1, 2\n4, 1, 1\n",
+                "*DLOAD\nGRAV, 9.81, 0.0, -1.0\n",
+                "*END STEP\n"
+            ),
+            stype = surface_type
+        )
+    }
+
+    #[test]
+    fn surface_and_contact_pair_parse_and_solve() {
+        let (m, r) = parse_inp(&contact_deck("NODE")).unwrap();
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert_eq!(
+            m.contact_pairs,
+            vec![solvix_core::ContactPair {
+                slave: vec![1, 2, 3],
+                master: vec![1000, 1001, 1002],
+            }]
+        );
+        // End-to-end: the deck solves with contact and the floor holds
+        // the block's weight.
+        let sol = solvix_core::solve(&m).unwrap();
+        assert_eq!(sol.contact_forces.len(), 3);
+        let fy: f64 = sol.contact_forces.iter().map(|c| c.fy).sum();
+        let weight = 7850.0 * 1.0 * 1.0 * 1.0 * 9.81;
+        assert!(
+            (fy - weight).abs() / weight < 0.01,
+            "sum contact fy {fy} vs {weight}"
+        );
+    }
+
+    #[test]
+    fn element_type_surface_warns_and_skips() {
+        // TYPE=ELEMENT surface is skipped -> a pair referencing it fails
+        // on the unknown surface name.
+        let e = parse_inp(&contact_deck("ELEMENT")).unwrap_err();
+        assert!(
+            e.message.contains("unknown surface 'BOTTOM'"),
+            "{}",
+            e.message
+        );
+
+        // Without a referencing pair the skip is only a warning.
+        let deck = concat!(
+            "*NODE\n1,0,0\n2,1,0\n3,0,1\n",
+            "*ELEMENT, TYPE=CPS3, ELSET=E\n1, 1, 2, 3\n",
+            "*MATERIAL, NAME=M\n*ELASTIC\n1.0E9, 0.3\n",
+            "*SURFACE, NAME=S, TYPE=ELEMENT\nE, S1\n",
+            "*BOUNDARY\n1, 1, 2\n"
+        );
+        let (m, r) = parse_inp(deck).unwrap();
+        assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
+        assert!(r.warnings[0].contains("TYPE=ELEMENT"));
+        assert!(m.contact_pairs.is_empty());
+    }
+
+    #[test]
+    fn contact_pair_errors_and_skips_carry_line_numbers() {
+        // Unknown surface: fatal with the data line's number.
+        let deck = contact_deck("NODE").replace("BOTTOM, RIGID", "NOPE, RIGID");
+        let e = parse_inp(&deck).unwrap_err();
+        assert!(
+            e.message.contains("unknown surface 'NOPE'"),
+            "{}",
+            e.message
+        );
+
+        // Wrong field count: fatal.
+        let deck = contact_deck("NODE").replace("BOTTOM, RIGID", "BOTTOM");
+        let e = parse_inp(&deck).unwrap_err();
+        assert!(e.message.contains("slave, master"), "{}", e.message);
+
+        // *SURFACE without NAME and *SURFACE INTERACTION/*FRICTION warn.
+        let deck = concat!(
+            "*NODE\n1,0,0\n2,1,0\n3,0,1\n",
+            "*ELEMENT, TYPE=CPS3, ELSET=E\n1, 1, 2, 3\n",
+            "*MATERIAL, NAME=M\n*ELASTIC\n1.0E9, 0.3\n",
+            "*SURFACE\n1, 2\n",
+            "*SURFACE INTERACTION, NAME=FRIC\n",
+            "*FRICTION\n0.3\n",
+            "*BOUNDARY\n1, 1, 2\n"
+        );
+        let (m, r) = parse_inp(deck).unwrap();
+        assert_eq!(r.warnings.len(), 3, "{:?}", r.warnings);
+        assert!(r.warnings[0].contains("*SURFACE without NAME"));
+        assert!(r.warnings[1].contains("*SURFACE INTERACTION"));
+        assert!(r.warnings[2].contains("*FRICTION"));
+        assert!(m.contact_pairs.is_empty());
     }
 }

@@ -18,10 +18,13 @@
 //! the `dyn.rs` module) runs implicit Newmark transient dynamics with
 //! Rayleigh damping. [`solve_nl`] (backed by `nl`) runs geometric
 //! nonlinearity for plane models: Updated Lagrangian kinematics with
-//! full Newton (NLGEOM steps).
+//! full Newton (NLGEOM steps). Models with [`Model::contact_pairs`]
+//! (backed by [`contact`]) solve 2D frictionless penalty contact on
+//! that same NL machinery.
 
 mod assembly;
 pub mod buckle;
+mod contact;
 #[path = "dyn.rs"]
 mod dynamics;
 mod element;
@@ -271,6 +274,17 @@ pub struct Model {
     pub beam_sections: Vec<(String, f64, f64)>,
     pub boundary_conditions: Vec<BoundaryCondition>,
     pub cloads: Vec<ConcentratedLoad>,
+    /// Node-to-surface contact pairs (`*CONTACT PAIR`). A model with a
+    /// non-empty list routes through [`solve_nl`] (penalty contact is
+    /// formulated on the NL machinery; see [`contact`](crate::contact)
+    /// for the v1 ceilings). Pairs are active in all steps (v1).
+    pub contact_pairs: Vec<ContactPair>,
+    /// Normal penalty stiffness in Pa for [`Model::contact_pairs`].
+    /// `0.0` (the default) selects the documented auto heuristic
+    /// `penalty = 100 * E_max` (2.1e13 Pa for steel-scale models) —
+    /// stiff enough for penetration ~1e-12 m under gravity loads,
+    /// soft enough not to poison the tangent's conditioning.
+    pub contact_penalty: f64,
     pub steps: Vec<Step>,
 }
 
@@ -292,6 +306,8 @@ impl Default for Model {
             beam_sections: Vec::new(),
             boundary_conditions: Vec::new(),
             cloads: Vec::new(),
+            contact_pairs: Vec::new(),
+            contact_penalty: 0.0,
             steps: Vec::new(),
         }
     }
@@ -410,6 +426,33 @@ pub enum ModelError {
     InvalidPlasticity,
 }
 
+/// One node-to-surface contact pair (v0.5): `slave` holds the node ids
+/// checked against penetration, `master` the node ids of the master
+/// surface. The master polyline's segment order is resolved inside
+/// [`solve_nl`] (sorted along the surface's dominant axis — see
+/// [`contact`](crate::contact)); the ids here may be in any order.
+/// Frictionless, small-sliding penalty contact only (v1).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ContactPair {
+    /// Slave node ids (penetrating side).
+    pub slave: Vec<u32>,
+    /// Master node ids defining the surface polyline.
+    pub master: Vec<u32>,
+}
+
+/// Contact force on one slave node at the converged state: the force
+/// the master surface exerts on the node (Newtons) and the penetration
+/// depth (positive, meters). Only nodes that end up in contact are
+/// reported.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ContactForce {
+    pub node_id: u32,
+    pub fx: f64,
+    pub fy: f64,
+    /// Penetration depth `|g|` in meters (positive = penetrating).
+    pub penetration: f64,
+}
+
 /// Reaction force at a constrained dof (Newtons).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Reaction {
@@ -430,6 +473,10 @@ pub struct Solution {
     /// Parallel to `mesh.nodes`.
     pub nodal_von_mises: Vec<f64>,
     pub reactions: Vec<Reaction>,
+    /// Contact forces on slave nodes at the solved state (see
+    /// [`ContactForce`]); populated by the contact-aware NL path,
+    /// empty for linear solves and models without contact pairs.
+    pub contact_forces: Vec<ContactForce>,
     pub iterations: usize,
     pub final_residual: f64,
     /// Which linear solver produced the displacements: "pcg" or "ldlt".
@@ -487,6 +534,15 @@ pub use nl::{solve_nl, NlFrame, NlOptions};
 ///
 /// Relative tolerance 1e-10, `max_iter = max(1000, 10 * ndof)`.
 pub fn solve(model: &Model) -> Result<Solution, SolveError> {
+    if !model.contact_pairs.is_empty() {
+        // Contact rides the NL machinery regardless of NLGEOM (nl::solve_nl
+        // rejects plasticity+contact with its own diagnostic).
+        let frames = nl::solve_nl(model, &NlOptions::default())?;
+        return Ok(frames
+            .last()
+            .map(|f| f.solution.clone())
+            .unwrap_or_default());
+    }
     if model.plasticity.is_some() {
         let frames = nl::solve_nl(model, &NlOptions::default())?;
         return Ok(frames
@@ -631,6 +687,7 @@ pub(crate) fn solve_with_thermal(
         von_mises,
         nodal_von_mises,
         reactions,
+        contact_forces: Vec::new(),
         iterations,
         final_residual,
         solver_method,

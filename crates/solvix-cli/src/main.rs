@@ -421,6 +421,7 @@ fn final_frame_solution(model: &Model, dyn_sol: &DynSolution) -> Solution {
         iterations: dyn_sol.iterations_total,
         final_residual: 0.0,
         solver_method: "newmark".into(),
+        contact_forces: Vec::new(),
         cond_estimate: 0.0,
     }
 }
@@ -949,6 +950,7 @@ mod tests {
             iterations: 42,
             final_residual: 1.5e-12,
             solver_method: "pcg".into(),
+            contact_forces: Vec::new(),
             cond_estimate: 12.5,
         }
     }

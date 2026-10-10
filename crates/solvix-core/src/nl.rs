@@ -60,6 +60,10 @@
 //!   positive-definiteness at a limit point) surfaces as
 //!   `InvalidModel` rather than triggering cutback — fine until
 //!   snap-through problems matter.
+//! - Contact (v0.5, [`crate::contact`]): models with contact pairs add
+//!   penalty terms inside `evaluate` (same tangent/residual pipeline)
+//!   with the active set re-evaluated every iteration and a
+//!   MAX_CONTACT_SET_CHANGES oscillation ceiling per increment.
 
 use crate::assembly::{self, Csr};
 use crate::buckle::geo_scalar_tri;
@@ -126,6 +130,11 @@ struct Eval {
     /// Stress history including the trial step (to commit on
     /// acceptance).
     sigma_new: Vec<Vec<[f64; 4]>>,
+    /// Contact forces on penetrating slave nodes (empty without
+    /// contact pairs).
+    contact_forces: Vec<crate::ContactForce>,
+    /// Active-set flags per slave slot at this evaluation.
+    contact_active: Vec<bool>,
 }
 
 /// Closed-form CPS3 B rows at the given coordinates.
@@ -153,6 +162,7 @@ fn evaluate(
     elems: &[UlElem],
     u_ref: &[f64],
     step: &[f64],
+    contact: Option<&crate::contact::ContactCtx>,
 ) -> Result<Eval, SolveError> {
     let ndof = 2usize; // the kind whitelist in solve_nl guarantees plane-only
     let t = model.thickness;
@@ -354,10 +364,31 @@ fn evaluate(
         sigma_new.push(sig_e);
     }
 
+    // Contact (v0.5): gap/penalty terms at the trial configuration —
+    // same tangent triplets and f_int convention as the elements, so
+    // the Newton residual and reactions need no special casing.
+    // Association MUST match the Newton commit `u += alpha*step`
+    // bit-for-bit (`u_ref + step`), so that re-evaluating after a
+    // commit at the same total displacement yields the identical gap.
+    let mut contact_forces = Vec::new();
+    let mut contact_active = Vec::new();
+    if let Some(ctx) = contact {
+        let u_total: Vec<f64> = u_ref.iter().zip(step).map(|(&r, &s)| r + s).collect();
+        let t = crate::contact::contact_terms(ctx, model, &u_total);
+        trips.extend(t.trips);
+        for (row, v) in t.f {
+            f_int[row] += v;
+        }
+        contact_forces = t.forces;
+        contact_active = t.active;
+    }
+
     Ok(Eval {
         kt: assembly::csr_from_triplets(n, trips),
         f_int,
         sigma_new,
+        contact_forces,
+        contact_active,
     })
 }
 
@@ -369,6 +400,7 @@ fn zero_solution(model: &Model) -> Solution {
         von_mises: vec![0.0; model.mesh.elements.len()],
         nodal_von_mises: vec![0.0; model.mesh.nodes.len()],
         reactions: Vec::new(),
+        contact_forces: Vec::new(),
         iterations: 0,
         final_residual: 0.0,
         solver_method: "newton".to_string(),
@@ -387,8 +419,18 @@ fn zero_solution(model: &Model) -> Solution {
 /// non-positive-definite tangent; `NotConverged` when Newton diverges
 /// (or exhausts its budget) even after the allowed increment
 /// cutbacks.
+/// Documented ceiling on contact active-set oscillation per load
+/// increment: beyond this many set changes the increment is cut in half
+/// (see [`crate::contact`]).
+const MAX_CONTACT_SET_CHANGES: usize = 20;
+
 pub fn solve_nl(model: &Model, opts: &NlOptions) -> Result<Vec<NlFrame>, SolveError> {
     if model.plasticity.is_some() {
+        if !model.contact_pairs.is_empty() {
+            return Err(SolveError::InvalidModel(
+                "contact + plasticity not supported (v1)".into(),
+            ));
+        }
         return crate::plastic::solve_nl(model, opts);
     }
     let loads = model.load_state();
@@ -423,6 +465,12 @@ pub fn solve_nl(model: &Model, opts: &NlOptions) -> Result<Vec<NlFrame>, SolveEr
             }
         }
     }
+    // Contact context: validated ids, ordered master polylines, penalty.
+    let contact = if model.contact_pairs.is_empty() {
+        None
+    } else {
+        Some(crate::contact::build_ctx(model)?)
+    };
 
     let ndof = 2usize;
     // Loads are DEAD: assembled once, on the original geometry.
@@ -491,11 +539,23 @@ pub fn solve_nl(model: &Model, opts: &NlOptions) -> Result<Vec<NlFrame>, SolveEr
         let mut residual = f64::NAN;
         let mut cond = 1.0;
         let mut frame_ev: Option<Eval> = None;
+        // Active-set bookkeeping: how often the contact set flipped
+        // within this increment (MAX_CONTACT_SET_CHANGES ceiling).
+        let mut prev_set: Option<Vec<bool>> = None;
+        let mut set_changes = 0usize;
         for it in 1..=opts.max_iterations {
             iterations = it;
             // Reference = the committed state; with a zero trial step
             // this residual has no mixed-geometry part at all.
-            let ev = evaluate(model, &ul, &u, &zero_step)?;
+            let ev = evaluate(model, &ul, &u, &zero_step, contact.as_ref())?;
+            if contact.is_some() {
+                if let Some(prev) = &prev_set {
+                    if prev != &ev.contact_active {
+                        set_changes += 1;
+                    }
+                }
+                prev_set = Some(ev.contact_active.clone());
+            }
             residual = residual_of(&ev, &f_ext, f_norm);
             if residual.is_finite() && residual <= opts.tolerance {
                 streak += 1;
@@ -505,6 +565,9 @@ pub fn solve_nl(model: &Model, opts: &NlOptions) -> Result<Vec<NlFrame>, SolveEr
                 }
             } else {
                 streak = 0;
+            }
+            if set_changes > MAX_CONTACT_SET_CHANGES {
+                break; // active set is oscillating; cut the increment
             }
             if !residual.is_finite() || residual > 10.0 * prev_res {
                 break; // diverging
@@ -525,7 +588,7 @@ pub fn solve_nl(model: &Model, opts: &NlOptions) -> Result<Vec<NlFrame>, SolveEr
             let mut alpha = 1.0f64;
             for _ in 0..13 {
                 let alpha_step: Vec<f64> = step.iter().map(|s| alpha * s).collect();
-                let ev_t = evaluate(model, &ul, &u, &alpha_step)?;
+                let ev_t = evaluate(model, &ul, &u, &alpha_step, contact.as_ref())?;
                 let res_t = residual_of(&ev_t, &f_ext, f_norm);
                 if res_t <= residual {
                     accepted = Some((alpha_step, ev_t));
@@ -584,6 +647,7 @@ pub fn solve_nl(model: &Model, opts: &NlOptions) -> Result<Vec<NlFrame>, SolveEr
                                 value: ev.f_int[c.row] - f_ext[c.row],
                             })
                             .collect(),
+                        contact_forces: ev.contact_forces.clone(),
                         iterations,
                         final_residual: residual,
                         solver_method: "newton".to_string(),
