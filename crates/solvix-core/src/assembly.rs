@@ -34,7 +34,9 @@ pub(crate) struct ElemInfo {
     pub(crate) d: Constitutive,
 }
 
-fn csr_from_triplets(n: usize, trips: Vec<(usize, usize, f64)>) -> Csr {
+/// Triplets to CSR: entries summed per (row, col), columns sorted.
+/// Shared by the stiffness and the consistent-mass assembly.
+pub(crate) fn csr_from_triplets(n: usize, trips: Vec<(usize, usize, f64)>) -> Csr {
     let mut rows: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
     for (r, c, v) in trips {
         rows[r].push((c, v));
@@ -65,9 +67,9 @@ fn csr_from_triplets(n: usize, trips: Vec<(usize, usize, f64)>) -> Csr {
     }
 }
 
-/// Scatter an element stiffness into global triplets. Local dof a maps to
-/// global `node_idx[a/ndof] * ndof + a%ndof`.
-fn scatter<const N: usize>(
+/// Scatter an element matrix (stiffness or mass) into global triplets.
+/// Local dof a maps to global `node_idx[a/ndof] * ndof + a%ndof`.
+pub(crate) fn scatter<const N: usize>(
     trips: &mut Vec<(usize, usize, f64)>,
     node_idx: &[usize],
     ke: &[[f64; N]; N],
@@ -185,7 +187,7 @@ pub(crate) fn assemble(
 }
 
 /// In-plane coordinates of the k-th element node (plane elements).
-fn coords2(model: &Model, node_idx: &[usize], k: usize) -> [f64; 2] {
+pub(crate) fn coords2(model: &Model, node_idx: &[usize], k: usize) -> [f64; 2] {
     let c = model.mesh.nodes[node_idx[k]].coords;
     [c[0], c[1]]
 }
@@ -284,6 +286,7 @@ pub(crate) mod tests {
                 element_ids: (1..=n_elem as u32).collect(),
             }],
             mat_assignments: vec![("all".into(), "mat".into())],
+            density: 1.0,
             boundary_conditions: vec![BoundaryCondition {
                 node_ids: vec![1],
                 dofs: vec![1, 2],

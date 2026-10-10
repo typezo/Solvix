@@ -565,6 +565,7 @@ mod tests {
                 }],
             },
             thickness: 1.0,
+            density: 7850.0,
             materials: vec![Material {
                 name: "steel".into(),
                 youngs_modulus: 210e9,

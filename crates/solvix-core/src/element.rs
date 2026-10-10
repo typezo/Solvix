@@ -104,7 +104,8 @@ fn quad_shape_derivs(xi: f64, eta: f64) -> ([f64; 4], [f64; 4]) {
 }
 
 /// B matrix at (xi, eta), or `None` if det(J) is not positive there.
-fn quad_b(coords: &[[f64; 2]; 4], xi: f64, eta: f64) -> Option<([[f64; 8]; 3], f64)> {
+/// Also the det(J) source for the CPS4 consistent mass (modal).
+pub(crate) fn quad_b(coords: &[[f64; 2]; 4], xi: f64, eta: f64) -> Option<([[f64; 8]; 3], f64)> {
     let (dn_dxi, dn_deta) = quad_shape_derivs(xi, eta);
     let mut j = [[0.0; 2]; 2];
     for i in 0..4 {
@@ -128,6 +129,17 @@ fn quad_b(coords: &[[f64; 2]; 4], xi: f64, eta: f64) -> Option<([[f64; 8]; 3], f
         bm[2][2 * i + 1] = dnx;
     }
     Some((bm, detj))
+}
+
+/// Bilinear shape functions at (xi, eta), node order matching
+/// [`QUAD_CORNERS`] (used by the consistent mass matrix).
+pub(crate) fn quad_shapes(xi: f64, eta: f64) -> [f64; 4] {
+    let mut n = [0.0; 4];
+    for i in 0..4 {
+        let (xi_i, eta_i) = QUAD_CORNERS[i];
+        n[i] = 0.25 * (1.0 + xi * xi_i) * (1.0 + eta * eta_i);
+    }
+    n
 }
 
 /// CPS4 stiffness with 2x2 Gauss. Returns `None` if det(J) <= 0 at any
@@ -210,7 +222,13 @@ fn hex_shape_derivs(xi: f64, eta: f64, zeta: f64) -> [[f64; 8]; 3] {
 
 /// B matrix (6x24) at a natural point, or `None` if det(J) is not
 /// positive there. J[a][b] = dx_b/d(xi_a); dN/dx = J^-1 * dN/d(xi).
-fn hex_b(coords: &[[f64; 3]; 8], xi: f64, eta: f64, zeta: f64) -> Option<([[f64; 24]; 6], f64)> {
+/// Also the det(J) source for the C3D8 consistent mass (modal).
+pub(crate) fn hex_b(
+    coords: &[[f64; 3]; 8],
+    xi: f64,
+    eta: f64,
+    zeta: f64,
+) -> Option<([[f64; 24]; 6], f64)> {
     let dn = hex_shape_derivs(xi, eta, zeta);
     let mut j = [[0.0; 3]; 3];
     for i in 0..8 {
@@ -247,6 +265,16 @@ fn hex_b(coords: &[[f64; 3]; 8], xi: f64, eta: f64, zeta: f64) -> Option<([[f64;
         bm[5][c + 2] = g[0];
     }
     Some((bm, detj))
+}
+
+/// Trilinear shape functions at (xi, eta, zeta), node order matching
+/// [`HEX_CORNERS`] (used by the consistent mass matrix).
+pub(crate) fn hex_shapes(xi: f64, eta: f64, zeta: f64) -> [f64; 8] {
+    let mut n = [0.0; 8];
+    for (i, &(a, b, c)) in HEX_CORNERS.iter().enumerate() {
+        n[i] = 0.125 * (1.0 + xi * a) * (1.0 + eta * b) * (1.0 + zeta * c);
+    }
+    n
 }
 
 /// C3D8 stiffness with 2x2x2 Gauss. Returns `None` if det(J) <= 0 at any

@@ -11,10 +11,13 @@
 //! CG), [`stress`] (von Mises + reactions). [`solve`] tries PCG first
 //! and falls back to the RCM-ordered sparse LDLT in `ldl` when the
 //! iteration budget runs out; [`solve_with_method`] pins the method.
+//! [`solve_modal`] (backed by `modal`) extracts the smallest natural
+//! frequencies and mass-normalized mode shapes.
 
 mod assembly;
 mod element;
 mod ldl;
+mod modal;
 mod solver;
 mod stress;
 
@@ -114,17 +117,38 @@ pub struct ConcentratedLoad {
 }
 
 /// A complete, solvable v0.1 model: one static step.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Model {
     pub mesh: Mesh,
     /// Out-of-plane thickness for plane-stress elements (default 1.0).
     pub thickness: f64,
+    /// Mass density in kg/m^3 for modal analysis ([`solve_modal`]).
+    /// Default 7850.0 (steel). Per-material `*DENSITY` parsing lands with
+    /// the input crate (#26); until then one value covers the model.
+    pub density: f64,
     pub materials: Vec<Material>,
     pub elsets: Vec<ElementSet>,
     /// (elset name, material name) pairs from `*SOLID SECTION`.
     pub mat_assignments: Vec<(String, String)>,
     pub boundary_conditions: Vec<BoundaryCondition>,
     pub cloads: Vec<ConcentratedLoad>,
+}
+
+impl Default for Model {
+    /// Non-zero defaults: `thickness` 1.0 and `density` 7850.0 (steel);
+    /// the remaining fields default as their own types do.
+    fn default() -> Self {
+        Self {
+            mesh: Mesh::default(),
+            thickness: 1.0,
+            density: 7850.0,
+            materials: Vec::new(),
+            elsets: Vec::new(),
+            mat_assignments: Vec::new(),
+            boundary_conditions: Vec::new(),
+            cloads: Vec::new(),
+        }
+    }
 }
 
 impl Model {
@@ -230,6 +254,8 @@ pub enum Method {
     /// RCM-ordered sparse LDLT only.
     Ldlt,
 }
+
+pub use modal::{solve_modal, ModalOptions, ModalSolution};
 
 /// Solve the linear-static problem `K u = f` with homogeneous Dirichlet
 /// constraints. [`Method::Auto`]: conjugate gradient on CSR with Jacobi
@@ -657,6 +683,7 @@ mod tests {
                 ],
             },
             thickness: 1.0,
+            density: 7850.0,
             materials: vec![steel()],
             elsets: vec![ElementSet {
                 name: "all".into(),
