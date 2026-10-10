@@ -36,7 +36,13 @@ pub struct BucklingSolution {
 
 /// Geometric stress stiffness block scalar for one element with plane
 /// stress state `s = [sxx, syy, sxy]`, integrated over the element.
-fn geo_scalar_quad(coords: &[[f64; 2]; 4], s: &[f64; 3], t: f64) -> Option<[[f64; 4]; 4]> {
+/// Shared with the nonlinear solver (nl.rs), which feeds it UPDATED
+/// coordinates.
+pub(crate) fn geo_scalar_quad(
+    coords: &[[f64; 2]; 4],
+    s: &[f64; 3],
+    t: f64,
+) -> Option<[[f64; 4]; 4]> {
     const GP: f64 = 0.577_350_269_189_625_8;
     let w = 1.0;
     let mut ks = [[0.0f64; 4]; 4];
@@ -59,7 +65,11 @@ fn geo_scalar_quad(coords: &[[f64; 2]; 4], s: &[f64; 3], t: f64) -> Option<[[f64
 }
 
 /// CPS3: constant gradients, closed-form area integral.
-fn geo_scalar_tri(coords: &[[f64; 2]; 3], s: &[f64; 3], t: f64) -> Option<[[f64; 3]; 3]> {
+pub(crate) fn geo_scalar_tri(
+    coords: &[[f64; 2]; 3],
+    s: &[f64; 3],
+    t: f64,
+) -> Option<[[f64; 3]; 3]> {
     let b = [
         coords[1][1] - coords[2][1],
         coords[2][1] - coords[0][1],
@@ -89,7 +99,9 @@ fn geo_scalar_tri(coords: &[[f64; 2]; 3], s: &[f64; 3], t: f64) -> Option<[[f64;
 }
 
 /// Assemble the global geometric stiffness from the static stress state.
-fn assemble_ksigma(
+/// Shared with the nonlinear solver (nl.rs), which feeds it the current
+/// Newton iterate.
+pub(crate) fn assemble_ksigma(
     model: &Model,
     ndof: usize,
     u: &[f64],

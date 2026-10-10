@@ -82,8 +82,9 @@ fn axpy(y: &mut [f64], x: &[f64], a: f64) {
 /// same element scatter with a guaranteed diagonal, and every element
 /// stiffness block is structurally full, so m's sparsity pattern is a
 /// subset of k's; m-only positions cannot occur (the walk skips them
-/// defensively rather than rebuild the pattern).
-fn add_scaled(k: &mut Csr, m: &Csr, c: f64) {
+/// defensively rather than rebuild the pattern). Shared with the
+/// nonlinear solver (nl.rs adds K_sigma into the tangent the same way).
+pub(crate) fn add_scaled(k: &mut Csr, m: &Csr, c: f64) {
     let n = k.row_ptr.len() - 1;
     for r in 0..n {
         let mut mi = m.row_ptr[r];

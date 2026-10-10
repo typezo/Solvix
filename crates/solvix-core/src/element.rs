@@ -50,6 +50,7 @@ pub(crate) fn d3_matrix(e: f64, nu: f64) -> [[f64; 6]; 6] {
 /// plane elements get the plane-stress/plane-strain 3x3, solids the 3D
 /// 6x6, beams carry their section constants (E from the material, A and
 /// I from `*BEAM SECTION`).
+#[derive(Clone)]
 pub(crate) enum Constitutive {
     Plane([[f64; 3]; 3]),
     PlaneStrain([[f64; 3]; 3]),

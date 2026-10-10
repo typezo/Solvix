@@ -16,7 +16,9 @@
 //! [`solve_thermomech`] (backed by `heat`) run steady-state conduction
 //! and the sequential thermal-stress pass. [`solve_dynamic`] (backed by
 //! the `dyn.rs` module) runs implicit Newmark transient dynamics with
-//! Rayleigh damping.
+//! Rayleigh damping. [`solve_nl`] (backed by `nl`) runs geometric
+//! nonlinearity for plane models: Updated Lagrangian kinematics with
+//! full Newton (NLGEOM steps).
 
 mod assembly;
 pub mod buckle;
@@ -26,6 +28,7 @@ mod element;
 mod heat;
 mod ldl;
 mod modal;
+mod nl;
 mod solver;
 mod stress;
 
@@ -211,6 +214,11 @@ pub struct Step {
     /// [`solve_dynamic`] integrates the step. Steps only (no legacy
     /// top-level counterpart).
     pub dynamics: Option<DynamicsSpec>,
+    /// Geometric nonlinearity (`*STEP, NLGEOM=YES`): when the LAST step
+    /// carries this flag, [`solve`] routes through [`solve_nl`]
+    /// (Updated Lagrangian + full Newton) instead of the linear static
+    /// path; [`solve_with_method`] always stays linear. Default false.
+    pub nlgeom: bool,
 }
 
 /// A complete, solvable model.
@@ -433,6 +441,7 @@ pub enum Method {
 pub use dynamics::{solve_dynamic, DynOptions, DynSolution, TimePoint};
 pub use heat::{solve_thermal, solve_thermomech, ThermalSolution};
 pub use modal::{solve_modal, ModalOptions, ModalSolution};
+pub use nl::{solve_nl, NlFrame, NlOptions};
 
 /// Solve the linear-static problem `K u = f` with homogeneous Dirichlet
 /// constraints. [`Method::Auto`]: conjugate gradient on CSR with Jacobi
@@ -441,8 +450,20 @@ pub use modal::{solve_modal, ModalOptions, ModalSolution};
 /// 2 dofs/node, models containing solid elements with 3 (see
 /// [`ndof_per_node`]).
 ///
+/// When the LAST step sets `nlgeom` (`*STEP, NLGEOM=YES`), the solve
+/// routes through [`solve_nl`] instead and returns the final frame's
+/// solution (total displacements under the full load). Models without
+/// steps, or whose last step is linear, take the linear path below.
+///
 /// Relative tolerance 1e-10, `max_iter = max(1000, 10 * ndof)`.
 pub fn solve(model: &Model) -> Result<Solution, SolveError> {
+    if model.steps.last().is_some_and(|s| s.nlgeom) {
+        let frames = nl::solve_nl(model, &NlOptions::default())?;
+        return Ok(frames
+            .last()
+            .map(|f| f.solution.clone())
+            .unwrap_or_default());
+    }
     solve_with_method(model, Method::Auto)
 }
 

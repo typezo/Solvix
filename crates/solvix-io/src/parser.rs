@@ -1,7 +1,8 @@
 //! Abaqus `.inp` parser for the v0.1 keyword subset (issue #2), extended
 //! with multi-step, `*DLOAD` and `*DENSITY` (issue #26), the thermal
 //! keywords `*CONDUCTIVITY`, `*EXPANSION`, `*TEMPERATURE`, `*DFLUX`
-//! (issue #27), and transient dynamics `*DYNAMIC` + `*DAMPING` (#28).
+//! (issue #27), transient dynamics `*DYNAMIC` + `*DAMPING` (#28), and
+//! `*STEP, NLGEOM=YES` geometric nonlinearity (#29).
 //!
 //! Line model: `**…` comments and blank lines are dropped up front; every
 //! remaining line is either a keyword line (`*NAME, KEY=VALUE, …`, parsed
@@ -57,6 +58,10 @@ struct StepAcc {
     dyn_dt: Option<(f64, f64)>,
     /// *DAMPING Rayleigh pair (alpha, beta) set inside this step.
     damping: Option<(f64, f64)>,
+    /// *STEP, NLGEOM=YES: geometric nonlinearity for this step (issue
+    /// #29). Never inherited — a step without the flag is linear even
+    /// after an NLGEOM step, matching Abaqus.
+    nlgeom: bool,
 }
 
 /// OP=NEW/MOD of a keyword line: `true` when OP=NEW, warning on anything
@@ -955,6 +960,18 @@ pub(super) fn parse_inp(text: &str) -> Result<(Model, ParseReport), ParseError> 
                     .get("name")
                     .cloned()
                     .unwrap_or_else(|| format!("Step-{step_no}"));
+                acc.nlgeom = match kw.params.get("nlgeom").map(|s| s.to_lowercase()) {
+                    None => false,
+                    Some(v) if v == "yes" || v.is_empty() => true,
+                    Some(v) if v == "no" => false,
+                    Some(v) => {
+                        report.warnings.push(format!(
+                            "line {}: unsupported NLGEOM='{v}' on *STEP — treated as NO",
+                            kw.line
+                        ));
+                        false
+                    }
+                };
                 cur = Some(acc);
                 j += 1;
                 while matches!(items.get(j), Some(Item::Data { .. })) {
@@ -1165,6 +1182,7 @@ pub(super) fn parse_inp(text: &str) -> Result<(Model, ParseReport), ParseError> 
                 heat_fluxes: a.heat_fluxes,
                 heat_source: a.heat_source,
                 dynamics,
+                nlgeom: a.nlgeom,
             });
         }
         model.steps = steps_out;
@@ -2064,5 +2082,73 @@ TIP, 2, -50.0
         assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
         assert!(r.warnings[0].contains("without *DYNAMIC"));
         assert!(m.steps[0].dynamics.is_none());
+    }
+
+    // ---- issue #29: *STEP, NLGEOM ----
+
+    #[test]
+    fn nlgeom_step_parses_and_solve_routes_to_nl() {
+        // NLGEOM=YES parses onto the step and the plane deck solves
+        // through the nonlinear path.
+        let deck = plate_deck(
+            "",
+            "*STEP, NAME=NL, NLGEOM=YES\n*STATIC\n*BOUNDARY\nBASE, 1, 2\n*CLOAD\n8, 2, -1.0\n*END STEP\n",
+        );
+        let (m, r) = parse_inp(&deck).unwrap();
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert_eq!(m.steps.len(), 1);
+        assert_eq!(m.steps[0].name, "NL");
+        assert!(m.steps[0].nlgeom);
+        assert!(solvix_core::solve(&m).is_ok());
+
+        // Routing proof by kind rejection: the same C3D8 cube solves
+        // linear without the flag and fails with the NL diagnostic with
+        // it (solve() must have entered solve_nl).
+        let cube = concat!(
+            "*NODE\n",
+            "1,0,0,0\n2,1,0,0\n3,1,1,0\n4,0,1,0\n5,0,0,1\n6,1,0,1\n7,1,1,1\n8,0,1,1\n",
+            "*ELEMENT, TYPE=C3D8, ELSET=E\n1, 1, 2, 3, 4, 5, 6, 7, 8\n",
+            "*MATERIAL, NAME=M\n*ELASTIC\n210.0E9, 0.3\n",
+            "*SOLID SECTION, ELSET=E, MATERIAL=M\n",
+        );
+        let nl_step = "*STEP, NLGEOM=YES\n*STATIC\n*BOUNDARY\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\n*CLOAD\n8, 3, -10.0\n*END STEP\n";
+        let lin_step = "*STEP, NLGEOM=NO\n*STATIC\n*BOUNDARY\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\n*CLOAD\n8, 3, -10.0\n*END STEP\n";
+
+        let (m, r) = parse_inp(&format!("{cube}{lin_step}")).unwrap();
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert!(!m.steps[0].nlgeom);
+        assert!(solvix_core::solve(&m).is_ok());
+
+        let (m, r) = parse_inp(&format!("{cube}{nl_step}")).unwrap();
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        match solvix_core::solve(&m) {
+            Err(solvix_core::SolveError::InvalidModel(msg)) => {
+                assert!(msg.contains("NL not yet supported for kind C3d8"), "{msg}")
+            }
+            other => panic!("expected the NL routing error, got {other:?}"),
+        }
+
+        // Unsupported NLGEOM value warns and stays linear.
+        let (m, r) = parse_inp(&plate_deck(
+            "",
+            "*STEP, NLGEOM=MAYBE\n*STATIC\n*BOUNDARY\nBASE, 1, 2\n*END STEP\n",
+        ))
+        .unwrap();
+        assert_eq!(r.warnings.len(), 1);
+        assert!(r.warnings[0].contains("NLGEOM='maybe'"));
+        assert!(!m.steps[0].nlgeom);
+
+        // The flag does not leak into a following plain step.
+        let (m, r) = parse_inp(&plate_deck(
+            "",
+            concat!(
+                "*STEP, NLGEOM=YES\n*STATIC\n*BOUNDARY\nBASE, 1, 2\n*END STEP\n",
+                "*STEP\n*STATIC\n*CLOAD\n8, 2, -1.0\n*END STEP\n"
+            ),
+        ))
+        .unwrap();
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert!(m.steps[0].nlgeom);
+        assert!(!m.steps[1].nlgeom);
     }
 }
