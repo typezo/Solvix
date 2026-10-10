@@ -1,0 +1,75 @@
+# Solvix parity scoreboard manifest (issue #34).
+# Hand-parseable TOML subset: [[case]] tables with keys
+#   name       case id (scoreboard row)
+#   deck_path  deck file relative to this manifest (or the CWD / repo root)
+#   generator  built-in deck generator instead of deck_path
+#              (cantilever40x4 | kirsch8x8 | patch_cps4)
+#   metric     max_disp_mm | max_uy_mm | max_centroid_von_mises_mpa |
+#              max_nodal_von_mises_mpa | max_temperature_c | freq_1_hz | pcr_n
+#   expected   analytical reference value
+#   tol_pct    pass band in percent (boundary inclusive)
+#   note       analytical reference, shown in docs/BENCHMARKS.md
+
+[[case]]
+name = "cantilever40x4"
+deck_path = "examples/cantilever.inp"
+metric = "max_disp_mm"
+expected = 15.238
+tol_pct = 12.0
+note = "Euler-Bernoulli tip deflection P*L^3/(3*E*I) = 15.238 mm"
+
+[[case]]
+name = "kirsch8x8"
+deck_path = "examples/plate_hole.inp"
+metric = "max_nodal_von_mises_mpa"
+expected = 3.0
+tol_pct = 15.0
+note = "Kirsch: 3*sigma at the hole edge for 1 MPa far field"
+
+[[case]]
+name = "patch_cps4"
+generator = "patch_cps4"
+metric = "max_centroid_von_mises_mpa"
+expected = 1.0
+tol_pct = 2.0
+note = "distorted CPS4 patch under uniform traction: exact 1 MPa"
+
+[[case]]
+name = "cantilever3d"
+deck_path = "examples/cantilever3d.inp"
+metric = "max_disp_mm"
+expected = 15.238
+tol_pct = 15.0
+note = "same cantilever in C3D8 solids (bending locks, wider band)"
+
+[[case]]
+name = "thermal_bar"
+deck_path = "examples/thermal_bar.inp"
+metric = "max_temperature_c"
+expected = 100.0
+tol_pct = 0.1
+note = "steady 1D gradient T(x) = 100*(1 - x/L): max T = 100 at the clamp"
+
+[[case]]
+name = "b31_cantilever"
+deck_path = "decks/b31_cantilever.inp"
+metric = "max_uy_mm"
+expected = 158.730
+tol_pct = 2.0
+note = "B31 Hermite cantilever: P*L^3/(3*E*I) = 158.730 mm (exact)"
+
+[[case]]
+name = "modal_cantilever"
+deck_path = "decks/modal_cantilever.inp"
+metric = "freq_1_hz"
+expected = 20.886
+tol_pct = 8.0
+note = "first bending mode 1.875^2/(2*pi)*sqrt(E*I/(rho*A))/L^2 = 20.886 Hz"
+
+[[case]]
+name = "euler_column"
+deck_path = "decks/euler_column.inp"
+metric = "pcr_n"
+expected = 432081.0
+tol_pct = 10.0
+note = "pin-ended Euler column Pcr = pi^2*E*I/L^2 = 432081 N"

@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Solvix benchmark gallery</title>
+    <meta name="description" content="Static benchmark gallery and release timeline for Solvix, the agent-era, open-source Abaqus.">
+    <link rel="stylesheet" href="style.css">
+  </head>
+  <body id="top">
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header">
+      <a class="brand" href="#top">Solvix</a>
+      <nav aria-label="Primary">
+        <a href="https://github.com/typezo/Solvix">GitHub</a>
+        <a href="https://github.com/typezo/Solvix/issues">Issue board</a>
+      </nav>
+    </header>
+
+    <main id="main">
+      <section class="hero" aria-labelledby="hero-title">
+        <p class="eyebrow">v0.1.0 &rarr; v0.6.0 &middot; benchmark gallery</p>
+        <h1 id="hero-title">Solvix</h1>
+        <p class="tagline">the agent-era, open-source Abaqus</p>
+        <p class="hero-copy">
+          A dependency-light Rust finite element solver with an Abaqus-style
+          input language, JSON-first CLI, browser UI, and reproducible QA
+          benchmarks from the first six releases.
+        </p>
+        <div class="hero-actions">
+          <a class="button button-primary" href="https://github.com/typezo/Solvix">View the source</a>
+          <a class="button" href="https://github.com/typezo/Solvix/issues">Visit the issue board</a>
+        </div>
+      </section>
+
+      <section class="section" aria-labelledby="benchmark-title">
+        <div class="section-heading">
+          <h2 id="benchmark-title">Benchmark table</h2>
+          <p class="section-note">
+            Live from static data: the values are embedded in <code>app.js</code>,
+            so this gallery remains a reproducible, backend-free page.
+          </p>
+        </div>
+        <div class="table-shell">
+          <table id="benchmark-table">
+            <caption>Verification highlights from Solvix releases</caption>
+            <thead>
+              <tr>
+                <th scope="col">Benchmark</th>
+                <th scope="col">Release</th>
+                <th scope="col">Embedded result</th>
+                <th scope="col">What it checks</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+          <p id="benchmark-status" class="table-status" hidden>Rendered 7 static benchmark records.</p>
+          <noscript><p class="table-status">Enable JavaScript to render the embedded benchmark table.</p></noscript>
+        </div>
+      </section>
+
+      <section class="section" aria-labelledby="screenshots-title">
+        <div class="section-heading">
+          <h2 id="screenshots-title">Abaqus-style UI</h2>
+          <p class="section-note">
+            The bundled interface keeps the model tree, viewport, contour legend,
+            and JSON console in one browser workspace.
+          </p>
+        </div>
+        <div class="gallery">
+          <figure class="shot">
+            <img src="../docs/screenshots/ui-mesh.png" alt="Solvix browser UI showing the model tree and a numbered cantilever mesh" loading="lazy" decoding="async">
+            <figcaption>Mesh, boundary glyphs, and the tip load</figcaption>
+          </figure>
+          <figure class="shot">
+            <img src="../docs/screenshots/ui-contour.png" alt="Solvix browser UI shading elements by von Mises stress with a color legend" loading="lazy" decoding="async">
+            <figcaption>Element von Mises contour</figcaption>
+          </figure>
+          <figure class="shot">
+            <img src="../docs/screenshots/ui-deformed.png" alt="Solvix browser UI showing a deformed cantilever over a dashed undeformed wireframe" loading="lazy" decoding="async">
+            <figcaption>Deformed shape with exaggeration control</figcaption>
+          </figure>
+          <figure class="shot">
+            <img src="../docs/screenshots/ui-3d.png" alt="Solvix browser UI showing a 3D cantilever mesh in an arcball viewport" loading="lazy" decoding="async">
+            <figcaption>3D C3D8 solid in the software renderer</figcaption>
+          </figure>
+        </div>
+      </section>
+
+      <section class="section" aria-labelledby="timeline-title">
+        <div class="section-heading">
+          <h2 id="timeline-title">Release timeline</h2>
+          <p class="section-note">One capability step at a time, each gated by the benchmark suite.</p>
+        </div>
+        <ol class="timeline">
+          <li>
+            <div class="timeline-marker"><span class="version">v0.1.0</span><span class="release-date">Oct 10, 2026</span></div>
+            <p>2D CPS3/CPS4 linear static, Abaqus-style input, JSON CLI, VTU output, and browser UI.</p>
+          </li>
+          <li>
+            <div class="timeline-marker"><span class="version">v0.2.0</span><span class="release-date">Oct 10, 2026</span></div>
+            <p>C3D8/C3D4 3D elements, direct sparse fallback, Gmsh import, and MCP server mode.</p>
+          </li>
+          <li>
+            <div class="timeline-marker"><span class="version">v0.3.0</span><span class="release-date">Oct 10, 2026</span></div>
+            <p>Modal and buckling analyses, B31/CPS8/CPE8 breadth, multi-step loads, and mode viewing.</p>
+          </li>
+          <li>
+            <div class="timeline-marker"><span class="version">v0.4.0</span><span class="release-date">Oct 10, 2026</span></div>
+            <p>Steady-state heat, sequential thermal stress, and Newmark transient dynamics.</p>
+          </li>
+          <li>
+            <div class="timeline-marker"><span class="version">v0.5.0</span><span class="release-date">Oct 10, 2026</span></div>
+            <p>Updated-Lagrangian geometry, J2 plasticity, and 2D node-to-surface contact.</p>
+          </li>
+          <li>
+            <div class="timeline-marker"><span class="version">v0.6.0</span><span class="release-date">Oct 10, 2026</span></div>
+            <p>Solvix output-database frames, history plots and animations, PNG export, and threaded assembly/PCG.</p>
+          </li>
+        </ol>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <p class="open-source-call">FIGHT FOR OPEN SOURCE.</p>
+      <nav aria-label="Footer">
+        <a href="https://github.com/typezo/Solvix">GitHub</a>
+        <a href="https://github.com/typezo/Solvix/issues">Issues</a>
+        <a href="../docs/AGENT_COOKBOOK.md">Agent Cookbook</a>
+      </nav>
+    </footer>
+    <script src="app.js" defer></script>
+  </body>
+</html>

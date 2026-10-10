@@ -44,6 +44,9 @@ dynamics, and parser-failure handling. Each entry includes the exact CLI
 command and its expected QA result in
 [docs/examples.md](docs/examples.md).
 
+Open the [benchmark gallery](site/index.html) for the release-by-release
+verification snapshot.
+
 ## Screenshots
 
 The bundled web UI (`cargo run -p solvix-ui -- serve`) recreates the

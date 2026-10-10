@@ -1,4 +1,5 @@
-//! Built-in verification suite: `solvix bench` (issue #17).
+//! Built-in verification suite: `solvix bench` (issue #17), extended
+//! with a manifest-driven parity scoreboard (issue #34).
 //!
 //! Cases are embedded decks built by pure functions (loops, not literals, and
 //! no dependency on `examples/`), so unit tests exercise parse+solve+gate
@@ -12,6 +13,15 @@
 //!   docs/benchmarks/kirsch.md).
 //! * `patch_cps4` — distorted 9-node patch under uniform sigma_x; every
 //!   element centroid von Mises must equal the applied traction.
+//!
+//! `--manifest <path>` (issue #34) appends the cases from a hand-parseable
+//! TOML-subset manifest (`[[case]]` tables, see `benchmarks/manifest.toml`):
+//! deck files on disk or named built-in generators, each gated the same way
+//! through [`gate`]. A missing deck or bad metric FAILS that case (row +
+//! error line), never a crash. `--markdown` prints the scoreboard as a
+//! docs/BENCHMARKS.md body instead of the plain table.
+
+use std::path::{Path, PathBuf};
 
 use solvix_core::{Model, Solution};
 
@@ -63,8 +73,8 @@ pub const CASES: &[CaseDef] = &[
 
 #[derive(Clone)]
 pub struct CaseOutcome {
-    pub name: &'static str,
-    pub metric: &'static str,
+    pub name: String,
+    pub metric: String,
     pub unit: &'static str,
     pub nodes: usize,
     pub elements: usize,
@@ -74,12 +84,25 @@ pub struct CaseOutcome {
     pub tol_pct: f64,
     pub pct_error: f64,
     pub pass: bool,
+    /// Why a case could not run at all (missing deck, bad metric, solve
+    /// error): the row is a FAIL, the message rides along.
+    pub error: Option<String>,
 }
 
 fn max_disp_mm(_model: &Model, sol: &Solution) -> f64 {
     sol.displacements
         .iter()
         .map(|d| (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt())
+        .fold(0.0, f64::max)
+        * 1000.0
+}
+
+/// Max transverse tip deflection: `uy` only, so B31 models (whose third
+/// displacement component is the rotation, not `uz`) gate cleanly.
+fn max_uy_mm(_model: &Model, sol: &Solution) -> f64 {
+    sol.displacements
+        .iter()
+        .map(|d| d[1].abs())
         .fold(0.0, f64::max)
         * 1000.0
 }
@@ -110,8 +133,8 @@ pub fn run_case(def: &CaseDef) -> Result<CaseOutcome, String> {
     let value = (def.extract)(&model, &sol);
     let (pct_error, pass) = gate(value, def.expected, def.tol_pct);
     Ok(CaseOutcome {
-        name: def.name,
-        metric: def.metric,
+        name: def.name.to_string(),
+        metric: def.metric.to_string(),
         unit: def.unit,
         nodes: model.mesh.nodes.len(),
         elements: model.mesh.elements.len(),
@@ -121,11 +144,13 @@ pub fn run_case(def: &CaseDef) -> Result<CaseOutcome, String> {
         tol_pct: def.tol_pct,
         pct_error,
         pass,
+        error: None,
     })
 }
 
-pub fn run(json: bool) -> i32 {
+pub fn run(json: bool, manifest: Option<&str>, markdown: bool) -> i32 {
     let mut outcomes = Vec::with_capacity(CASES.len());
+    let mut notes: Vec<(String, String)> = Vec::new();
     for def in CASES {
         match run_case(def) {
             Ok(o) => outcomes.push(o),
@@ -140,8 +165,47 @@ pub fn run(json: bool) -> i32 {
             }
         }
     }
+    if let Some(path) = manifest {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) => {
+                let msg = format!("cannot read manifest {path}: {e}");
+                if json {
+                    println!("{}", crate::error_json(Stage::Io, &msg));
+                } else {
+                    eprintln!("error (io): {msg}");
+                }
+                return Stage::Io.exit_code();
+            }
+        };
+        let cases = match parse_manifest(&text) {
+            Ok(c) => c,
+            Err(msg) => {
+                let msg = format!("manifest {path}: {msg}");
+                if json {
+                    println!("{}", crate::error_json(Stage::Parse, &msg));
+                } else {
+                    eprintln!("error (parse): {msg}");
+                }
+                return Stage::Parse.exit_code();
+            }
+        };
+        let dir = Path::new(path)
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        for case in &cases {
+            outcomes.push(run_manifest_case(case, &dir));
+        }
+        notes = cases
+            .iter()
+            .map(|c| (c.name.clone(), c.note.clone()))
+            .collect();
+    }
     let all_pass = outcomes.iter().all(|o| o.pass);
-    if json {
+    if markdown {
+        print!("{}", markdown_doc(&outcomes, &notes));
+    } else if json {
         println!("{}", json_line(&outcomes));
     } else {
         print!("{}", human(&outcomes));
@@ -153,14 +217,286 @@ pub fn run(json: bool) -> i32 {
     }
 }
 
+// ---- issue #34: manifest-driven cases ----
+
+/// Where a manifest case's deck comes from.
+#[derive(Clone, PartialEq, Debug)]
+pub enum DeckSource {
+    Path(String),
+    Generator(String),
+}
+
+/// One `[[case]]` table of `benchmarks/manifest.toml`.
+#[derive(Clone, PartialEq, Debug)]
+pub struct ManifestCase {
+    pub name: String,
+    pub deck: DeckSource,
+    pub metric: String,
+    pub expected: f64,
+    pub tol_pct: f64,
+    pub note: String,
+}
+
+/// Keys allowed in a `[[case]]` table.
+const CASE_KEYS: &[&str] = &[
+    "name",
+    "deck_path",
+    "generator",
+    "metric",
+    "expected",
+    "tol_pct",
+    "note",
+];
+
+/// Display unit of a metric name (also the gate's dispatch table).
+pub fn metric_unit(metric: &str) -> Option<&'static str> {
+    match metric {
+        "max_disp_mm" | "max_uy_mm" => Some("mm"),
+        "max_centroid_von_mises_mpa" | "max_nodal_von_mises_mpa" => Some("MPa"),
+        "max_temperature_c" => Some("C"),
+        "freq_1_hz" => Some("Hz"),
+        "pcr_n" => Some("N"),
+        _ => None,
+    }
+}
+
+/// Parse the hand-parseable TOML subset: `[[case]]` (or `[case]`) table
+/// headers, `key = value` lines with quoted strings or bare floats,
+/// blank lines and `#` comments. Anything else is an error naming the
+/// line.
+pub fn parse_manifest(text: &str) -> Result<Vec<ManifestCase>, String> {
+    let mut cases: Vec<Vec<(String, String)>> = Vec::new();
+    for (idx, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        let ln = idx + 1;
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix('[') {
+            let section = rest.trim_matches(|c| c == '[' || c == ']');
+            if section != "case" {
+                return Err(format!("line {ln}: unsupported section [{section}]"));
+            }
+            cases.push(Vec::new());
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(format!("line {ln}: expected 'key = value', got '{line}'"));
+        };
+        let (key, mut value) = (key.trim(), value.trim());
+        if !CASE_KEYS.contains(&key) {
+            return Err(format!("line {ln}: unknown key '{key}'"));
+        }
+        if value.starts_with('"') {
+            let end = value[1..]
+                .find('"')
+                .ok_or_else(|| format!("line {ln}: unterminated string"))?;
+            value = &value[1..1 + end];
+        }
+        let table = cases
+            .last_mut()
+            .ok_or_else(|| format!("line {ln}: '{key}' outside a [[case]] table"))?;
+        if table.iter().any(|(k, _)| k == key) {
+            return Err(format!("line {ln}: duplicate key '{key}'"));
+        }
+        table.push((key.to_string(), value.to_string()));
+    }
+    cases
+        .into_iter()
+        .enumerate()
+        .map(|(i, table)| manifest_case(i, &table))
+        .collect()
+}
+
+fn table_get<'a>(table: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    table
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str())
+}
+
+fn manifest_case(i: usize, table: &[(String, String)]) -> Result<ManifestCase, String> {
+    let where_ = format!("case {}: ", i + 1);
+    let name = table_get(table, "name").ok_or_else(|| format!("{where_}missing name"))?;
+    let metric = table_get(table, "metric").ok_or_else(|| format!("{where_}missing metric"))?;
+    metric_unit(metric).ok_or_else(|| format!("{where_}unknown metric '{metric}'"))?;
+    let deck_path = table_get(table, "deck_path");
+    let generator = table_get(table, "generator");
+    let deck = match (deck_path, generator) {
+        (Some(p), None) => DeckSource::Path(p.to_string()),
+        (None, Some(g)) => DeckSource::Generator(g.to_string()),
+        _ => {
+            return Err(format!(
+                "{where_}exactly one of deck_path / generator required"
+            ))
+        }
+    };
+    let expected = table_get(table, "expected")
+        .ok_or_else(|| format!("{where_}missing expected"))?
+        .parse::<f64>()
+        .map_err(|_| format!("{where_}expected must be a number"))?;
+    let tol_pct = table_get(table, "tol_pct")
+        .ok_or_else(|| format!("{where_}missing tol_pct"))?
+        .parse::<f64>()
+        .map_err(|_| format!("{where_}tol_pct must be a number"))?;
+    if !(expected.is_finite() && expected != 0.0 && tol_pct.is_finite() && tol_pct >= 0.0) {
+        return Err(format!(
+            "{where_}expected must be non-zero finite, tol_pct >= 0"
+        ));
+    }
+    Ok(ManifestCase {
+        name: name.to_string(),
+        deck,
+        metric: metric.to_string(),
+        expected,
+        tol_pct,
+        note: table_get(table, "note").unwrap_or("").to_string(),
+    })
+}
+
+/// Resolve and read a deck path: as given (CWD), then relative to the
+/// manifest's directory, then to its parent (repo root for
+/// `benchmarks/manifest.toml`).
+fn read_deck(path: &str, manifest_dir: &Path) -> Result<String, String> {
+    let candidates = [
+        PathBuf::from(path),
+        manifest_dir.join(path),
+        manifest_dir
+            .parent()
+            .map(|p| p.join(path))
+            .unwrap_or_default(),
+    ];
+    for c in &candidates {
+        if let Ok(text) = std::fs::read_to_string(c) {
+            return Ok(text);
+        }
+    }
+    Err(format!(
+        "deck not found: {path} (tried {})",
+        candidates
+            .iter()
+            .map(|c| c.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
+fn generator_deck(name: &str) -> Result<String, String> {
+    match name {
+        "cantilever40x4" => Ok(cantilever_deck()),
+        "kirsch8x8" => Ok(kirsch_deck()),
+        "patch_cps4" => Ok(patch_deck()),
+        other => Err(format!(
+            "unknown generator '{other}' (want cantilever40x4 | kirsch8x8 | patch_cps4)"
+        )),
+    }
+}
+
+/// A case that could not run: FAIL row with the reason attached.
+fn error_outcome(case: &ManifestCase, msg: String) -> CaseOutcome {
+    CaseOutcome {
+        name: case.name.clone(),
+        metric: case.metric.clone(),
+        unit: metric_unit(&case.metric).unwrap_or(""),
+        nodes: 0,
+        elements: 0,
+        iterations: 0,
+        value: 0.0,
+        expected: case.expected,
+        tol_pct: case.tol_pct,
+        pct_error: f64::NAN,
+        pass: false,
+        error: Some(msg),
+    }
+}
+
+/// Run one manifest case through the shared gate. Any failure (missing
+/// deck, parse error, solve error, unknown metric) is a FAIL outcome,
+/// never a panic.
+pub fn run_manifest_case(case: &ManifestCase, manifest_dir: &Path) -> CaseOutcome {
+    let text = match &case.deck {
+        DeckSource::Path(p) => read_deck(p, manifest_dir),
+        DeckSource::Generator(g) => generator_deck(g),
+    };
+    let text = match text {
+        Ok(t) => t,
+        Err(msg) => return error_outcome(case, msg),
+    };
+    let model = match solvix_io::parse_inp(&text) {
+        Ok((m, _)) => m,
+        Err(p) => return error_outcome(case, format!("parse line {}: {}", p.line, p.message)),
+    };
+    let (nodes, elements) = (model.mesh.nodes.len(), model.mesh.elements.len());
+    let (value, iterations, msg) = match case.metric.as_str() {
+        "max_disp_mm" | "max_uy_mm" | "max_centroid_von_mises_mpa" | "max_nodal_von_mises_mpa" => {
+            match solvix_core::solve(&model).map_err(crate::solve_error_message) {
+                Ok(sol) => {
+                    let v = match case.metric.as_str() {
+                        "max_disp_mm" => max_disp_mm(&model, &sol),
+                        "max_uy_mm" => max_uy_mm(&model, &sol),
+                        "max_centroid_von_mises_mpa" => max_centroid_von_mises_mpa(&model, &sol),
+                        _ => max_nodal_von_mises_mpa(&model, &sol),
+                    };
+                    (v, sol.iterations, None)
+                }
+                Err(e) => (0.0, 0, Some(e)),
+            }
+        }
+        "max_temperature_c" => match solvix_core::solve_thermal(&model) {
+            Ok(t) => (
+                t.temperatures
+                    .iter()
+                    .copied()
+                    .fold(f64::NEG_INFINITY, f64::max),
+                0,
+                None,
+            ),
+            Err(e) => (0.0, 0, Some(crate::solve_error_message(e))),
+        },
+        "freq_1_hz" => {
+            match solvix_core::solve_modal(&model, &solvix_core::ModalOptions { num_modes: 1 }) {
+                Ok(m) => (m.frequencies_hz[0], m.iterations, None),
+                Err(e) => (0.0, 0, Some(crate::solve_error_message(e))),
+            }
+        }
+        "pcr_n" => match solvix_core::buckle::solve_buckle(&model, 1) {
+            Ok(b) => {
+                // Factor on the model's own load pattern: Pcr = lambda * P.
+                let total: f64 = model.cloads.iter().map(|c| c.value.abs()).sum();
+                (b.load_factors[0] * total, b.iterations, None)
+            }
+            Err(e) => (0.0, 0, Some(crate::solve_error_message(e))),
+        },
+        other => (0.0, 0, Some(format!("unknown metric '{other}'"))),
+    };
+    if let Some(msg) = msg {
+        return error_outcome(case, msg);
+    }
+    let (pct_error, pass) = gate(value, case.expected, case.tol_pct);
+    CaseOutcome {
+        name: case.name.clone(),
+        metric: case.metric.clone(),
+        unit: metric_unit(&case.metric).unwrap_or(""),
+        nodes,
+        elements,
+        iterations,
+        value,
+        expected: case.expected,
+        tol_pct: case.tol_pct,
+        pct_error,
+        pass,
+        error: None,
+    }
+}
+
 pub fn human(outcomes: &[CaseOutcome]) -> String {
     let mut out = format!(
-        "{:<14}{:>6}{:>7}{:>7}  {:<26}{:>11}{:>11}{:>9}  {}\n",
+        "{:<18}{:>6}{:>7}{:>7}  {:<26}{:>11}{:>11}{:>9}  {}\n",
         "case", "nodes", "elems", "iter", "metric", "value", "expected", "error", "verdict"
     );
     for o in outcomes {
         out.push_str(&format!(
-            "{:<14}{:>6}{:>7}{:>7}  {:<26}{:>11}{:>11}{:>9}  {}\n",
+            "{:<18}{:>6}{:>7}{:>7}  {:<26}{:>11}{:>11}{:>9}  {}\n",
             o.name,
             o.nodes,
             o.elements,
@@ -174,6 +510,13 @@ pub fn human(outcomes: &[CaseOutcome]) -> String {
     }
     let passed = outcomes.iter().filter(|o| o.pass).count();
     out.push_str(&format!("{}/{} passed\n", passed, outcomes.len()));
+    for o in outcomes.iter().filter(|o| o.error.is_some()) {
+        out.push_str(&format!(
+            "error {}: {}\n",
+            o.name,
+            o.error.as_deref().unwrap_or("")
+        ));
+    }
     out
 }
 
@@ -181,16 +524,21 @@ pub fn json_line(outcomes: &[CaseOutcome]) -> String {
     let cases = outcomes
         .iter()
         .map(|o| {
-            format!(
-                "{{\"name\":\"{}\",\"metric\":\"{}\",\"value\":{:.3},\"expected\":{:.3},\"tolerance\":{:.1},\"pct_error\":{:.2},\"pass\":{}}}",
-                json_escape(o.name),
-                json_escape(o.metric),
+            let mut j = format!(
+                "{{\"name\":\"{}\",\"metric\":\"{}\",\"value\":{:.3},\"expected\":{:.3},\"tolerance\":{:.1},\"pct_error\":{:.2},\"pass\":{}",
+                json_escape(&o.name),
+                json_escape(&o.metric),
                 fin(o.value),
                 fin(o.expected),
                 o.tol_pct,
                 fin(o.pct_error),
                 o.pass,
-            )
+            );
+            if let Some(e) = &o.error {
+                j.push_str(&format!(",\"error\":\"{}\"", json_escape(e)));
+            }
+            j.push('}');
+            j
         })
         .collect::<Vec<_>>()
         .join(",");
@@ -199,6 +547,56 @@ pub fn json_line(outcomes: &[CaseOutcome]) -> String {
         outcomes.iter().all(|o| o.pass),
         cases
     )
+}
+
+/// The docs/BENCHMARKS.md body (issue #34): scoreboard table of the run
+/// plus the workflow. Regenerated by
+/// `solvix bench --manifest benchmarks/manifest.toml --markdown`.
+pub fn markdown_doc(outcomes: &[CaseOutcome], notes: &[(String, String)]) -> String {
+    let mut out = String::from(
+        "# Solvix parity scoreboard\n\n\
+         Analytical regression gates for the solver (issue #34): every case\n\
+         compares one metric of a solved deck against a closed-form reference\n\
+         with a per-case tolerance. Cases live in `benchmarks/manifest.toml`\n\
+         (decks in `examples/` and `benchmarks/decks/`); `solvix bench` runs\n\
+         the built-in suite plus the manifest.\n\n\
+         ## Workflow\n\n\
+         Run the suite locally (same command CI runs in\n\
+         `.github/workflows/bench.yml` on every push/PR — any FAIL exits 3\n\
+         and fails the build):\n\n\
+         ```console\n\
+         cargo run -q -p solvix-cli -- bench --manifest benchmarks/manifest.toml\n\
+         ```\n\n\
+         JSON for agents: add `--json`. Regenerate this file after a\n\
+         deliberate solver change (human-run, not CI):\n\n\
+         ```console\n\
+         cargo run -q -p solvix-cli -- bench --manifest benchmarks/manifest.toml --markdown > docs/BENCHMARKS.md\n\
+         ```\n\n\
+         ## Scoreboard (last local run)\n\n\
+         | case | metric | value | expected | error | verdict |\n\
+         |------|--------|-------|----------|-------|---------|\n",
+    );
+    for o in outcomes {
+        out.push_str(&format!(
+            "| {} | {} | {:.3} {} | {:.3} | {:+.2}% | {} |\n",
+            o.name,
+            o.metric,
+            fin(o.value),
+            o.unit,
+            fin(o.expected),
+            fin(o.pct_error),
+            if o.pass { "PASS" } else { "FAIL" },
+        ));
+    }
+    let passed = outcomes.iter().filter(|o| o.pass).count();
+    out.push_str(&format!("\n{}/{} passed.\n", passed, outcomes.len()));
+    if !notes.is_empty() {
+        out.push_str("\n## References\n\n");
+        for (name, note) in notes {
+            out.push_str(&format!("- **{name}** — {note}\n"));
+        }
+    }
+    out
 }
 
 fn material_and_step(s: &mut String, thickness: f64) {
@@ -475,6 +873,16 @@ mod tests {
     }
 
     #[test]
+    fn human_lists_error_rows_below_the_table() {
+        let mut o = solved("patch_cps4");
+        o.pass = false;
+        o.error = Some("deck not found: nope.inp".into());
+        let h = human(&[o]);
+        assert!(h.contains("FAIL"), "{h}");
+        assert!(h.contains("error patch_cps4: deck not found"), "{h}");
+    }
+
+    #[test]
     fn json_single_line_schema() {
         let o = solved("patch_cps4");
         let j = json_line(&[o]);
@@ -490,8 +898,8 @@ mod tests {
         );
         assert!(j.contains(r#""tolerance":2.0"#), "{j}");
         let failing = CaseOutcome {
-            name: "x",
-            metric: "m",
+            name: "x".into(),
+            metric: "m".into(),
             unit: "mm",
             nodes: 1,
             elements: 1,
@@ -501,7 +909,197 @@ mod tests {
             tol_pct: 5.0,
             pct_error: -50.0,
             pass: false,
+            error: None,
         };
-        assert!(json_line(&[failing]).starts_with(r#"{"ok":false,"cases":[{"name":"x""#));
+        assert!(json_line(std::slice::from_ref(&failing))
+            .starts_with(r#"{"ok":false,"cases":[{"name":"x""#));
+        let errored = CaseOutcome {
+            pass: false,
+            error: Some("boom \"quoted\"".into()),
+            ..failing
+        };
+        let j = json_line(&[errored]);
+        assert!(
+            j.ends_with(r#""pass":false,"error":"boom \"quoted\""}]}"#),
+            "{j}"
+        );
+    }
+
+    // ---- issue #34: manifest-driven cases ----
+
+    fn manifest_text() -> String {
+        std::fs::read_to_string("../../benchmarks/manifest.toml")
+            .expect("run tests from the crate dir; manifest at repo root")
+    }
+
+    #[test]
+    fn parse_manifest_subset() {
+        let text = "# leading comment\n\
+                    [[case]]\n\
+                    name = \"a\"\n  # spaced comment\n\
+                    deck_path = \"decks/a.inp\"\n\
+                    metric = \"max_disp_mm\"\n\
+                    expected = 15.238\n\
+                    tol_pct = 12.0\n\
+                    note = \"quoted note\"\n\
+                    [case]\n\
+                    name = \"b\"\n\
+                    generator = \"patch_cps4\"\n\
+                    metric = \"pcr_n\"\n\
+                    expected = 4.32e5\n\
+                    tol_pct = 10\n";
+        let cases = parse_manifest(text).unwrap();
+        assert_eq!(cases.len(), 2);
+        assert_eq!(
+            cases[0],
+            ManifestCase {
+                name: "a".into(),
+                deck: DeckSource::Path("decks/a.inp".into()),
+                metric: "max_disp_mm".into(),
+                expected: 15.238,
+                tol_pct: 12.0,
+                note: "quoted note".into(),
+            }
+        );
+        assert_eq!(cases[1].deck, DeckSource::Generator("patch_cps4".into()));
+        assert_eq!(cases[1].expected, 4.32e5);
+        assert_eq!(cases[1].tol_pct, 10.0);
+        assert_eq!(cases[1].note, "");
+    }
+
+    #[test]
+    fn parse_manifest_rejects_bad_input() {
+        let bad = [
+            ("name = \"a\"", "outside a [[case]] table"),
+            ("[[cases]]\nname = \"a\"", "unsupported section"),
+            ("[[case]]\nname = \"a\"\nwat = 1", "unknown key"),
+            ("[[case]]\nmetric = \"max_disp_mm\"", "missing name"),
+            ("[[case]]\nname = \"a\"", "missing metric"),
+            (
+                "[[case]]\nname = \"a\"\nmetric = \"nope\"",
+                "unknown metric",
+            ),
+            (
+                "[[case]]\nname = \"a\"\nmetric = \"pcr_n\"",
+                "missing deck source",
+            ),
+            (
+                "[[case]]\nname = \"a\"\nmetric = \"pcr_n\"\ndeck_path = \"x\"\ngenerator = \"y\"",
+                "both deck sources",
+            ),
+            (
+                "[[case]]\nname = \"a\"\nmetric = \"pcr_n\"\ngenerator = \"y\"",
+                "missing expected",
+            ),
+            (
+                "[[case]]\nname = \"a\"\nmetric = \"pcr_n\"\ngenerator = \"y\"\nexpected = 1",
+                "missing tol_pct",
+            ),
+            (
+                "[[case]]\nname = \"a\"\nmetric = \"pcr_n\"\ngenerator = \"y\"\nexpected = zero\n",
+                "bad float",
+            ),
+            ("[[case]]\nname = \"unterminated", "expected key = value"),
+            ("[[case]]\nname = \"open\n", "unterminated string"),
+            ("[[case]]\nname = \"a\"\nname = \"b\"\n", "duplicate key"),
+            (
+                "[[case]]\nname = \"a\"\nmetric = \"pcr_n\"\ngenerator = \"y\"\nexpected = 0\n",
+                "zero expected",
+            ),
+        ];
+        for (text, why) in bad {
+            assert!(parse_manifest(text).is_err(), "{why}: {text}");
+        }
+    }
+
+    #[test]
+    fn missing_deck_fails_the_case_without_crashing() {
+        let case = ManifestCase {
+            name: "ghost".into(),
+            deck: DeckSource::Path("definitely/missing.inp".into()),
+            metric: "max_disp_mm".into(),
+            expected: 1.0,
+            tol_pct: 10.0,
+            note: String::new(),
+        };
+        let o = run_manifest_case(&case, Path::new("../../benchmarks"));
+        assert!(!o.pass);
+        assert_eq!(o.nodes, 0);
+        let msg = o.error.expect("error rides along");
+        assert!(msg.contains("deck not found"), "{msg}");
+        assert!(msg.contains("definitely/missing.inp"), "{msg}");
+    }
+
+    #[test]
+    fn unknown_generator_fails_the_case() {
+        let case = ManifestCase {
+            name: "ghost".into(),
+            deck: DeckSource::Generator("nope".into()),
+            metric: "max_disp_mm".into(),
+            expected: 1.0,
+            tol_pct: 10.0,
+            note: String::new(),
+        };
+        let o = run_manifest_case(&case, Path::new("."));
+        assert!(!o.pass);
+        assert!(o.error.as_deref().unwrap().contains("unknown generator"));
+    }
+
+    #[test]
+    fn repo_manifest_parses_with_the_expected_cases() {
+        let cases = parse_manifest(&manifest_text()).unwrap();
+        let names: Vec<&str> = cases.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "cantilever40x4",
+                "kirsch8x8",
+                "patch_cps4",
+                "cantilever3d",
+                "thermal_bar",
+                "b31_cantilever",
+                "modal_cantilever",
+                "euler_column",
+            ]
+        );
+        assert!(cases.iter().all(|c| !c.note.is_empty()));
+        assert!(cases
+            .iter()
+            .any(|c| c.deck == DeckSource::Generator("patch_cps4".into())));
+    }
+
+    #[test]
+    fn repo_manifest_cases_all_pass() {
+        let cases = parse_manifest(&manifest_text()).unwrap();
+        let dir = Path::new("../../benchmarks");
+        for case in &cases {
+            let o = run_manifest_case(case, dir);
+            assert!(
+                o.pass,
+                "{}: value {} vs {} ({:?})",
+                o.name, o.value, o.expected, o.error
+            );
+        }
+    }
+
+    #[test]
+    fn markdown_doc_is_the_scoreboard() {
+        let o = solved("patch_cps4");
+        let m = markdown_doc(&[o], &[("patch_cps4".into(), "exact patch: 1 MPa".into())]);
+        assert!(m.contains("# Solvix parity scoreboard"), "{m}");
+        assert!(
+            m.contains("| case | metric | value | expected | error | verdict |"),
+            "{m}"
+        );
+        assert!(
+            m.contains("| patch_cps4 | max_centroid_von_mises_mpa | 1.000 MPa | 1.000 |"),
+            "{m}"
+        );
+        assert!(m.contains("1/1 passed."), "{m}");
+        assert!(
+            m.contains("bench --manifest benchmarks/manifest.toml"),
+            "{m}"
+        );
+        assert!(m.contains("- **patch_cps4** — exact patch: 1 MPa"), "{m}");
     }
 }

@@ -51,3 +51,13 @@ pub fn write_vtu(
 ) -> std::io::Result<()> {
     vtu::write_vtu(path, model, solution)
 }
+
+/// Write nodal displacements and element von Mises stress as a binary
+/// appended-data VTK UnstructuredGrid `.vtu` file (ParaView-ready).
+pub fn write_vtu_binary(
+    path: &std::path::Path,
+    model: &Model,
+    solution: &Solution,
+) -> std::io::Result<()> {
+    vtu::write_vtu_binary(path, model, solution)
+}

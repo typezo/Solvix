@@ -4,7 +4,7 @@
 //!   solvix run <job.inp> [-o outdir] [--odb] [--json]
 //!   solvix info <job.inp> [--json]
 //!   solvix odb <file.solvix> [--inspect | --frame N] [--json]
-//!   solvix bench [--json]
+//!   solvix bench [--manifest <path>] [--markdown] [--json]
 //!
 //! `run` auto-detects the analysis type from the deck (issues #46/#47):
 //! a `*DYNAMIC` step runs transient Newmark dynamics, temperature data
@@ -65,7 +65,17 @@ Usage:
                                                --frame N prints that frame's summary
                                                (time, load fraction, max displacement
                                                / stress / temperature / velocity)
-  solvix bench [--json]                       built-in verification suite (all-pass exit 0, else 3)
+  solvix bench [--manifest <path>] [--markdown] [--json]
+                                                built-in verification suite
+                                                (all-pass exit 0, else 3);
+                                                --manifest appends the
+                                                parity-scoreboard cases of a
+                                                benchmark manifest (see
+                                                benchmarks/manifest.toml);
+                                                --markdown prints the
+                                                docs/BENCHMARKS.md scoreboard
+                                                body (human-run) instead of
+                                                the table
   solvix mcp                                  MCP server on stdio (JSON-RPC 2.0, one object per line)
   solvix help | --help | -h                   show this text
 
@@ -122,6 +132,8 @@ enum Command {
     },
     Bench {
         json: bool,
+        manifest: Option<String>,
+        markdown: bool,
     },
     Mcp,
     Help,
@@ -233,13 +245,34 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
         }
         "bench" => {
             let mut json = false;
-            for a in it {
-                match a.as_str() {
+            let mut manifest: Option<String> = None;
+            let mut markdown = false;
+            let rest: Vec<&String> = it.collect();
+            let mut i = 0;
+            while i < rest.len() {
+                let a = rest[i].as_str();
+                match a {
                     "--json" => json = true,
+                    "--markdown" => markdown = true,
+                    "--manifest" => {
+                        i += 1;
+                        let Some(v) = rest.get(i) else {
+                            return Err("--manifest requires a value".into());
+                        };
+                        manifest = Some(v.to_string());
+                    }
                     other => return Err(format!("unexpected argument for bench: {other}")),
                 }
+                i += 1;
             }
-            Ok(Command::Bench { json })
+            if markdown && json {
+                return Err("--markdown and --json are mutually exclusive".into());
+            }
+            Ok(Command::Bench {
+                json,
+                manifest,
+                markdown,
+            })
         }
         "mcp" => {
             if let Some(extra) = it.next() {
@@ -1260,7 +1293,11 @@ fn cli(args: &[String]) -> i32 {
             odb,
             json,
         } => finish(do_run(&inp, &outdir, modes, odb, json), json),
-        Command::Bench { json } => bench::run(json),
+        Command::Bench {
+            json,
+            manifest,
+            markdown,
+        } => bench::run(json, manifest.as_deref(), markdown),
         Command::Mcp => mcp::serve(),
     }
 }
@@ -1452,14 +1489,40 @@ mod tests {
     fn args_bench() {
         assert_eq!(
             parse_args(&sv(&["bench"])),
-            Ok(Command::Bench { json: false })
+            Ok(Command::Bench {
+                json: false,
+                manifest: None,
+                markdown: false
+            })
         );
         assert_eq!(
             parse_args(&sv(&["bench", "--json"])),
-            Ok(Command::Bench { json: true })
+            Ok(Command::Bench {
+                json: true,
+                manifest: None,
+                markdown: false
+            })
+        );
+        assert_eq!(
+            parse_args(&sv(&[
+                "bench",
+                "--manifest",
+                "benchmarks/manifest.toml",
+                "--markdown"
+            ])),
+            Ok(Command::Bench {
+                json: false,
+                manifest: Some("benchmarks/manifest.toml".into()),
+                markdown: true
+            })
         );
         assert!(parse_args(&sv(&["bench", "extra"])).is_err());
         assert!(parse_args(&sv(&["bench", "-o", "x"])).is_err());
+        let err = parse_args(&sv(&["bench", "--manifest"])).unwrap_err();
+        assert!(err.contains("--manifest requires a value"), "{err}");
+        let err =
+            parse_args(&sv(&["bench", "--manifest", "m", "--json", "--markdown"])).unwrap_err();
+        assert!(err.contains("mutually exclusive"), "{err}");
     }
 
     #[test]

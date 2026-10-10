@@ -1,0 +1,15 @@
+name: bench
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  parity-scoreboard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Manifest benchmark regression gate
+        run: cargo run -q -p solvix-cli -- bench --manifest benchmarks/manifest.toml
