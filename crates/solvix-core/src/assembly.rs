@@ -9,6 +9,7 @@ use crate::element::{
 use crate::{ElemKind, Model, SolveError};
 
 /// Compressed sparse row matrix (symmetric pattern, sorted column indices).
+#[derive(Clone)]
 pub(crate) struct Csr {
     pub(crate) row_ptr: Vec<usize>,
     pub(crate) col_idx: Vec<usize>,

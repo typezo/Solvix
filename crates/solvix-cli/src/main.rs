@@ -211,6 +211,8 @@ struct RunSummary {
     nodes: usize,
     elements: usize,
     iterations: usize,
+    solver_method: String,
+    cond_estimate: f64,
     residual: f64,
     solve_ms: u64,
     max_disp_m: f64,
@@ -236,6 +238,8 @@ fn run_summary(
         nodes: model.mesh.nodes.len(),
         elements: model.mesh.elements.len(),
         iterations: sol.iterations,
+        solver_method: sol.solver_method.clone(),
+        cond_estimate: sol.cond_estimate,
         residual: sol.final_residual,
         solve_ms,
         max_disp_m,
@@ -246,11 +250,13 @@ fn run_summary(
 
 fn success_json(s: &RunSummary) -> String {
     format!(
-        "{{\"ok\":true,\"job\":\"{}\",\"nodes\":{},\"elements\":{},\"iterations\":{},\"residual\":{},\"solve_ms\":{},\"max_disp_mm\":{},\"max_von_mises_mpa\":{},\"outputs\":[{}]}}",
+        "{{\"ok\":true,\"job\":\"{}\",\"nodes\":{},\"elements\":{},\"iterations\":{},\"solver_method\":\"{}\",\"cond_estimate\":{},\"residual\":{},\"solve_ms\":{},\"max_disp_mm\":{},\"max_von_mises_mpa\":{},\"outputs\":[{}]}}",
         json_escape(&s.job),
         s.nodes,
         s.elements,
         s.iterations,
+        json_escape(&s.solver_method),
+        fmt_e(s.cond_estimate),
         fmt_e(s.residual),
         s.solve_ms,
         fmt_mm(s.max_disp_m),
@@ -269,6 +275,8 @@ fn run_human(s: &RunSummary) -> String {
     out.push_str(&row("nodes", &s.nodes.to_string()));
     out.push_str(&row("elements", &s.elements.to_string()));
     out.push_str(&row("iterations", &s.iterations.to_string()));
+    out.push_str(&row("solver method", &s.solver_method));
+    out.push_str(&row("cond estimate", &fmt_e(s.cond_estimate)));
     out.push_str(&row("residual", &fmt_e(s.residual)));
     out.push_str(&row("solve time", &format!("{} ms", s.solve_ms)));
     out.push_str(&row("max |disp|", &format!("{} mm", fmt_mm(s.max_disp_m))));
@@ -291,6 +299,7 @@ struct InfoReport {
     materials: Vec<String>,
     bc_nodes: usize,
     cload_sum: Vec<(usize, f64)>,
+    warnings: usize,
 }
 
 fn kind_name(k: ElemKind) -> &'static str {
@@ -302,7 +311,7 @@ fn kind_name(k: ElemKind) -> &'static str {
     }
 }
 
-fn info_report(model: &Model, job: &str) -> InfoReport {
+fn info_report(model: &Model, job: &str, report: &ParseReport) -> InfoReport {
     let mut by_kind: Vec<(&'static str, usize)> = [ElemKind::Cps3, ElemKind::Cps4]
         .iter()
         .map(|k| (kind_name(*k), 0))
@@ -344,6 +353,7 @@ fn info_report(model: &Model, job: &str) -> InfoReport {
         materials: model.materials.iter().map(|m| m.name.clone()).collect(),
         bc_nodes: bc.len(),
         cload_sum,
+        warnings: report.warnings.len(),
     }
 }
 
@@ -361,7 +371,7 @@ fn info_json(r: &InfoReport) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "{{\"ok\":true,\"job\":\"{}\",\"nodes\":{},\"elements\":{},\"elements_by_kind\":{{{}}},\"elsets\":{},\"elset_names\":[{}],\"materials\":{},\"material_names\":[{}],\"bc_nodes\":{},\"cload_sum_per_dof\":{{{}}}}}",
+        "{{\"ok\":true,\"job\":\"{}\",\"nodes\":{},\"elements\":{},\"elements_by_kind\":{{{}}},\"elsets\":{},\"elset_names\":[{}],\"materials\":{},\"material_names\":[{}],\"bc_nodes\":{},\"cload_sum_per_dof\":{{{}}},\"warnings\":{}}}",
         json_escape(&r.job),
         r.nodes,
         r.elements,
@@ -372,6 +382,7 @@ fn info_json(r: &InfoReport) -> String {
         names_json(&r.materials),
         r.bc_nodes,
         loads,
+        r.warnings,
     )
 }
 
@@ -407,6 +418,9 @@ fn info_human(r: &InfoReport) -> String {
     out.push_str(&row("materials", &list_or_count(&r.materials)));
     out.push_str(&row("bc nodes", &r.bc_nodes.to_string()));
     out.push_str(&row("cload sum", &loads));
+    if r.warnings > 0 {
+        out.push_str(&row("warnings", &r.warnings.to_string()));
+    }
     out
 }
 
@@ -480,7 +494,7 @@ fn do_info(inp: &str, json: bool) -> Result<(), (Stage, String)> {
     let text = read_deck(inp)?;
     let (model, report) = parse_deck(&text)?;
     emit_warnings(&report);
-    let r = info_report(&model, &job_name(inp));
+    let r = info_report(&model, &job_name(inp), &report);
     if json {
         println!("{}", info_json(&r));
     } else {
@@ -596,7 +610,8 @@ mod tests {
             reactions: vec![],
             iterations: 42,
             final_residual: 1.5e-12,
-            ..Solution::default()
+            solver_method: "pcg".into(),
+            cond_estimate: 12.5,
         }
     }
 
@@ -711,7 +726,7 @@ mod tests {
         );
         assert_eq!(
             success_json(&s),
-            r#"{"ok":true,"job":"demo","nodes":2,"elements":1,"iterations":42,"residual":1.500e-12,"solve_ms":7,"max_disp_mm":4.762,"max_von_mises_mpa":38.200,"outputs":["demo.vtu"]}"#
+            r#"{"ok":true,"job":"demo","nodes":2,"elements":1,"iterations":42,"solver_method":"pcg","cond_estimate":1.250e1,"residual":1.500e-12,"solve_ms":7,"max_disp_mm":4.762,"max_von_mises_mpa":38.200,"outputs":["demo.vtu"]}"#
         );
     }
 
@@ -764,10 +779,13 @@ mod tests {
 
     #[test]
     fn info_json_exact() {
-        let r = info_report(&fake_model(), "demo");
+        let report = ParseReport {
+            warnings: vec!["skipped *HEADING".into()],
+        };
+        let r = info_report(&fake_model(), "demo", &report);
         assert_eq!(
             info_json(&r),
-            r#"{"ok":true,"job":"demo","nodes":2,"elements":1,"elements_by_kind":{"cps3":0,"cps4":1},"elsets":1,"elset_names":["all"],"materials":1,"material_names":["steel"],"bc_nodes":1,"cload_sum_per_dof":{"2":1000.000}}"#
+            r#"{"ok":true,"job":"demo","nodes":2,"elements":1,"elements_by_kind":{"cps3":0,"cps4":1},"elsets":1,"elset_names":["all"],"materials":1,"material_names":["steel"],"bc_nodes":1,"cload_sum_per_dof":{"2":1000.000},"warnings":1}"#
         );
     }
 
@@ -775,8 +793,8 @@ mod tests {
     fn info_json_no_loads() {
         let mut m = fake_model();
         m.cloads.clear();
-        let r = info_report(&m, "demo");
-        assert!(info_json(&r).ends_with(r#""cload_sum_per_dof":{}}"#));
+        let r = info_report(&m, "demo", &ParseReport::default());
+        assert!(info_json(&r).ends_with(r#""cload_sum_per_dof":{},"warnings":0}"#));
     }
 
     #[test]
@@ -792,7 +810,7 @@ mod tests {
             dof: 1,
             value: -10.0,
         });
-        let r = info_report(&m, "demo");
+        let r = info_report(&m, "demo", &ParseReport::default());
         assert_eq!(r.cload_sum, vec![(1, -10.0), (2, 1250.5)]);
     }
 
@@ -810,6 +828,19 @@ mod tests {
         assert!(h.contains("38.200 MPa"), "{h}");
         assert!(h.contains("demo.vtu"), "{h}");
         assert!(h.contains("42"), "{h}");
+        assert!(h.contains("solver method pcg"), "{h}");
+        assert!(h.contains("cond estimate 1.250e1"), "{h}");
+    }
+
+    #[test]
+    fn info_human_prints_warning_count_when_present() {
+        let report = ParseReport {
+            warnings: vec!["skipped *HEADING".into()],
+        };
+        let r = info_report(&fake_model(), "demo", &report);
+        let h = info_human(&r);
+
+        assert!(h.contains("warnings      1"), "{h}");
     }
 
     #[test]

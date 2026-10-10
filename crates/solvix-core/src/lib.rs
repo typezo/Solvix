@@ -15,6 +15,7 @@
 //! frequencies and mass-normalized mode shapes.
 
 mod assembly;
+pub mod buckle;
 mod element;
 mod ldl;
 mod modal;

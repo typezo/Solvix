@@ -345,7 +345,7 @@ impl Default for McpState {
 }
 
 const TOOL_INFO: &str = r#"{"name":"solvix_info","description":"Parse a Solvix .inp deck and report mesh, BC and load statistics without solving. Units: SI in (m, N, Pa).","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Path to the .inp deck (SI units: m, N, Pa)"}},"required":["path"]}}"#;
-const TOOL_RUN: &str = r#"{"name":"solvix_run","description":"Parse, solve and write <jobname>.vtu for a .inp deck; returns the run summary. Units: SI in (m, N, Pa); mm and MPa out.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Path to the .inp deck (SI units: m, N, Pa)"},"outdir":{"type":"string","description":"Output directory for the .vtu file (default: working directory)"}},"required":["path"]}}"#;
+const TOOL_RUN: &str = r#"{"name":"solvix_run","description":"Parse, solve and write <jobname>.vtu for a .inp deck; returns the run summary with solver_method (pcg or ldlt) and cond_estimate (a diagonal conditioning indicator). Units: SI in (m, N, Pa); mm and MPa out.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Path to the .inp deck (SI units: m, N, Pa)"},"outdir":{"type":"string","description":"Output directory for the .vtu file (default: working directory)"}},"required":["path"]}}"#;
 const TOOL_RESULTS: &str = r#"{"name":"solvix_results","description":"Solve a .inp deck (reuses a cached solution per path) and return per-node displacements plus nodal and element von Mises arrays. Units: SI in (m, N, Pa); mm and MPa out.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Path to the .inp deck (SI units: m, N, Pa)"}},"required":["path"]}}"#;
 const TOOL_BENCH: &str = r#"{"name":"solvix_bench","description":"Run the built-in verification suite (cantilever40x4, kirsch, patch_cps4) and report values vs analytical references with pass/fail gates. Metrics in mm / MPa.","inputSchema":{"type":"object","properties":{},"required":[]}}"#;
 
@@ -383,8 +383,8 @@ fn arg_str<'a>(args: &'a Json, key: &str) -> Result<&'a str, (Stage, String)> {
 fn tool_info(args: &Json) -> Result<String, (Stage, String)> {
     let path = arg_str(args, "path")?;
     let text = read_deck(path)?;
-    let (model, _) = parse_deck(&text)?;
-    Ok(info_json(&info_report(&model, &job_name(path))))
+    let (model, report) = parse_deck(&text)?;
+    Ok(info_json(&info_report(&model, &job_name(path), &report)))
 }
 
 fn tool_run(args: &Json) -> Result<String, (Stage, String)> {
@@ -794,6 +794,8 @@ mod tests {
         assert_eq!(resp.matches("\"inputSchema\":").count(), 4, "{resp}");
         assert!(resp.contains(r#""required":["path"]"#), "{resp}");
         assert!(resp.contains("mm and MPa out"), "{resp}");
+        assert!(resp.contains("solver_method"), "{resp}");
+        assert!(resp.contains("cond_estimate"), "{resp}");
     }
 
     // tools/call -----------------------------------------------------------
@@ -808,6 +810,7 @@ mod tests {
         assert!(payload.contains(r#""ok":true"#), "{payload}");
         assert!(payload.contains(r#""nodes":6"#), "{payload}");
         assert!(payload.contains(r#""elements":2"#), "{payload}");
+        assert!(payload.contains(r#""warnings":"#), "{payload}");
         std::fs::remove_file(p).ok();
     }
 
@@ -827,6 +830,8 @@ mod tests {
         assert!(resp.contains(r#""isError":false"#), "{resp}");
         let payload = text_of(&resp);
         assert!(payload.contains(r#""ok":true"#), "{payload}");
+        assert!(payload.contains(r#""solver_method":"#), "{payload}");
+        assert!(payload.contains(r#""cond_estimate":"#), "{payload}");
         assert!(payload.contains(r#""max_disp_mm":"#), "{payload}");
         assert!(!payload.contains(r#""max_disp_mm":0.000"#), "{payload}");
         assert!(

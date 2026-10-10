@@ -221,7 +221,7 @@ pub(crate) fn assemble_mass(model: &Model, ndof: usize) -> Result<Csr, SolveErro
 /// Principal submatrix of `a` on the dofs where `is_constrained` is
 /// false, renumbered to 0..n_free. Also returns the kept old indices,
 /// ascending (the map for expanding solution vectors back).
-fn free_submatrix(a: &Csr, is_constrained: &[bool]) -> (Csr, Vec<usize>) {
+pub(crate) fn free_submatrix(a: &Csr, is_constrained: &[bool]) -> (Csr, Vec<usize>) {
     let free: Vec<usize> = (0..is_constrained.len())
         .filter(|&i| !is_constrained[i])
         .collect();
@@ -243,11 +243,11 @@ fn free_submatrix(a: &Csr, is_constrained: &[bool]) -> (Csr, Vec<usize>) {
 
 // ---- small dense symmetric helpers (p x p, p <= num_modes + 4) ----
 
-fn zeros(p: usize) -> Vec<Vec<f64>> {
+pub(crate) fn zeros(p: usize) -> Vec<Vec<f64>> {
     vec![vec![0.0; p]; p]
 }
 
-fn dot(a: &[f64], b: &[f64]) -> f64 {
+pub(crate) fn dot(a: &[f64], b: &[f64]) -> f64 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
@@ -379,20 +379,35 @@ fn jacobi_eigen(a0: &[Vec<f64>]) -> (Vec<f64>, Vec<Vec<f64>>) {
 /// columns. Whitening: `mm = G G^T`, Jacobi on `G^-1 kk G^-T`,
 /// `c = G^-T z`. `None` when `mm` stays indefinite even after the
 /// ridge below.
-fn generalized_eigenpairs(kk: &[Vec<f64>], mm: &[Vec<f64>]) -> Option<(Vec<f64>, Vec<Vec<f64>>)> {
+pub(crate) fn generalized_eigenpairs(
+    kk: &[Vec<f64>],
+    mm: &[Vec<f64>],
+) -> Option<(Vec<f64>, Vec<Vec<f64>>)> {
     let n = kk.len();
     let mut mm = mm.to_vec();
+    let max_diag = (0..n).map(|i| mm[i][i].abs()).fold(0.0f64, f64::max);
+    let mean_diag = max_diag; // scale reference: strongest diagonal entry
     let g = match cholesky(&mm) {
         Some(g) => g,
         None => {
-            // Near-converged blocks make cond(Y^T M Y) climb; a 1e-10
-            // relative diagonal ridge keeps the Cholesky alive. v1
-            // band-aid, invisible at eigenvalue accuracy 1e-9.
-            let ridge = 1e-10 * (0..n).map(|i| mm[i][i]).sum::<f64>() / n as f64;
-            for (i, row) in mm.iter_mut().enumerate() {
-                row[i] += ridge;
+            // Near-converged blocks make cond(Y^T M Y) climb; an adaptive
+            // relative ridge keeps the Cholesky alive. Regularizing the
+            // projected mass perturbs eigenvalues O(ridge) — 1e-4 relative
+            // is the ceiling (raised for buckling pencils with strong local tension).
+            let cap = 1e-2 * mean_diag.abs().max(f64::MIN_POSITIVE);
+            let mut ridge = 1e-10 * mean_diag.abs();
+            loop {
+                for (i, row) in mm.iter_mut().enumerate() {
+                    row[i] += ridge;
+                }
+                if let Some(g) = cholesky(&mm) {
+                    break g;
+                }
+                if ridge >= cap {
+                    return None; // ridge ceiling exhausted
+                }
+                ridge *= 100.0;
             }
-            cholesky(&mm)?
         }
     };
     // H = G^-1 kk G^-T in three column solves: W = G^-1 kk, then
@@ -434,11 +449,11 @@ fn generalized_eigenpairs(kk: &[Vec<f64>], mm: &[Vec<f64>]) -> Option<(Vec<f64>,
 
 /// xorshift64* seeded from a fixed constant: the start block — and so
 /// the whole eigen-solution — is reproducible across runs and platforms.
-struct Rng(u64);
+pub(crate) struct Rng(pub(crate) u64);
 
 impl Rng {
     /// Uniform in [-1, 1).
-    fn unit(&mut self) -> f64 {
+    pub(crate) fn unit(&mut self) -> f64 {
         let mut x = self.0;
         x ^= x >> 12;
         x ^= x << 25;
