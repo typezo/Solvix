@@ -712,14 +712,29 @@ TIP, 2, -50.0
     fn unsupported_element_type_and_missing_type_warn_and_skip() {
         let deck = concat!(
             "*NODE\n1,0,0\n2,1,0\n3,0,1\n",
-            "*ELEMENT, TYPE=C3D8\n1, 1, 2, 3, 1, 2, 3, 1\n",
+            "*ELEMENT, TYPE=S4R\n1, 1, 2, 3, 1\n",
             "*ELEMENT\n5, 1, 2, 3\n",
         );
         let (m, r) = parse_inp(deck).unwrap();
         assert!(m.mesh.elements.is_empty());
         assert_eq!(r.warnings.len(), 2);
-        assert!(r.warnings[0].contains("TYPE=C3D8"));
+        assert!(r.warnings[0].contains("TYPE=S4R"));
         assert!(r.warnings[1].contains("TYPE-less"));
+    }
+
+    #[test]
+    fn c3d8_and_c3d4_element_types_parse() {
+        let deck = concat!(
+            "*NODE\n",
+            "1,0,0,0\n2,1,0,0\n3,1,1,0\n4,0,1,0\n5,0,0,1\n6,1,0,1\n7,1,1,1\n8,0,1,1\n",
+            "*ELEMENT, TYPE=C3D8\n1, 1, 2, 3, 4, 5, 6, 7, 8\n",
+            "*ELEMENT, TYPE=C3D4\n2, 1, 2, 3, 5\n",
+        );
+        let (m, r) = parse_inp(deck).unwrap();
+        assert!(r.warnings.is_empty());
+        assert_eq!(m.mesh.elements[0].kind, ElemKind::C3d8);
+        assert_eq!(m.mesh.elements[0].connectivity.len(), 8);
+        assert_eq!(m.mesh.elements[1].kind, ElemKind::C3d4);
     }
 
     #[test]
