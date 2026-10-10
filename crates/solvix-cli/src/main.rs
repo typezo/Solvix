@@ -5,6 +5,11 @@
 //!   solvix info <job.inp> [--json]
 //!   solvix bench [--json]
 //!
+//! `run` auto-detects the analysis type from the deck (issues #46/#47):
+//! a `*DYNAMIC` step runs transient Newmark dynamics, temperature data
+//! without dynamics runs the thermal-stress pass, anything else is
+//! linear statics. No flags — see [`solve_auto`].
+//!
 //! Exit codes: 0 ok · 1 usage/IO · 2 parse error · 3 solve error.
 //! stdout carries the payload (human table or single-line JSON), stderr
 //! carries warnings — designed for AI agents.
@@ -12,7 +17,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use solvix_core::{ElemKind, Model, Solution, SolveError};
+use solvix_core::{DynSolution, ElemKind, Model, Solution, SolveError};
 use solvix_io::ParseReport;
 
 mod bench;
@@ -27,7 +32,18 @@ Usage:
   solvix run <job.inp> [-o outdir] [--modes N] [--json]
                                               parse, solve, write <jobname>.vtu;
                                               --modes N also extracts the N lowest
-                                              natural frequencies (modal analysis)
+                                              natural frequencies (modal analysis).
+                                              Analysis type is AUTO-DETECTED from
+                                              the deck (no flags): a *DYNAMIC step
+                                              runs transient Newmark dynamics (JSON
+                                              gains \"dynamic\":true, steps, dt,
+                                              duration, final_disp_mm; max_disp_mm
+                                              is the max over all time points); step
+                                              temperature data (*HEAT TRANSFER,
+                                              *TEMPERATURE, *DFLUX) without dynamics
+                                              runs a thermal-stress pass (JSON gains
+                                              \"thermal\":true, max_temperature_c);
+                                              anything else is linear statics
   solvix info <job.inp> [--json]              parse-only model report, never solves
   solvix bench [--json]                       built-in verification suite (all-pass exit 0, else 3)
   solvix mcp                                  MCP server on stdio (JSON-RPC 2.0, one object per line)
@@ -241,21 +257,34 @@ struct RunSummary {
     /// Natural frequencies (Hz) when `--modes N` ran a modal pass; empty
     /// otherwise.
     frequencies_hz: Vec<f64>,
+    /// Auto-detected thermal pass (issue #46): nodal temperature range.
+    thermal: Option<ThermalInfo>,
+    /// Auto-detected transient dynamics (issue #47).
+    dynamic: Option<DynamicInfo>,
 }
 
 fn run_summary(
     model: &Model,
-    sol: &Solution,
+    outcome: &AutoOutcome,
     job: &str,
     solve_ms: u64,
     outputs: Vec<String>,
     frequencies_hz: Vec<f64>,
 ) -> RunSummary {
-    let max_disp_m = sol
-        .displacements
-        .iter()
-        .map(|d| (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt())
-        .fold(0.0, f64::max);
+    let (sol, thermal, dynamic) = match outcome {
+        AutoOutcome::Static { sol, thermal } => (sol, *thermal, None),
+        AutoOutcome::Dynamic { info, final_sol } => (final_sol, None, Some(*info)),
+    };
+    // Dynamic runs report the max over ALL time points, not just the
+    // final frame packed into `sol`.
+    let max_disp_m = match &dynamic {
+        Some(d) => d.max_disp_m,
+        None => sol
+            .displacements
+            .iter()
+            .map(|d| (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt())
+            .fold(0.0, f64::max),
+    };
     let max_von_mises_pa = sol.von_mises.iter().copied().fold(0.0, f64::max);
     RunSummary {
         job: job.to_string(),
@@ -270,11 +299,198 @@ fn run_summary(
         max_von_mises_pa,
         outputs,
         frequencies_hz,
+        thermal,
+        dynamic,
     }
 }
 
 fn fmt_hz(x: f64) -> String {
     format!("{:.3}", fin(x))
+}
+
+fn fmt_c(c: f64) -> String {
+    format!("{:.3}", fin(c))
+}
+
+/// Seconds in plain decimals where reasonable, scientific otherwise.
+fn fmt_secs(x: f64) -> String {
+    let x = fin(x);
+    if x != 0.0 && (x.abs() < 1e-3 || x.abs() >= 1e6) {
+        fmt_e(x)
+    } else {
+        let s = format!("{x:.6}");
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    }
+}
+
+/// Nodal temperature range of an auto-detected thermal run (the deck's
+/// temperature units — only differences enter the stress pass).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ThermalInfo {
+    pub(crate) min_c: f64,
+    pub(crate) max_c: f64,
+}
+
+/// Summary of an auto-detected transient run (`*DYNAMIC`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct DynamicInfo {
+    pub(crate) steps: usize,
+    pub(crate) dt: f64,
+    pub(crate) duration: f64,
+    /// Max over ALL time points of the largest nodal |u| (m).
+    pub(crate) max_disp_m: f64,
+    /// Largest nodal |u| at the final time (m).
+    pub(crate) final_disp_m: f64,
+}
+
+/// What a run actually solved (issues #46/#47): `*DYNAMIC` in any step
+/// wins (transient Newmark; thermal data in the same deck is ignored in
+/// v1 with a stderr warning), temperature data without dynamics runs the
+/// thermal-stress pass, anything else is plain linear statics.
+pub(crate) enum AutoOutcome {
+    Static {
+        sol: Solution,
+        thermal: Option<ThermalInfo>,
+    },
+    Dynamic {
+        info: DynamicInfo,
+        /// Final-time displacements packed as a [`Solution`] for the VTU
+        /// writer and summary fields (v1 dynamics recovers no stresses).
+        final_sol: Solution,
+    },
+}
+
+pub(crate) fn has_dynamics(model: &Model) -> bool {
+    model.steps.iter().any(|s| s.dynamics.is_some())
+}
+
+pub(crate) fn has_thermal(model: &Model) -> bool {
+    model
+        .steps
+        .iter()
+        .any(|s| !s.temp_bcs.is_empty() || !s.heat_fluxes.is_empty() || s.heat_source.is_some())
+}
+
+/// Largest nodal displacement magnitude in a flat dof vector.
+fn max_abs_u(flat: &[f64], ndof: usize) -> f64 {
+    let mut max: f64 = 0.0;
+    for c in flat.chunks(ndof.max(1)) {
+        let mut s = 0.0;
+        for &v in c {
+            s += v * v;
+        }
+        max = max.max(s.sqrt());
+    }
+    max
+}
+
+/// Per-node displacement triples of one flat dof vector.
+fn flat_triples(flat: &[f64], nodes: usize) -> Vec<[f64; 3]> {
+    let ndof = flat.len().checked_div(nodes).unwrap_or(2);
+    (0..nodes)
+        .map(|i| {
+            let b = i * ndof;
+            [
+                flat.get(b).copied().unwrap_or(0.0),
+                flat.get(b + 1).copied().unwrap_or(0.0),
+                if ndof == 3 {
+                    flat.get(b + 2).copied().unwrap_or(0.0)
+                } else {
+                    0.0
+                },
+            ]
+        })
+        .collect()
+}
+
+/// Final-time displacements of a transient run as a [`Solution`]: the VTU
+/// writer and the summary consume per-node triples; stress recovery is
+/// not part of v1 dynamics (empty arrays render as 0 in the VTU).
+fn final_frame_solution(model: &Model, dyn_sol: &DynSolution) -> Solution {
+    let nodes = model.mesh.nodes.len();
+    let flat = dyn_sol
+        .points
+        .last()
+        .map(|p| p.displacements.as_slice())
+        .unwrap_or(&[]);
+    Solution {
+        displacements: flat_triples(flat, nodes),
+        von_mises: Vec::new(),
+        nodal_von_mises: Vec::new(),
+        reactions: Vec::new(),
+        iterations: dyn_sol.iterations_total,
+        final_residual: 0.0,
+        solver_method: "newmark".into(),
+        cond_estimate: 0.0,
+    }
+}
+
+/// The `run` pipeline's analysis-type dispatch (issues #46/#47): detect
+/// from step content, solve with the matching core entry point.
+pub(crate) fn solve_auto(model: &Model) -> Result<AutoOutcome, SolveError> {
+    if has_dynamics(model) {
+        let dyn_sol = solvix_core::solve_dynamic(model)?;
+        let spec = model
+            .steps
+            .iter()
+            .rev()
+            .find(|s| s.dynamics.is_some())
+            .and_then(|s| s.dynamics.as_ref())
+            .expect("has_dynamics checked is_some");
+        let nodes = model.mesh.nodes.len();
+        let ndof = dyn_sol
+            .points
+            .last()
+            .map(|p| p.displacements.len() / nodes.max(1))
+            .unwrap_or(2);
+        let max_disp_m = dyn_sol
+            .points
+            .iter()
+            .map(|p| max_abs_u(&p.displacements, ndof))
+            .fold(0.0, f64::max);
+        let final_disp_m = dyn_sol
+            .points
+            .last()
+            .map(|p| max_abs_u(&p.displacements, ndof))
+            .unwrap_or(0.0);
+        let info = DynamicInfo {
+            steps: dyn_sol.points.len().saturating_sub(1),
+            dt: spec.dt,
+            duration: spec.duration,
+            max_disp_m,
+            final_disp_m,
+        };
+        let final_sol = final_frame_solution(model, &dyn_sol);
+        return Ok(AutoOutcome::Dynamic { info, final_sol });
+    }
+    if has_thermal(model) {
+        // solve_thermomech runs the conduction pass internally; the extra
+        // solve_thermal recovers the temperature field for the summary
+        // (core offers no temps-out variant — the double conduction solve
+        // is the v0.4 price).
+        let temps = solvix_core::solve_thermal(model)?;
+        let sol = solvix_core::solve_thermomech(model)?;
+        let info = ThermalInfo {
+            min_c: temps
+                .temperatures
+                .iter()
+                .copied()
+                .fold(f64::INFINITY, f64::min),
+            max_c: temps
+                .temperatures
+                .iter()
+                .copied()
+                .fold(f64::NEG_INFINITY, f64::max),
+        };
+        return Ok(AutoOutcome::Static {
+            sol,
+            thermal: Some(info),
+        });
+    }
+    Ok(AutoOutcome::Static {
+        sol: solvix_core::solve(model)?,
+        thermal: None,
+    })
 }
 
 fn success_json(s: &RunSummary) -> String {
@@ -293,6 +509,20 @@ fn success_json(s: &RunSummary) -> String {
             freqs
         )
     };
+    let thermal = match s.thermal {
+        Some(t) => format!(",\"thermal\":true,\"max_temperature_c\":{}", fmt_c(t.max_c)),
+        None => String::new(),
+    };
+    let dynamic = match s.dynamic {
+        Some(d) => format!(
+            ",\"dynamic\":true,\"steps\":{},\"dt\":{},\"duration\":{},\"final_disp_mm\":{}",
+            d.steps,
+            fmt_secs(d.dt),
+            fmt_secs(d.duration),
+            fmt_mm(d.final_disp_m)
+        ),
+        None => String::new(),
+    };
     let mut j = format!(
         "{{\"ok\":true,\"job\":\"{}\",\"nodes\":{},\"elements\":{},\"iterations\":{},\"solver_method\":\"{}\",\"cond_estimate\":{},\"residual\":{},\"solve_ms\":{},\"max_disp_mm\":{},\"max_von_mises_mpa\":{},\"outputs\":[{}]",
         json_escape(&s.job),
@@ -308,6 +538,8 @@ fn success_json(s: &RunSummary) -> String {
         names_json(&s.outputs),
     );
     j.push_str(&modal);
+    j.push_str(&thermal);
+    j.push_str(&dynamic);
     j.push('}');
     j
 }
@@ -342,6 +574,21 @@ fn run_human(s: &RunSummary) -> String {
                 &format!("{} Hz", fmt_hz(*f)),
             ));
         }
+    }
+    if let Some(t) = s.thermal {
+        out.push_str(&row("analysis", "thermal-stress (auto)"));
+        out.push_str(&row("max temp", &format!("{} C", fmt_c(t.max_c))));
+        out.push_str(&row("min temp", &format!("{} C", fmt_c(t.min_c))));
+    }
+    if let Some(d) = s.dynamic {
+        out.push_str(&row("analysis", "dynamics, Newmark (auto)"));
+        out.push_str(&row("time steps", &d.steps.to_string()));
+        out.push_str(&row("dt", &format!("{} s", fmt_secs(d.dt))));
+        out.push_str(&row("duration", &format!("{} s", fmt_secs(d.duration))));
+        out.push_str(&row(
+            "final |disp|",
+            &format!("{} mm", fmt_mm(d.final_disp_m)),
+        ));
     }
     out
 }
@@ -531,12 +778,16 @@ fn do_run(
     let text = read_deck(inp)?;
     let (model, report) = parse_deck(&text)?;
     emit_warnings(&report);
+    if has_dynamics(&model) && has_thermal(&model) {
+        eprintln!("warning: *DYNAMIC step present — thermal data ignored (v1: dynamics wins)");
+    }
     let t0 = Instant::now();
-    let sol = solvix_core::solve(&model).map_err(|e| (Stage::Solve, solve_error_message(e)))?;
+    let outcome = solve_auto(&model).map_err(|e| (Stage::Solve, solve_error_message(e)))?;
     let solve_ms = t0.elapsed().as_millis() as u64;
-    // Modal pass (issue #40): after the static solve, extract the N lowest
+    // Modal pass (issue #40): after the solve, extract the N lowest
     // natural frequencies. VTU mode-shape output is deferred: solvix-io is
-    // owned by issue #25 (write_vtu extension is a #25-followup item).
+    // owned by issue #25 (write_vtu extension is a #25-followup item), as
+    // is temperature PointData for thermal jobs (issue #46 follow-up).
     let frequencies_hz = match modes {
         Some(n) => {
             solvix_core::solve_modal(&model, &solvix_core::ModalOptions { num_modes: n })
@@ -549,11 +800,15 @@ fn do_run(
     std::fs::create_dir_all(outdir)
         .map_err(|e| (Stage::Io, format!("cannot create directory {outdir}: {e}")))?;
     let vtu: PathBuf = Path::new(outdir).join(format!("{job}.vtu"));
-    solvix_io::write_vtu(&vtu, &model, &sol)
+    let sol_for_vtu = match &outcome {
+        AutoOutcome::Static { sol, .. } => sol,
+        AutoOutcome::Dynamic { final_sol, .. } => final_sol,
+    };
+    solvix_io::write_vtu(&vtu, &model, sol_for_vtu)
         .map_err(|e| (Stage::Io, format!("cannot write {}: {e}", vtu.display())))?;
     let s = run_summary(
         &model,
-        &sol,
+        &outcome,
         &job,
         solve_ms,
         vec![vtu.display().to_string()],
@@ -698,6 +953,13 @@ mod tests {
         }
     }
 
+    fn static_outcome() -> AutoOutcome {
+        AutoOutcome::Static {
+            sol: fake_solution(),
+            thermal: None,
+        }
+    }
+
     #[test]
     fn unit_fmt_mm() {
         assert_eq!(fmt_mm(0.00476), "4.760");
@@ -834,7 +1096,7 @@ mod tests {
     fn success_json_exact() {
         let s = run_summary(
             &fake_model(),
-            &fake_solution(),
+            &static_outcome(),
             "demo",
             7,
             vec!["demo.vtu".into()],
@@ -850,7 +1112,7 @@ mod tests {
     fn success_json_with_modes_exact() {
         let s = run_summary(
             &fake_model(),
-            &fake_solution(),
+            &static_outcome(),
             "demo",
             7,
             vec!["demo.vtu".into()],
@@ -866,7 +1128,7 @@ mod tests {
     fn run_human_modal_table() {
         let s = run_summary(
             &fake_model(),
-            &fake_solution(),
+            &static_outcome(),
             "demo",
             7,
             vec!["demo.vtu".into()],
@@ -882,7 +1144,7 @@ mod tests {
     fn run_human_static_has_no_mode_rows() {
         let s = run_summary(
             &fake_model(),
-            &fake_solution(),
+            &static_outcome(),
             "demo",
             7,
             vec!["demo.vtu".into()],
@@ -896,7 +1158,7 @@ mod tests {
     fn success_json_escapes_job() {
         let s = run_summary(
             &fake_model(),
-            &fake_solution(),
+            &static_outcome(),
             "my \"job\"",
             0,
             vec!["a b.vtu".into()],
@@ -981,7 +1243,7 @@ mod tests {
     fn run_human_has_units() {
         let s = run_summary(
             &fake_model(),
-            &fake_solution(),
+            &static_outcome(),
             "demo",
             7,
             vec!["demo.vtu".into()],
@@ -1018,5 +1280,195 @@ mod tests {
         assert_eq!(job_name("examples/cantilever.inp"), "cantilever");
         assert_eq!(job_name("weird"), "weird");
         assert_eq!(job_name("/a/b/c.job.inp"), "c.job");
+    }
+
+    // ---- issues #46/#47: auto-detected thermal and dynamics runs ----
+
+    /// 2x1 CPS4 bar, 0.1 x 0.05: clamped left edge, HOT=100 at x=0,
+    /// COLD=0 at x=0.1. T(x) = 100(1 - x/0.1).
+    const THERMAL_DECK: &str = "\
+*HEADING
+    thermal fixture
+*NODE
+1, 0.0, 0.0
+2, 0.05, 0.0
+3, 0.1, 0.0
+4, 0.0, 0.025
+5, 0.05, 0.025
+6, 0.1, 0.025
+*ELEMENT, TYPE=CPS4, ELSET=ALL
+1, 1, 2, 5, 4
+2, 2, 3, 6, 5
+*NSET, NSET=HOT
+1, 4
+*NSET, NSET=COLD
+3, 6
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210e9, 0.3
+*CONDUCTIVITY
+45.0
+*EXPANSION
+1.2e-5
+*SOLID SECTION, ELSET=ALL, MATERIAL=STEEL
+0.01
+*STEP, NAME=HEAT
+*HEAT TRANSFER, STEADY STATE
+*TEMPERATURE
+HOT, 100.0
+COLD, 0.0
+*BOUNDARY
+1, 1, 2
+4, 1, 2
+*END STEP
+";
+
+    /// Same mesh clamped at the left, tip load, transient Newmark:
+    /// dt = 1e-3 over 0.01 s -> 10 steps, 11 output points.
+    const DYNAMIC_DECK: &str = "\
+*HEADING
+    dynamics fixture
+*NODE
+1, 0.0, 0.0
+2, 0.05, 0.0
+3, 0.1, 0.0
+4, 0.0, 0.025
+5, 0.05, 0.025
+6, 0.1, 0.025
+*ELEMENT, TYPE=CPS4, ELSET=ALL
+1, 1, 2, 5, 4
+2, 2, 3, 6, 5
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210e9, 0.3
+*DENSITY
+7850.
+*SOLID SECTION, ELSET=ALL, MATERIAL=STEEL
+0.01
+*STEP
+*DYNAMIC
+1.0E-3, 0.01
+*BOUNDARY
+1, 1, 2
+4, 1, 2
+*CLOAD
+3, 2, -100.0
+6, 2, -100.0
+*END STEP
+";
+
+    #[test]
+    fn auto_detection_helpers() {
+        let (model, _) = solvix_io::parse_inp(THERMAL_DECK).unwrap();
+        assert!(has_thermal(&model));
+        assert!(!has_dynamics(&model));
+        let (model, _) = solvix_io::parse_inp(DYNAMIC_DECK).unwrap();
+        assert!(has_dynamics(&model));
+        assert!(!has_thermal(&model));
+        let (model, _) = solvix_io::parse_inp(
+            "*NODE\n1, 0.0, 0.0\n2, 1.0, 0.0\n3, 0.0, 1.0\n*ELEMENT, TYPE=CPS3, ELSET=A\n1, 1, 2, 3\n*MATERIAL, NAME=M\n*ELASTIC\n1.0, 0.0\n*SOLID SECTION, ELSET=A, MATERIAL=M\n1.0\n*STEP\n*STATIC\n*BOUNDARY\n1, 1, 2\n*END STEP\n",
+        )
+        .unwrap();
+        assert!(!has_thermal(&model));
+        assert!(!has_dynamics(&model));
+    }
+
+    #[test]
+    fn auto_thermal_run_json_and_human() {
+        let (model, _) = solvix_io::parse_inp(THERMAL_DECK).unwrap();
+        let outcome = solve_auto(&model).unwrap();
+        let AutoOutcome::Static { thermal, .. } = &outcome else {
+            panic!("thermal deck must take the thermomech path");
+        };
+        let t = thermal.expect("thermal info present");
+        assert!((t.max_c - 100.0).abs() < 1e-6, "max {t:?}");
+        assert!(t.min_c.abs() < 1e-6, "min {t:?}");
+        let s = run_summary(
+            &model,
+            &outcome,
+            "demo",
+            7,
+            vec!["demo.vtu".into()],
+            Vec::new(),
+        );
+        let j = success_json(&s);
+        assert!(
+            j.contains(r#""thermal":true,"max_temperature_c":100.000"#),
+            "{j}"
+        );
+        assert!(!j.contains("dynamic"), "{j}");
+        let h = run_human(&s);
+        assert!(h.contains("analysis      thermal-stress (auto)"), "{h}");
+        assert!(h.contains("max temp      100.000 C"), "{h}");
+        assert!(h.contains("min temp      0.000 C"), "{h}");
+    }
+
+    #[test]
+    fn auto_dynamic_run_json_and_human() {
+        let (model, _) = solvix_io::parse_inp(DYNAMIC_DECK).unwrap();
+        let outcome = solve_auto(&model).unwrap();
+        let AutoOutcome::Dynamic { info, final_sol } = &outcome else {
+            panic!("dynamic deck must take the transient path");
+        };
+        assert_eq!(info.steps, 10);
+        assert_eq!(final_sol.displacements.len(), model.mesh.nodes.len());
+        // Undamped step load: the oscillation must exceed the static
+        // equilibrium (max over time beats the final value somewhere in
+        // the window) and be non-zero.
+        assert!(info.max_disp_m > 0.0);
+        assert!(info.max_disp_m >= info.final_disp_m, "{info:?}");
+        let s = run_summary(
+            &model,
+            &outcome,
+            "demo",
+            7,
+            vec!["demo.vtu".into()],
+            Vec::new(),
+        );
+        assert_eq!(s.max_disp_m, info.max_disp_m, "summary max is over time");
+        assert_eq!(s.solver_method, "newmark");
+        let j = success_json(&s);
+        assert!(
+            j.contains(r#""dynamic":true,"steps":10,"dt":0.001,"duration":0.01,"final_disp_mm":"#),
+            "{j}"
+        );
+        assert!(!j.contains("thermal"), "{j}");
+        let h = run_human(&s);
+        assert!(h.contains("analysis      dynamics, Newmark (auto)"), "{h}");
+        assert!(h.contains("time steps    10"), "{h}");
+        assert!(h.contains("dt            0.001 s"), "{h}");
+        assert!(h.contains("duration      0.01 s"), "{h}");
+        assert!(h.contains("final |disp|  "), "{h}");
+    }
+
+    #[test]
+    fn auto_static_run_has_no_new_fields() {
+        let (model, _) = solvix_io::parse_inp(
+            "*NODE\n1, 0.0, 0.0\n2, 1.0, 0.0\n3, 0.0, 1.0\n*ELEMENT, TYPE=CPS3, ELSET=A\n1, 1, 2, 3\n*MATERIAL, NAME=M\n*ELASTIC\n1.0, 0.0\n*SOLID SECTION, ELSET=A, MATERIAL=M\n1.0\n*STEP\n*STATIC\n*BOUNDARY\n1, 1, 2\n*CLOAD\n2, 1, 1.0\n*END STEP\n",
+        )
+        .unwrap();
+        let outcome = solve_auto(&model).unwrap();
+        assert!(matches!(outcome, AutoOutcome::Static { thermal: None, .. }));
+        let s = run_summary(
+            &model,
+            &outcome,
+            "demo",
+            1,
+            vec!["demo.vtu".into()],
+            Vec::new(),
+        );
+        let j = success_json(&s);
+        assert!(!j.contains("thermal"), "{j}");
+        assert!(!j.contains("dynamic"), "{j}");
+    }
+
+    #[test]
+    fn fmt_secs_plain_and_scientific() {
+        assert_eq!(fmt_secs(0.1), "0.1");
+        assert_eq!(fmt_secs(0.001), "0.001");
+        assert_eq!(fmt_secs(1e-4), "1.000e-4");
+        assert_eq!(fmt_secs(1.5), "1.5");
+        assert_eq!(fmt_secs(0.0), "0");
+        assert_eq!(fmt_secs(f64::NAN), "0");
     }
 }

@@ -17,7 +17,7 @@ use solvix_core::Solution;
 
 use crate::{
     bench, error_json, fin, fmt_mm, fmt_mpa, info_json, info_report, job_name, json_escape,
-    parse_deck, read_deck, run_summary, solve_error_message, success_json, Stage,
+    parse_deck, read_deck, run_summary, solve_auto, solve_error_message, success_json, Stage,
 };
 
 // ---------------------------------------------------------------------------
@@ -345,7 +345,7 @@ impl Default for McpState {
 }
 
 const TOOL_INFO: &str = r#"{"name":"solvix_info","description":"Parse a Solvix .inp deck and report mesh, BC and load statistics without solving. Units: SI in (m, N, Pa).","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Path to the .inp deck (SI units: m, N, Pa)"}},"required":["path"]}}"#;
-const TOOL_RUN: &str = r#"{"name":"solvix_run","description":"Parse, solve and write <jobname>.vtu for a .inp deck; returns the run summary with solver_method (pcg or ldlt) and cond_estimate (a diagonal conditioning indicator). Optional \"modes\": N also extracts the N lowest natural frequencies (modal analysis; JSON gains modes and frequencies_hz). Units: SI in (m, N, Pa); mm and MPa out.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Path to the .inp deck (SI units: m, N, Pa)"},"outdir":{"type":"string","description":"Output directory for the .vtu file (default: working directory)"},"modes":{"type":"integer","minimum":1,"description":"Also extract the N lowest natural frequencies (modal analysis)"}},"required":["path"]}}"#;
+const TOOL_RUN: &str = r#"{"name":"solvix_run","description":"Parse, solve and write <jobname>.vtu for a .inp deck; returns the run summary with solver_method (pcg or ldlt) and cond_estimate (a diagonal conditioning indicator). The analysis type is AUTO-DETECTED from the deck (no flags): a *DYNAMIC step runs transient Newmark dynamics — JSON gains \"dynamic\":true, steps, dt, duration, final_disp_mm, and max_disp_mm is the max over all time points; step temperature data (*HEAT TRANSFER, *TEMPERATURE, *DFLUX) without dynamics runs a thermal-stress pass — JSON gains \"thermal\":true and max_temperature_c; anything else is linear statics. Optional \"modes\": N also extracts the N lowest natural frequencies (modal analysis; JSON gains modes and frequencies_hz). Units: SI in (m, N, Pa); mm and MPa out.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Path to the .inp deck (SI units: m, N, Pa)"},"outdir":{"type":"string","description":"Output directory for the .vtu file (default: working directory)"},"modes":{"type":"integer","minimum":1,"description":"Also extract the N lowest natural frequencies (modal analysis)"}},"required":["path"]}}"#;
 const TOOL_RESULTS: &str = r#"{"name":"solvix_results","description":"Solve a .inp deck (reuses a cached solution per path) and return per-node displacements plus nodal and element von Mises arrays. Units: SI in (m, N, Pa); mm and MPa out.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Path to the .inp deck (SI units: m, N, Pa)"}},"required":["path"]}}"#;
 const TOOL_BENCH: &str = r#"{"name":"solvix_bench","description":"Run the built-in verification suite (cantilever40x4, kirsch, patch_cps4) and report values vs analytical references with pass/fail gates. Metrics in mm / MPa.","inputSchema":{"type":"object","properties":{},"required":[]}}"#;
 
@@ -412,7 +412,7 @@ fn tool_run(args: &Json) -> Result<String, (Stage, String)> {
     let text = read_deck(path)?;
     let (model, _) = parse_deck(&text)?;
     let t0 = std::time::Instant::now();
-    let sol = solvix_core::solve(&model).map_err(|e| (Stage::Solve, solve_error_message(e)))?;
+    let outcome = solve_auto(&model).map_err(|e| (Stage::Solve, solve_error_message(e)))?;
     let frequencies_hz = match arg_modes(args) {
         Some(n) => {
             solvix_core::solve_modal(&model, &solvix_core::ModalOptions { num_modes: n })
@@ -425,11 +425,15 @@ fn tool_run(args: &Json) -> Result<String, (Stage, String)> {
     std::fs::create_dir_all(&outdir)
         .map_err(|e| (Stage::Io, format!("cannot create directory {outdir}: {e}")))?;
     let vtu = std::path::Path::new(&outdir).join(format!("{}.vtu", job_name(path)));
-    solvix_io::write_vtu(&vtu, &model, &sol)
+    let sol_for_vtu = match &outcome {
+        crate::AutoOutcome::Static { sol, .. } => sol,
+        crate::AutoOutcome::Dynamic { final_sol, .. } => final_sol,
+    };
+    solvix_io::write_vtu(&vtu, &model, sol_for_vtu)
         .map_err(|e| (Stage::Io, format!("cannot write {}: {e}", vtu.display())))?;
     let s = run_summary(
         &model,
-        &sol,
+        &outcome,
         &job_name(path),
         solve_ms,
         vec![vtu.display().to_string()],
@@ -640,6 +644,91 @@ mod tests {
     fn tmp_deck(name: &str) -> String {
         let p = tmp_path(name);
         std::fs::write(&p, tiny_deck()).unwrap();
+        p
+    }
+
+    /// Tiny thermal deck: 2x1 CPS4 bar, T=100 at x=0, T=0 at x=0.1,
+    /// clamped left edge (issue #46 auto-detection).
+    fn thermal_deck() -> String {
+        "\
+*HEADING
+    mcp thermal fixture
+*NODE
+1, 0.0, 0.0
+2, 0.05, 0.0
+3, 0.1, 0.0
+4, 0.0, 0.025
+5, 0.05, 0.025
+6, 0.1, 0.025
+*ELEMENT, TYPE=CPS4, ELSET=ALL
+1, 1, 2, 5, 4
+2, 2, 3, 6, 5
+*NSET, NSET=HOT
+1, 4
+*NSET, NSET=COLD
+3, 6
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210e9, 0.3
+*CONDUCTIVITY
+45.0
+*EXPANSION
+1.2e-5
+*SOLID SECTION, ELSET=ALL, MATERIAL=STEEL
+0.01
+*STEP
+*HEAT TRANSFER, STEADY STATE
+*TEMPERATURE
+HOT, 100.0
+COLD, 0.0
+*BOUNDARY
+1, 1, 2
+4, 1, 2
+*END STEP
+"
+        .to_string()
+    }
+
+    /// Tiny dynamics deck: same mesh, *DYNAMIC 1e-3 over 0.01 s
+    /// (issue #47 auto-detection).
+    fn dynamic_deck() -> String {
+        "\
+*HEADING
+    mcp dynamics fixture
+*NODE
+1, 0.0, 0.0
+2, 0.05, 0.0
+3, 0.1, 0.0
+4, 0.0, 0.025
+5, 0.05, 0.025
+6, 0.1, 0.025
+*ELEMENT, TYPE=CPS4, ELSET=ALL
+1, 1, 2, 5, 4
+2, 2, 3, 6, 5
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210e9, 0.3
+*DENSITY
+7850.
+*SOLID SECTION, ELSET=ALL, MATERIAL=STEEL
+0.01
+*STEP
+*DYNAMIC
+1.0E-3, 0.01
+*BOUNDARY
+1, 1, 2
+4, 1, 2
+*CLOAD
+3, 2, -100.0
+6, 2, -100.0
+*END STEP
+"
+        .to_string()
+    }
+
+    fn tmp_deck_with(name: &str, deck: &str) -> String {
+        let p = tmp_path(name);
+        std::fs::write(&p, deck).unwrap();
         p
     }
 
@@ -961,6 +1050,56 @@ mod tests {
         assert_eq!(text_of(&resp), text_of(&resp2));
         assert_eq!(s.cache.len(), 1);
         std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn call_run_thermal_deck_reports_temperature() {
+        let mut s = McpState::new();
+        let p = tmp_deck_with("runthermal", &thermal_deck());
+        let outdir = std::env::temp_dir()
+            .join(format!("solvix-mcp-test-{}-runthermal", std::process::id()))
+            .display()
+            .to_string();
+        let resp = call_tool(
+            &mut s,
+            "solvix_run",
+            &format!(r#"{{"path":"{p}","outdir":"{outdir}"}}"#),
+        );
+        assert!(resp.contains(r#""isError":false"#), "{resp}");
+        let payload = text_of(&resp);
+        assert!(
+            payload.contains(r#""thermal":true,"max_temperature_c":100"#),
+            "{payload}"
+        );
+        assert!(!payload.contains(r#""dynamic""#), "{payload}");
+        std::fs::remove_file(p).ok();
+        std::fs::remove_dir_all(outdir).ok();
+    }
+
+    #[test]
+    fn call_run_dynamic_deck_reports_transient_fields() {
+        let mut s = McpState::new();
+        let p = tmp_deck_with("rundyn", &dynamic_deck());
+        let outdir = std::env::temp_dir()
+            .join(format!("solvix-mcp-test-{}-rundyn", std::process::id()))
+            .display()
+            .to_string();
+        let resp = call_tool(
+            &mut s,
+            "solvix_run",
+            &format!(r#"{{"path":"{p}","outdir":"{outdir}"}}"#),
+        );
+        assert!(resp.contains(r#""isError":false"#), "{resp}");
+        let payload = text_of(&resp);
+        assert!(
+            payload.contains(
+                r#""dynamic":true,"steps":10,"dt":0.001,"duration":0.01,"final_disp_mm":"#
+            ),
+            "{payload}"
+        );
+        assert!(!payload.contains(r#""thermal""#), "{payload}");
+        std::fs::remove_file(p).ok();
+        std::fs::remove_dir_all(outdir).ok();
     }
 
     #[test]

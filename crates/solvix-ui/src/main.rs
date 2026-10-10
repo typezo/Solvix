@@ -9,10 +9,16 @@
 //! - `POST /api/run` body `{"path": "examples/cantilever.inp"}` (optional
 //!   `"modes": N` also extracts the N lowest natural frequencies, issue #40)
 //!   → run summary JSON (CLI schema; gains `modes`/`frequencies_hz` when run
-//!   with modes)
+//!   with modes, `thermal`/`max_temperature_c` for auto-detected thermal
+//!   decks (issue #46) and `dynamic`/`steps`/`dt`/`duration`/`final_disp_mm`
+//!   for auto-detected `*DYNAMIC` decks (issue #47))
 //! - `GET  /api/results/{job}` → displacements + von Mises arrays; after a
 //!   modal run also `frequencies_hz` and the first 3 `modes` as per-node
-//!   vectors scaled to max |component| = 1.0
+//!   vectors scaled to max |component| = 1.0; thermal runs add
+//!   `thermal.temperatures` (issue #46); dynamic runs add
+//!   `dynamic.time_history` (t, max |u| mm, <= 201 points) and
+//!   `dynamic.frames` (per-node displacement triples at the same times,
+//!   driving the frame slider) (issue #47)
 //! - `GET  /api/agent` → machine-readable API description
 //!
 //! std-only: TcpListener + thread per connection, Connection: close.
@@ -25,7 +31,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use solvix_core::{
-    solve_modal, ElemKind, ModalOptions, ModalSolution, Model, Solution, SolveError,
+    solve_modal, DynSolution, ElemKind, ModalOptions, ModalSolution, Model, Solution, SolveError,
 };
 
 const USAGE: &str = "\
@@ -326,16 +332,134 @@ fn query_param(target: &str, name: &str) -> Option<String> {
 
 // --------------------------------------------------------------- app state
 
-/// One cached solved job: model, static solution, modal run if requested.
-type CachedResult = (Model, Solution, Option<ModalSolution>);
+/// Auto-detected transient run data (issue #47): summary scalars plus the
+/// time history and per-frame displacement triples the results API serves
+/// to the frontend's sparkline + frame slider.
+struct UiDynamic {
+    steps: usize,
+    dt: f64,
+    duration: f64,
+    /// Max over ALL time points of the largest nodal |u| (m).
+    max_disp_m: f64,
+    /// Largest nodal |u| at the final time (m).
+    final_disp_m: f64,
+    /// (t in s, max nodal |u| in mm), subsampled to <= MAX_HISTORY_POINTS.
+    time_history: Vec<(f64, f64)>,
+    /// Per-node displacement triples (m) at the SAME subsample indices —
+    /// the frame slider's deformed shapes.
+    frames: Vec<Vec<[f64; 3]>>,
+}
+
+/// One cached solved job: model, solution, modal run if requested, plus
+/// auto-detected thermal temperatures (issue #46) and dynamics (issue #47).
+struct JobResult {
+    model: Model,
+    /// Static/thermomech solution; for dynamic jobs the final-time frame
+    /// packed as a Solution (v1 dynamics recovers no stresses).
+    sol: Solution,
+    modal: Option<ModalSolution>,
+    /// Nodal temperatures (the deck's temperature units) of a thermal run.
+    thermal: Option<Vec<f64>>,
+    dynamic: Option<UiDynamic>,
+}
+
+/// Time-history/frames subsample ceiling served by /api/results.
+const MAX_HISTORY_POINTS: usize = 201;
+
+/// Evenly spaced indices over 0..n-1 capped at `cap` (first and last
+/// always included, strictly increasing when n > cap).
+fn subsample_indices(n: usize, cap: usize) -> Vec<usize> {
+    if n == 0 {
+        Vec::new()
+    } else if n <= cap {
+        (0..n).collect()
+    } else {
+        (0..cap).map(|i| i * (n - 1) / (cap - 1)).collect()
+    }
+}
+
+/// The run pipeline's analysis-type detection (issues #46/#47): any
+/// `*DYNAMIC` step wins; temperature data without dynamics is thermal.
+fn has_dynamics(model: &Model) -> bool {
+    model.steps.iter().any(|s| s.dynamics.is_some())
+}
+
+fn has_thermal(model: &Model) -> bool {
+    model
+        .steps
+        .iter()
+        .any(|s| !s.temp_bcs.is_empty() || !s.heat_fluxes.is_empty() || s.heat_source.is_some())
+}
+
+/// Largest nodal displacement magnitude in a flat dof vector.
+fn max_abs_u(flat: &[f64], ndof: usize) -> f64 {
+    let mut max: f64 = 0.0;
+    for c in flat.chunks(ndof.max(1)) {
+        let mut s = 0.0;
+        for &v in c {
+            s += v * v;
+        }
+        max = max.max(s.sqrt());
+    }
+    max
+}
+
+/// Per-node displacement triples of one flat dof vector.
+fn flat_triples(flat: &[f64], nodes: usize) -> Vec<[f64; 3]> {
+    let ndof = flat.len().checked_div(nodes).unwrap_or(2);
+    (0..nodes)
+        .map(|i| {
+            let b = i * ndof;
+            [
+                flat.get(b).copied().unwrap_or(0.0),
+                flat.get(b + 1).copied().unwrap_or(0.0),
+                if ndof == 3 {
+                    flat.get(b + 2).copied().unwrap_or(0.0)
+                } else {
+                    0.0
+                },
+            ]
+        })
+        .collect()
+}
+
+/// Summarize a transient solution for the cache: scalars + subsampled
+/// history and frames.
+fn ui_dynamic(model: &Model, dyn_sol: &DynSolution, dt: f64, duration: f64) -> UiDynamic {
+    let nodes = model.mesh.nodes.len();
+    let last = dyn_sol.points.last().expect("solve_dynamic emits t=0");
+    let ndof = last.displacements.len() / nodes.max(1);
+    let max_disp_m = dyn_sol
+        .points
+        .iter()
+        .map(|p| max_abs_u(&p.displacements, ndof))
+        .fold(0.0, f64::max);
+    let final_disp_m = max_abs_u(&last.displacements, ndof);
+    let mut time_history = Vec::new();
+    let mut frames = Vec::new();
+    for i in subsample_indices(dyn_sol.points.len(), MAX_HISTORY_POINTS) {
+        let p = &dyn_sol.points[i];
+        time_history.push((p.time, max_abs_u(&p.displacements, ndof) * 1000.0));
+        frames.push(flat_triples(&p.displacements, nodes));
+    }
+    UiDynamic {
+        steps: dyn_sol.points.len().saturating_sub(1),
+        dt,
+        duration,
+        max_disp_m,
+        final_disp_m,
+        time_history,
+        frames,
+    }
+}
 
 struct AppState {
     /// Workspace root: `examples/` decks resolve under it, `/api/run` paths
     /// resolve relative to it.
     root: PathBuf,
     static_dir: PathBuf,
-    /// job name → last solved (model, solution, modal run if any).
-    results: Mutex<HashMap<String, CachedResult>>,
+    /// job name → last solved JobResult.
+    results: Mutex<HashMap<String, JobResult>>,
 }
 
 /// `<root>/crates/solvix-ui/static` when run from the workspace root,
@@ -431,53 +555,75 @@ fn model_json(model: &Model, job: &str) -> String {
 }
 
 /// Run summary JSON — same schema as `solvix run --json` (issue #3); a
-/// non-empty `frequencies_hz` appends the modal fields (issue #40).
-fn run_summary_json(
-    model: &Model,
-    sol: &Solution,
-    job: &str,
-    solve_ms: u64,
-    outputs: &[String],
-    frequencies_hz: &[f64],
-) -> String {
-    let max_disp_m = sol
-        .displacements
-        .iter()
-        .map(|d| (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt())
-        .fold(0.0, f64::max);
-    let max_mises = sol.von_mises.iter().copied().fold(0.0, f64::max);
+/// non-empty `frequencies_hz` appends the modal fields (issue #40), a
+/// thermal run appends `thermal`/`max_temperature_c` (issue #46) and a
+/// transient run `dynamic`/`steps`/`dt`/`duration`/`final_disp_mm`
+/// (issue #47).
+fn run_summary_json(jr: &JobResult, job: &str, solve_ms: u64, outputs: &[String]) -> String {
+    let max_disp_m = match &jr.dynamic {
+        // Dynamic runs report the max over ALL time points.
+        Some(d) => d.max_disp_m,
+        None => jr
+            .sol
+            .displacements
+            .iter()
+            .map(|d| (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt())
+            .fold(0.0, f64::max),
+    };
+    let max_mises = jr.sol.von_mises.iter().copied().fold(0.0, f64::max);
     let outs = outputs
         .iter()
         .map(|o| format!("\"{}\"", json_escape(o)))
         .collect::<Vec<_>>()
         .join(",");
-    let modal = if frequencies_hz.is_empty() {
-        String::new()
-    } else {
-        let freqs = frequencies_hz
-            .iter()
-            .map(|f| fixed3(*f))
-            .collect::<Vec<_>>()
-            .join(",");
-        format!(
-            ",\"modes\":{},\"frequencies_hz\":[{}]",
-            frequencies_hz.len(),
-            freqs
-        )
+    let modal = match &jr.modal {
+        Some(m) if !m.frequencies_hz.is_empty() => {
+            let freqs = m
+                .frequencies_hz
+                .iter()
+                .map(|f| fixed3(*f))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                ",\"modes\":{},\"frequencies_hz\":[{}]",
+                m.frequencies_hz.len(),
+                freqs
+            )
+        }
+        _ => String::new(),
+    };
+    let thermal = match &jr.thermal {
+        Some(temps) => format!(
+            ",\"thermal\":true,\"max_temperature_c\":{}",
+            fixed3(temps.iter().copied().fold(f64::NEG_INFINITY, f64::max))
+        ),
+        None => String::new(),
+    };
+    let dynamic = match &jr.dynamic {
+        Some(d) => format!(
+            ",\"dynamic\":true,\"steps\":{},\"dt\":{},\"duration\":{},\"final_disp_mm\":{}",
+            d.steps,
+            num(d.dt),
+            num(d.duration),
+            fixed3(d.final_disp_m * 1000.0)
+        ),
+        None => String::new(),
     };
     let mut j = format!(
         "{{\"ok\":true,\"job\":\"{}\",\"nodes\":{},\"elements\":{},\"iterations\":{},\"residual\":{},\"solve_ms\":{},\"max_disp_mm\":{},\"max_von_mises_mpa\":{},\"outputs\":[{}]",
         json_escape(job),
-        model.mesh.nodes.len(),
-        model.mesh.elements.len(),
-        sol.iterations,
-        exp3(sol.final_residual),
+        jr.model.mesh.nodes.len(),
+        jr.model.mesh.elements.len(),
+        jr.sol.iterations,
+        exp3(jr.sol.final_residual),
         solve_ms,
         fixed3(max_disp_m * 1000.0),
         fixed3(max_mises / 1e6),
         outs,
     );
     j.push_str(&modal);
+    j.push_str(&thermal);
+    j.push_str(&dynamic);
     j.push('}');
     j
 }
@@ -529,8 +675,11 @@ fn mode_display_triples(model: &Model, modal: &ModalSolution) -> Vec<Vec<[f64; 3
 }
 
 /// Results JSON — exact shape of `static/mock/results.json`; after a modal
-/// run also `frequencies_hz` plus display-scaled `modes` triples (issue #40).
-fn results_json(job: &str, sol: &Solution, modal: Option<(&Model, &ModalSolution)>) -> String {
+/// run also `frequencies_hz` plus display-scaled `modes` triples (issue #40);
+/// thermal runs add `thermal.temperatures` (issue #46); dynamic runs add
+/// `dynamic.time_history` + `dynamic.frames` (issue #47).
+fn results_json(jr: &JobResult, job: &str) -> String {
+    let sol = &jr.sol;
     let disp = sol
         .displacements
         .iter()
@@ -549,14 +698,17 @@ fn results_json(job: &str, sol: &Solution, modal: Option<(&Model, &ModalSolution
         .map(|v| num(*v))
         .collect::<Vec<_>>()
         .join(",");
-    let max_disp_m = sol
-        .displacements
-        .iter()
-        .map(|d| (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt())
-        .fold(0.0, f64::max);
+    let max_disp_m = match &jr.dynamic {
+        Some(d) => d.max_disp_m,
+        None => sol
+            .displacements
+            .iter()
+            .map(|d| (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt())
+            .fold(0.0, f64::max),
+    };
     let max_mises = sol.von_mises.iter().copied().fold(0.0, f64::max);
-    let modal_json = match modal {
-        Some((model, m)) => {
+    let modal_json = match (&jr.modal, &jr.model) {
+        (Some(m), model) => {
             let freqs = m
                 .frequencies_hz
                 .iter()
@@ -575,6 +727,43 @@ fn results_json(job: &str, sol: &Solution, modal: Option<(&Model, &ModalSolution
                 .join("],[");
             format!(",\"frequencies_hz\":[{}],\"modes\":[[{}]]", freqs, modes)
         }
+        (None, _) => String::new(),
+    };
+    let thermal_json = match &jr.thermal {
+        Some(temps) => {
+            let values = temps.iter().map(|t| num(*t)).collect::<Vec<_>>().join(",");
+            format!(
+                ",\"thermal\":{{\"temperatures\":[{}],\"thermal\":true}}",
+                values
+            )
+        }
+        None => String::new(),
+    };
+    let dynamic_json = match &jr.dynamic {
+        Some(d) => {
+            let history = d
+                .time_history
+                .iter()
+                .map(|(t, u)| format!("{{\"t\":{},\"max_abs_u_mm\":{}}}", num(*t), fixed3(*u)))
+                .collect::<Vec<_>>()
+                .join(",");
+            let frames = d
+                .frames
+                .iter()
+                .map(|frame| {
+                    frame
+                        .iter()
+                        .map(|v| format!("[{},{},{}]", num(v[0]), num(v[1]), num(v[2])))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .collect::<Vec<_>>()
+                .join("],[");
+            format!(
+                ",\"dynamic\":{{\"dynamic\":true,\"time_history\":[{}],\"frames\":[[{}]]}}",
+                history, frames
+            )
+        }
         None => String::new(),
     };
     let mut j = format!(
@@ -588,6 +777,8 @@ fn results_json(job: &str, sol: &Solution, modal: Option<(&Model, &ModalSolution
         sol.iterations,
         exp3(sol.final_residual),
     );
+    j.push_str(&thermal_json);
+    j.push_str(&dynamic_json);
     j.push_str(&modal_json);
     j.push('}');
     j
@@ -607,15 +798,15 @@ fn agent_json() -> String {
             "POST",
             "/api/run",
             "{\"path\": \"examples/NAME.inp\"} (+ optional \"modes\": N for modal analysis)",
-            "{\"ok\":true,\"job\":..,\"nodes\":..,\"elements\":..,\"iterations\":..,\"residual\":..,\"solve_ms\":..,\"max_disp_mm\":..,\"max_von_mises_mpa\":..,\"outputs\":[\"NAME.vtu\"]} (CLI run --json schema; with modes also \"modes\":N,\"frequencies_hz\":[Hz])",
-            "parse, solve and write NAME.vtu next to the deck; caches results for /api/results/{job}; \"modes\": N also extracts natural frequencies (cached for the mode viewer)",
+            "{\"ok\":true,\"job\":..,\"nodes\":..,\"elements\":..,\"iterations\":..,\"residual\":..,\"solve_ms\":..,\"max_disp_mm\":..,\"max_von_mises_mpa\":..,\"outputs\":[\"NAME.vtu\"]} (CLI run --json schema; with modes also \"modes\":N,\"frequencies_hz\":[Hz]; thermal decks gain \"thermal\":true,\"max_temperature_c\":C; *DYNAMIC decks gain \"dynamic\":true,\"steps\":N,\"dt\":s,\"duration\":s,\"final_disp_mm\":mm with max_disp_mm = max over time)",
+            "parse, solve and write NAME.vtu next to the deck; caches results for /api/results/{job}; \"modes\": N also extracts natural frequencies (cached for the mode viewer); the analysis type is auto-detected from the deck (no flags): *DYNAMIC runs transient Newmark dynamics, temperature data without dynamics runs a thermal-stress pass, else linear statics",
         ),
         (
             "GET",
             "/api/results/{job}",
             "null",
-            "shape of /static/mock/results.json with ok=true",
-            "displacements and von Mises arrays of the last POST /api/run of {job}",
+            "shape of /static/mock/results.json with ok=true; thermal jobs add \"thermal\":{\"temperatures\":[C per node],\"thermal\":true}; dynamic jobs add \"dynamic\":{\"dynamic\":true,\"time_history\":[{\"t\":s,\"max_abs_u_mm\":mm}..<=201 points],\"frames\":[[[x,y,z] per node]..same times]}",
+            "displacements and von Mises arrays of the last POST /api/run of {job} (dynamic jobs: final-time displacements + time history and frames for the player)",
         ),
         (
             "GET",
@@ -718,9 +909,58 @@ fn api_run(state: &AppState, body: &[u8]) -> Response {
         Err(p) => return Response::error(400, "parse", &format!("line {}: {}", p.line, p.message)),
     };
     let t0 = Instant::now();
-    let sol = match solvix_core::solve(&model) {
-        Ok(s) => s,
-        Err(e) => return Response::error(400, "solve", &solve_error_message(e)),
+    // Analysis-type dispatch (issues #46/#47): *DYNAMIC wins; temperature
+    // data without dynamics runs the thermal-stress pass; else statics.
+    let (sol, thermal, dynamic) = if has_dynamics(&model) {
+        let dyn_sol = match solvix_core::solve_dynamic(&model) {
+            Ok(d) => d,
+            Err(e) => return Response::error(400, "solve", &solve_error_message(e)),
+        };
+        let spec = model
+            .steps
+            .iter()
+            .rev()
+            .find(|s| s.dynamics.is_some())
+            .and_then(|s| s.dynamics.as_ref())
+            .expect("has_dynamics checked is_some");
+        let info = ui_dynamic(&model, &dyn_sol, spec.dt, spec.duration);
+        let nodes = model.mesh.nodes.len();
+        let flat = dyn_sol
+            .points
+            .last()
+            .map(|p| p.displacements.as_slice())
+            .unwrap_or(&[]);
+        let final_sol = Solution {
+            displacements: flat_triples(flat, nodes),
+            von_mises: Vec::new(),
+            nodal_von_mises: Vec::new(),
+            reactions: Vec::new(),
+            iterations: dyn_sol.iterations_total,
+            final_residual: 0.0,
+            solver_method: "newmark".into(),
+            cond_estimate: 0.0,
+        };
+        (final_sol, None, Some(info))
+    } else if has_thermal(&model) {
+        // solve_thermomech runs the conduction pass internally; the extra
+        // solve_thermal recovers the temperature field for the API
+        // (core offers no temps-out variant — the double conduction solve
+        // is the v0.4 price).
+        let temps = match solvix_core::solve_thermal(&model) {
+            Ok(t) => t,
+            Err(e) => return Response::error(400, "solve", &solve_error_message(e)),
+        };
+        let sol = match solvix_core::solve_thermomech(&model) {
+            Ok(s) => s,
+            Err(e) => return Response::error(400, "solve", &solve_error_message(e)),
+        };
+        (sol, Some(temps.temperatures), None)
+    } else {
+        let sol = match solvix_core::solve(&model) {
+            Ok(s) => s,
+            Err(e) => return Response::error(400, "solve", &solve_error_message(e)),
+        };
+        (sol, None, None)
     };
     // Optional modal pass (issue #40); count validated by solve_modal.
     let modal = match json_uint_field(body, "modes") {
@@ -740,20 +980,16 @@ fn api_run(state: &AppState, body: &[u8]) -> Response {
     if let Err(e) = solvix_io::write_vtu(&vtu, &model, &sol) {
         return Response::error(500, "io", &format!("cannot write {}: {e}", vtu.display()));
     }
-    let freqs = modal
-        .as_ref()
-        .map(|m| m.frequencies_hz.clone())
-        .unwrap_or_default();
-    let summary = run_summary_json(
-        &model,
-        &sol,
-        &job,
-        solve_ms,
-        &[vtu.display().to_string()],
-        &freqs,
-    );
+    let jr = JobResult {
+        model,
+        sol,
+        modal,
+        thermal,
+        dynamic,
+    };
+    let summary = run_summary_json(&jr, &job, solve_ms, &[vtu.display().to_string()]);
     if let Ok(mut cache) = state.results.lock() {
-        cache.insert(job, (model, sol, modal));
+        cache.insert(job, jr);
     }
     Response::json(200, summary)
 }
@@ -761,10 +997,7 @@ fn api_run(state: &AppState, body: &[u8]) -> Response {
 fn api_results(state: &AppState, job: &str) -> Response {
     let cache = state.results.lock().unwrap_or_else(|p| p.into_inner());
     match cache.get(job) {
-        Some((model, sol, modal)) => Response::json(
-            200,
-            results_json(job, sol, modal.as_ref().map(|m| (model, m))),
-        ),
+        Some(jr) => Response::json(200, results_json(jr, job)),
         None => Response::error(
             404,
             "io",
@@ -984,6 +1217,17 @@ mod tests {
             root: root.to_path_buf(),
             static_dir: PathBuf::from("static"),
             results: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn job_result(sol: Solution, modal: Option<ModalSolution>) -> JobResult {
+        let (model, _) = solvix_io::parse_inp(TINY_DECK).unwrap();
+        JobResult {
+            model,
+            sol,
+            modal,
+            thermal: None,
+            dynamic: None,
         }
     }
 
@@ -1230,8 +1474,9 @@ mod tests {
             final_residual: 6.933e-11,
             ..Solution::default()
         };
+        let jr = job_result(sol, None);
         assert_eq!(
-            results_json("cantilever", &sol, None),
+            results_json(&jr, "cantilever"),
             r#"{"ok":true,"job":"cantilever","displacements":[[0.0,0.0,0.0],[4e-6,-8e-6,0.0]],"von_mises":[120000000.0,119000000.0],"nodal_von_mises":[120000000.0,119000000.0],"max_disp_mm":0.009,"max_von_mises_mpa":120.000,"iterations":390,"residual":6.933e-11}"#
         );
     }
@@ -1240,19 +1485,22 @@ mod tests {
     fn run_summary_json_appends_modal_fields() {
         let (model, _) = solvix_io::parse_inp(TINY_DECK).unwrap();
         let sol = solvix_core::solve(&model).unwrap();
+        let modal = ModalSolution {
+            frequencies_hz: vec![41.5, 260.25],
+            modes: Vec::new(),
+            iterations: 3,
+        };
         let j = run_summary_json(
-            &model,
-            &sol,
+            &job_result(sol.clone(), Some(modal)),
             "tiny",
             3,
             &["tiny.vtu".into()],
-            &[41.5, 260.25],
         );
         assert!(
             j.ends_with(r#""outputs":["tiny.vtu"],"modes":2,"frequencies_hz":[41.500,260.250]}"#),
             "{j}"
         );
-        let static_only = run_summary_json(&model, &sol, "tiny", 3, &["tiny.vtu".into()], &[]);
+        let static_only = run_summary_json(&job_result(sol, None), "tiny", 3, &["tiny.vtu".into()]);
         assert!(
             static_only.ends_with(r#""outputs":["tiny.vtu"]}"#),
             "{static_only}"
@@ -1299,7 +1547,9 @@ mod tests {
             ],
             iterations: 5,
         };
-        let j = results_json("tiny", &sol, Some((&model, &modal)));
+        let mut jr = job_result(sol, Some(modal));
+        jr.model = model;
+        let j = results_json(&jr, "tiny");
         assert!(
             j.ends_with(
                 r#""frequencies_hz":[12.500,99.125],"modes":[[[0.0,0.0,0.0],[1.0,0.0,0.0],[0.0,0.0,0.0]],[[0.0,0.0,0.0],[0.0,0.0,0.0],[1.0,0.0,0.0]]]}"#
@@ -1374,6 +1624,206 @@ mod tests {
         let body = String::from_utf8(resp.body).unwrap();
         assert!(body.contains(r#""stage":"solve""#), "{body}");
         assert!(body.contains("num_modes"), "{body}");
+    }
+
+    // -- issues #46/#47: auto-detected thermal and dynamic runs ----------
+
+    /// 2x1 CPS4 bar: clamped left edge, T=100 at x=0, T=0 at x=0.1.
+    const TINY_THERMAL_DECK: &str = "\
+*HEADING
+    thermal fixture
+*NODE
+1, 0.0, 0.0
+2, 0.05, 0.0
+3, 0.1, 0.0
+4, 0.0, 0.025
+5, 0.05, 0.025
+6, 0.1, 0.025
+*ELEMENT, TYPE=CPS4, ELSET=ALL
+1, 1, 2, 5, 4
+2, 2, 3, 6, 5
+*NSET, NSET=HOT
+1, 4
+*NSET, NSET=COLD
+3, 6
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210e9, 0.3
+*CONDUCTIVITY
+45.0
+*EXPANSION
+1.2e-5
+*SOLID SECTION, ELSET=ALL, MATERIAL=STEEL
+0.01
+*STEP
+*HEAT TRANSFER, STEADY STATE
+*TEMPERATURE
+HOT, 100.0
+COLD, 0.0
+*BOUNDARY
+1, 1, 2
+4, 1, 2
+*END STEP
+";
+
+    /// Same mesh clamped left, tip load, transient: dt x duration.
+    fn tiny_dynamic_deck(dt: &str, duration: &str) -> String {
+        format!(
+            "\
+*HEADING
+    dynamics fixture
+*NODE
+1, 0.0, 0.0
+2, 0.05, 0.0
+3, 0.1, 0.0
+4, 0.0, 0.025
+5, 0.05, 0.025
+6, 0.1, 0.025
+*ELEMENT, TYPE=CPS4, ELSET=ALL
+1, 1, 2, 5, 4
+2, 2, 3, 6, 5
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210e9, 0.3
+*DENSITY
+7850.
+*SOLID SECTION, ELSET=ALL, MATERIAL=STEEL
+0.01
+*STEP
+*DYNAMIC
+{dt}, {duration}
+*BOUNDARY
+1, 1, 2
+4, 1, 2
+*CLOAD
+3, 2, -100.0
+6, 2, -100.0
+*END STEP
+"
+        )
+    }
+
+    #[test]
+    fn subsample_indices_caps_and_spans() {
+        assert_eq!(subsample_indices(0, 201), Vec::<usize>::new());
+        assert_eq!(subsample_indices(5, 201), vec![0, 1, 2, 3, 4]);
+        let idx = subsample_indices(501, 201);
+        assert_eq!(idx.len(), 201);
+        assert_eq!(idx[0], 0);
+        assert_eq!(idx[200], 500);
+        assert!(idx.windows(2).all(|w| w[0] < w[1]), "strictly increasing");
+        let idx = subsample_indices(202, 201);
+        assert_eq!(idx.len(), 201);
+        assert_eq!(idx[0], 0);
+        assert_eq!(idx[200], 201);
+    }
+
+    #[test]
+    fn run_thermal_end_to_end() {
+        let root = fixture_root("thermal");
+        std::fs::write(root.join("examples/tiny_thermal.inp"), TINY_THERMAL_DECK).unwrap();
+        let state = test_state(&root);
+        let resp = handle(
+            &state,
+            "POST",
+            "/api/run",
+            br#"{"path":"examples/tiny_thermal.inp"}"#,
+        );
+        assert_eq!(resp.status, 200, "{}", String::from_utf8_lossy(&resp.body));
+        let body = String::from_utf8(resp.body).unwrap();
+        assert!(
+            body.contains(r#""thermal":true,"max_temperature_c":100.000"#),
+            "{body}"
+        );
+        assert!(!body.contains(r#""dynamic""#), "{body}");
+
+        let resp = handle(&state, "GET", "/api/results/tiny_thermal", b"");
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8(resp.body).unwrap();
+        assert!(body.contains(r#""thermal":{"temperatures":["#), "{body}");
+        assert!(body.contains(r#""thermal":true}}"#), "{body}");
+        // Linear gradient: node 1 (x=0) is 100, node 3 (x=0.1) is 0.
+        assert!(body.contains(r#""temperatures":[100.0,"#), "{body}");
+        assert!(body.contains(r#",0.0],"thermal":true}}"#), "{body}");
+
+        // static deck: no thermal fields
+        let resp = handle(
+            &state,
+            "POST",
+            "/api/run",
+            br#"{"path":"examples/tiny.inp"}"#,
+        );
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8(resp.body).unwrap();
+        assert!(!body.contains(r#""thermal""#), "{body}");
+    }
+
+    #[test]
+    fn run_dynamic_end_to_end() {
+        let root = fixture_root("dyn");
+        std::fs::write(
+            root.join("examples/tiny_dyn.inp"),
+            tiny_dynamic_deck("1.0E-3", "0.01"),
+        )
+        .unwrap();
+        let state = test_state(&root);
+        let resp = handle(
+            &state,
+            "POST",
+            "/api/run",
+            br#"{"path":"examples/tiny_dyn.inp"}"#,
+        );
+        assert_eq!(resp.status, 200, "{}", String::from_utf8_lossy(&resp.body));
+        let body = String::from_utf8(resp.body).unwrap();
+        assert!(
+            body.contains(
+                r#""dynamic":true,"steps":10,"dt":0.001,"duration":0.01,"final_disp_mm":"#
+            ),
+            "{body}"
+        );
+        assert!(!body.contains(r#""thermal""#), "{body}");
+
+        let resp = handle(&state, "GET", "/api/results/tiny_dyn", b"");
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8(resp.body).unwrap();
+        assert!(
+            body.contains(r#""dynamic":{"dynamic":true,"time_history":["#),
+            "{body}"
+        );
+        assert_eq!(
+            body.matches("\"t\":").count(),
+            11,
+            "11 points, no subsample"
+        );
+        assert!(body.contains(r#""t":0.0,"max_abs_u_mm":0.000"#), "{body}");
+        // frames: 11 frames of 6 nodes; frame 0 is all-zero (rest state).
+        assert!(body.contains(r#""frames":[[[0.0,0.0,0.0]"#), "{body}");
+    }
+
+    #[test]
+    fn dynamic_history_is_subsampled_to_cap() {
+        let root = fixture_root("dynsub");
+        // 501 output points -> capped at MAX_HISTORY_POINTS (201).
+        std::fs::write(
+            root.join("examples/tiny_dynsub.inp"),
+            tiny_dynamic_deck("1.0E-3", "0.5"),
+        )
+        .unwrap();
+        let state = test_state(&root);
+        let resp = handle(
+            &state,
+            "POST",
+            "/api/run",
+            br#"{"path":"examples/tiny_dynsub.inp"}"#,
+        );
+        assert_eq!(resp.status, 200, "{}", String::from_utf8_lossy(&resp.body));
+        let resp = handle(&state, "GET", "/api/results/tiny_dynsub", b"");
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8(resp.body).unwrap();
+        assert_eq!(body.matches("\"t\":").count(), MAX_HISTORY_POINTS, "{body}");
+        assert!(body.contains(r#""t":0.0,"max_abs_u_mm":0.000"#), "{body}");
+        // last subsample index is the final point: t = 0.5.
+        assert!(body.contains(r#""t":0.5,"#), "{body}");
     }
 
     // -- /api/agent ------------------------------------------------------------

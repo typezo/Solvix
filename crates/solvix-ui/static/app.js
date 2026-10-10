@@ -105,8 +105,9 @@
     "show-bcs", "show-loads", "show-undeformed-overlay", "viewport",
     "viewport-mode-label",
     "fit-button", "wireframe-button", "contour-u-button",
-    "contour-vm-button", "undeformed-overlay-button", "deform-slider",
-    "deform-output", "result-chips", "mode-list", "console-output", "console-form",
+    "contour-vm-button", "contour-t-button", "undeformed-overlay-button",
+    "deform-slider", "deform-output", "result-chips", "mode-list",
+    "dyn-list", "console-output", "console-form",
     "command-input", "command-hint", "status-job", "status-mesh",
     "status-cursor", "status-zoom", "status-message",
   ];
@@ -133,6 +134,7 @@
     resultsError: null,
     runResponse: null,
     activeMode: null,
+    activeFrame: null,
     jobs: ["cantilever3d", "cantilever"],
     is3D: false,
     modelBounds: null,
@@ -366,12 +368,34 @@
       .map((mode) => (Array.isArray(mode) ? mode : [])
         .map((item) => [number(item[0]), number(item[1]), number(item[2])]));
 
+    const thermalRaw = raw.thermal && typeof raw.thermal === "object" ? raw.thermal : null;
+    const temperatures = thermalRaw && Array.isArray(thermalRaw.temperatures)
+      ? thermalRaw.temperatures.map((item) => number(item))
+      : [];
+
+    const dynamicRaw = raw.dynamic && typeof raw.dynamic === "object" ? raw.dynamic : null;
+    const timeHistory = dynamicRaw && Array.isArray(dynamicRaw.time_history)
+      ? dynamicRaw.time_history.map((point) => ({
+        t: number(point && point.t),
+        maxAbsUMm: number(point && point.max_abs_u_mm),
+      }))
+      : [];
+    const dynFrames = dynamicRaw && Array.isArray(dynamicRaw.frames)
+      ? dynamicRaw.frames.map((frame) => (Array.isArray(frame) ? frame : [])
+        .map((item) => [number(item[0]), number(item[1]), number(item[2])]))
+      : [];
+    const dynamic = timeHistory.length && dynFrames.length
+      ? { timeHistory, frames: dynFrames }
+      : null;
+
     return {
       job: String(raw.job || (model ? model.job : state.job)),
       displacements,
       vonMises,
       frequenciesHz,
       modes,
+      temperatures,
+      dynamic,
       raw,
     };
   }
@@ -389,6 +413,32 @@
       label: modeLabel(index, hz),
       enabled: index < vectors,
     }));
+  }
+
+  /* Pure dynamics-history helpers (issue #47; exposed for tests). */
+
+  function dynFrameLabel(t) {
+    return `t = ${fmt(t, 3)} s`;
+  }
+
+  /// SVG polyline `points` string for a value series in a width x height
+  /// box: min maps to the bottom edge, max to the top, a flat series to
+  /// the midline.
+  function sparklinePath(values, width = 120, height = 40) {
+    if (!Array.isArray(values) || values.length === 0) return "";
+    let min = Infinity;
+    let max = -Infinity;
+    for (const v of values) {
+      if (v < min) min = v;
+      if (v > max) max = v;
+    }
+    const span = max - min;
+    const n = values.length;
+    return values.map((v, i) => {
+      const x = n === 1 ? 0 : (i / (n - 1)) * width;
+      const y = span > 0 ? height - ((v - min) / span) * height : height / 2;
+      return `${Math.round(x * 100) / 100},${Math.round(y * 100) / 100}`;
+    }).join(" ");
   }
 
   function boundsOf(nodes) {
@@ -422,13 +472,18 @@
   }
 
   /// Displacement array currently driving the viewport: the selected mode
-  /// shape (issue #40, already scaled to max |component| = 1 by the API) or
-  /// the static result.
+  /// shape (issue #40, already scaled to max |component| = 1 by the API),
+  /// the selected dynamics frame (issue #47; null = final state, which is
+  /// what `displacements` holds for dynamic jobs) or the static result.
   function activeDisplacements() {
     if (!state.results) return [];
     if (state.activeMode !== null) {
       const mode = state.results.modes[state.activeMode];
       if (mode) return mode;
+    }
+    if (state.activeFrame !== null && state.results.dynamic) {
+      const frame = state.results.dynamic.frames[state.activeFrame];
+      if (frame) return frame;
     }
     return state.results.displacements;
   }
@@ -857,12 +912,16 @@
     state.resultsSource = source;
     state.resultsError = null;
     state.activeMode = null;
+    state.activeFrame = null;
     if (!state.jobs.includes(state.results.job)) {
       state.jobs.push(state.results.job);
     }
     ensureJobOption(state.results.job);
     state.job = state.results.job;
     state.warnings = [];
+    if (state.display.contourMode === "t" && !state.results.temperatures.length) {
+      state.display.contourMode = "none";
+    }
     if (state.model && state.results.displacements.length !== state.model.nodes.size) {
       state.warnings.push(
         `Result has ${state.results.displacements.length} displacement rows; model has ${state.model.nodes.size} nodes.`
@@ -924,6 +983,7 @@
     renderSimpleLists();
     renderResultChips();
     renderModeList();
+    renderDynPlayer();
     updateToolbarStates();
   }
 
@@ -961,6 +1021,59 @@
       render();
     });
     host.replaceChildren(...buttons, reset);
+    host.hidden = false;
+  }
+
+  /// Dynamics player (issue #47): max-|u| sparkline + frame slider that
+  /// re-renders the deformed shape from that time point's displacements.
+  function renderDynPlayer() {
+    const host = dom["dyn-list"];
+    const dyn = state.results && state.results.dynamic;
+    if (!dyn || !dyn.frames.length) {
+      host.replaceChildren();
+      host.hidden = true;
+      return;
+    }
+    const index = state.activeFrame === null ? dyn.frames.length - 1 : state.activeFrame;
+    const pointAt = (i) => (dyn.timeHistory[i] ? dyn.timeHistory[i].t : 0);
+
+    const svgNS = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(svgNS, "svg");
+    svg.setAttribute("viewBox", "0 0 120 40");
+    svg.setAttribute("width", "120");
+    svg.setAttribute("height", "40");
+    svg.setAttribute("role", "img");
+    svg.setAttribute("aria-label", "max |u| time history");
+    svg.classList.add("dyn-sparkline");
+    const polyline = document.createElementNS(svgNS, "polyline");
+    polyline.setAttribute(
+      "points",
+      sparklinePath(dyn.timeHistory.map((p) => p.maxAbsUMm), 120, 40)
+    );
+    polyline.setAttribute("fill", "none");
+    polyline.setAttribute("stroke", "#7aa2f4");
+    polyline.setAttribute("stroke-width", "1.5");
+    svg.appendChild(polyline);
+
+    const slider = document.createElement("input");
+    slider.type = "range";
+    slider.min = "0";
+    slider.max = String(dyn.frames.length - 1);
+    slider.value = String(index);
+    slider.setAttribute("aria-label", "time frame");
+    const label = document.createElement("span");
+    label.className = "dyn-frame-label";
+    label.textContent = dynFrameLabel(pointAt(index));
+    slider.addEventListener("input", () => {
+      state.activeFrame = Number(slider.value);
+      label.textContent = dynFrameLabel(pointAt(state.activeFrame));
+      if (state.module !== "results") setModule("results", false);
+      dom["viewport-mode-label"].textContent = viewportLabel();
+      renderResultChips();
+      render();
+    });
+
+    host.replaceChildren(svg, slider, label);
     host.hidden = false;
   }
 
@@ -1091,6 +1204,13 @@
         : maxDisplacementMagnitude() * 1000;
       chips.push(`max |U| ${fmt(maxDisp, 3)} mm`);
       chips.push(`max VM ${fmt(maxVM, 3)} MPa`);
+      if (state.results.temperatures.length) {
+        const maxT = Math.max(...state.results.temperatures);
+        chips.push(`max T ${fmt(maxT, 1)} °C`);
+      }
+      if (state.results.dynamic) {
+        chips.push(`${state.results.dynamic.frames.length} frames`);
+      }
       if (Number.isFinite(Number(raw && raw.iterations))) {
         chips.push(`${Number(raw.iterations)} iterations`);
       }
@@ -1098,7 +1218,10 @@
       chips.push("No result");
     }
     if (state.display.contourMode !== "none") {
-      chips.push(`contour ${state.display.contourMode === "vm" ? "von Mises" : "|U|"}`);
+      const name = state.display.contourMode === "vm"
+        ? "von Mises"
+        : state.display.contourMode === "t" ? "T" : "|U|";
+      chips.push(`contour ${name}`);
     }
     chips.push(`deform ${state.display.deformationPercent.toFixed(1)}%`);
     dom["result-chips"].replaceChildren(...chips.map((text) => {
@@ -1113,6 +1236,9 @@
     dom["wireframe-button"].setAttribute("aria-pressed", String(state.display.wireframe));
     dom["contour-u-button"].setAttribute("aria-pressed", String(state.display.contourMode === "u"));
     dom["contour-vm-button"].setAttribute("aria-pressed", String(state.display.contourMode === "vm"));
+    const hasThermal = Boolean(state.results && state.results.temperatures.length);
+    dom["contour-t-button"].hidden = !hasThermal;
+    dom["contour-t-button"].setAttribute("aria-pressed", String(state.display.contourMode === "t"));
     dom["undeformed-overlay-button"].setAttribute("aria-pressed", String(state.display.undeformedOverlay));
     dom["deform-slider"].value = String(state.display.deformationPercent);
     dom["deform-output"].value = `${state.display.deformationPercent.toFixed(1)}% bbox`;
@@ -1126,10 +1252,14 @@
     if (!state.results) return `${projection}Undeformed`;
     const contour = state.display.contourMode === "vm"
       ? "von Mises"
-      : state.display.contourMode === "u" ? "|U|" : "no contour";
+      : state.display.contourMode === "t" ? "T" : state.display.contourMode === "u" ? "|U|" : "no contour";
     if (state.activeMode !== null && state.results.frequenciesHz.length) {
       const mode = `${modeLabel(state.activeMode, state.results.frequenciesHz[state.activeMode])}`;
       return `${projection}${mode} · ${contour}`;
+    }
+    if (state.activeFrame !== null && state.results.dynamic) {
+      const point = state.results.dynamic.timeHistory[state.activeFrame];
+      return `${projection}${dynFrameLabel(point ? point.t : 0)} · ${contour}`;
     }
     return `${projection}Deformed · ${contour}`;
   }
@@ -1244,6 +1374,12 @@
           activeMode: state.activeMode,
           modeLabel: state.activeMode !== null && state.results && state.results.frequenciesHz.length
             ? modeLabel(state.activeMode, state.results.frequenciesHz[state.activeMode])
+            : null,
+          activeFrame: state.activeFrame,
+          frameLabel: state.activeFrame !== null && state.results && state.results.dynamic
+            ? dynFrameLabel(
+              (state.results.dynamic.timeHistory[state.activeFrame] || {}).t || 0
+            )
             : null,
           renderer: state.is3D ? "3d-orthographic" : "2d",
           camera: Object.assign({}, state.camera),
@@ -1487,9 +1623,22 @@
       if (!values.length) return null;
       return { min: Math.min(...values), max: Math.max(...values), mode: "vm" };
     }
+    if (state.display.contourMode === "t") {
+      const values = state.results.temperatures;
+      if (!values.length) return null;
+      return { min: Math.min(...values), max: Math.max(...values), mode: "t" };
+    }
     const values = activeDisplacements().map((item) => Math.hypot(item[0], item[1], item[2] || 0));
     if (!values.length) return null;
     return { min: Math.min(...values), max: Math.max(...values), mode: "u" };
+  }
+
+  /// Per-node values of the active nodal contour: temperatures (°C) or
+  /// displacement magnitudes (m).
+  function nodalContourValues() {
+    if (!state.results) return [];
+    if (state.display.contourMode === "t") return state.results.temperatures;
+    return activeDisplacements().map((item) => Math.hypot(item[0], item[1], item[2] || 0));
   }
 
   function normalizedColor(value, domain) {
@@ -1640,8 +1789,8 @@
 
   function draw3DNodalContour(projected) {
     const domain = contourDomain();
-    if (!domain || domain.mode !== "u" || !state.results) return;
-    const values = activeDisplacements().map((item) => Math.hypot(item[0], item[1], item[2] || 0));
+    if (!domain || domain.mode === "vm" || !state.results) return;
+    const values = nodalContourValues();
     let index = 0;
     for (const point of Array.from(projected.values()).sort((a, b) => a.depth - b.depth)) {
       const value = values[index] || 0;
@@ -1718,9 +1867,7 @@
   function drawMesh(nodes, deformed) {
     if (!state.model) return;
     const domain = contourDomain();
-    const displacementValues = state.results
-      ? activeDisplacements().map((item) => Math.hypot(item[0], item[1], item[2] || 0))
-      : [];
+    const displacementValues = nodalContourValues();
 
     ctx.lineJoin = "round";
     ctx.lineCap = "round";
@@ -1961,15 +2108,21 @@
     ctx.font = "10px ui-monospace, monospace";
     ctx.textAlign = "left";
     ctx.textBaseline = "middle";
-    ctx.fillText(domain.mode === "vm" ? "von Mises" : "|U|", x - 1, y - 11);
-    ctx.fillText(domain.mode === "vm" ? "MPa" : "mm", x - 1, y + legendHeight + 9);
+    ctx.fillText(
+      domain.mode === "vm" ? "von Mises" : domain.mode === "t" ? "Temperature" : "|U|",
+      x - 1,
+      y - 11
+    );
+    ctx.fillText(domain.mode === "vm" ? "MPa" : domain.mode === "t" ? "°C" : "mm", x - 1, y + legendHeight + 9);
 
     const ticks = 6;
     for (let i = 0; i < ticks; i += 1) {
       const t = i / (ticks - 1);
       const tickY = y + legendHeight * (1 - t);
       const value = domain.min + (domain.max - domain.min) * t;
-      const displayed = domain.mode === "vm" ? value / 1e6 : value * 1000;
+      const displayed = domain.mode === "vm"
+        ? value / 1e6
+        : domain.mode === "t" ? value : value * 1000;
       ctx.strokeStyle = "rgba(255,255,255,0.55)";
       ctx.beginPath();
       ctx.moveTo(x + width, tickY);
@@ -2148,6 +2301,7 @@
   });
 
   function setContour(mode) {
+    if (mode === "t" && !(state.results && state.results.temperatures.length)) return;
     state.display.contourMode = state.display.contourMode === mode ? "none" : mode;
     if (state.results && state.module !== "results") setModule("results", false);
     fitView();
@@ -2158,6 +2312,7 @@
 
   dom["contour-u-button"].addEventListener("click", () => setContour("u"));
   dom["contour-vm-button"].addEventListener("click", () => setContour("vm"));
+  dom["contour-t-button"].addEventListener("click", () => setContour("t"));
 
   dom["undeformed-overlay-button"].addEventListener("click", () => {
     state.display.undeformedOverlay = !state.display.undeformedOverlay;
@@ -2432,6 +2587,8 @@
       TET_EDGE_INDICES,
       arcballVector,
       build3DEdgeRecords,
+      buildModeList,
+      dynFrameLabel,
       edgeIndicesForElement,
       fitOrthographic,
       initial3DRotation,
@@ -2440,7 +2597,6 @@
       matrixMultiply,
       matrixTranspose,
       matrixVectorMultiply,
-      buildModeList,
       modeLabel,
       painterSortEdges,
       panOrthographic,
@@ -2449,6 +2605,7 @@
       rotationBetweenUnitVectors,
       rotationXY,
       screenToCenterWorld,
+      sparklinePath,
       zoomOrthographicAt,
     };
   }

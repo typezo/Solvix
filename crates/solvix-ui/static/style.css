@@ -550,6 +550,41 @@ input[type="checkbox"] {
   cursor: default;
 }
 
+/* The hidden attribute must win over display rules (mode-list, dyn-list). */
+[hidden] {
+  display: none !important;
+}
+
+/* Dynamics player (issue #47): sparkline + frame slider. */
+.dyn-list {
+  position: absolute;
+  bottom: 40px;
+  left: 9px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 5px 9px;
+  border: 1px solid rgba(122, 162, 244, 0.45);
+  border-radius: 3px;
+  background: rgba(16, 17, 30, 0.82);
+}
+
+.dyn-list svg {
+  display: block;
+}
+
+.dyn-list input[type="range"] {
+  width: 120px;
+  margin: 0;
+}
+
+.dyn-frame-label {
+  color: #b9c8f2;
+  font-size: 11px;
+  font-family: ui-monospace, monospace;
+  min-width: 74px;
+}
+
 /* Console */
 .console-panel {
   display: grid;
