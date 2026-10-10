@@ -4,6 +4,7 @@
 //!
 //! Implementation owned by issue #2 (parser) — this file fixes the interface.
 
+mod frd;
 mod msh;
 mod odb;
 mod parser;
@@ -11,6 +12,7 @@ mod vtu;
 
 use solvix_core::{Model, Solution};
 
+pub use frd::{parse_frd, FrdResult};
 pub use odb::{Odb, OdbFrame, OdbWriter};
 
 /// Non-fatal notes collected while parsing (skipped keywords, defaults used).
