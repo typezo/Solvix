@@ -99,3 +99,74 @@ Issue #14 — Abaqus-CAE-style frontend, vanilla JavaScript + Canvas.
 - [x] `cargo fmt --check` — passes.
 - [x] `cargo clippy --workspace --all-targets -- -D warnings` — passes.
 - [x] `git diff --check` for files under `crates/solvix-ui/static/` — passes.
+
+## Issue #50 — ODB animations, XY plots, probe, PNG export
+
+### API (main.rs)
+
+- [x] `POST /api/run` now mirrors the CLI's `solve_auto` routing: NL decks
+      (NLGEOM/plasticity/contact) call `solve_nl` directly so the converged
+      increments are kept; dynamic runs already hold their output points.
+- [x] Frame summaries (`FrameSummary { t, load_fraction, displacements,
+      max_abs_u_mm }`) are built by pure functions `nl_frame_summaries`
+      (t = load fraction) and `dyn_frame_summaries` (t = seconds,
+      load_fraction = t/duration), both subsampled to a 200-frame cap with
+      first/last always included; full per-node triples stay in memory in
+      the job cache.
+- [x] `GET /api/frames/{job}` →
+      `{"ok":true,"frames":N,"points":[{"t":x,"max_abs_u_mm":y}],"has_full":bool}`
+      (empty points and `has_full:false` for plain static jobs; 404 for
+      unknown jobs).
+- [x] `GET /api/frame/{job}/{i}` →
+      `{"ok":true,"t":x,"load_fraction":f,"displacements":[[x,y,z] per node]}`;
+      out-of-range `i` is a 404 carrying the frame count.
+- [x] `/api/agent` documents both new routes; its `body` field is now
+      JSON-escaped, fixing pre-existing invalid JSON when a body string
+      contained quotes (verified with a strict JSON parse over HTTP).
+- [x] Tests: summary value math, 300→200 subsampling with monotone t for
+      both builders, an end-to-end NL run (`*STEP, NLGEOM=YES` → 20 frames,
+      t = 0.05..1.0) through `/api/run` → `/api/frames` → `/api/frame`
+      (including out-of-range 404 and re-run dropping frames), a dynamic
+      run capped at 200 frames with the final time preserved, and router
+      dispatch for the new paths (`..`/`/`/non-numeric index rejected).
+
+### Frontend (static/)
+
+- [x] After an API results load, `GET /api/frames/{job}` populates the
+      player; frame triples are fetched lazily from `/api/frame/{job}/{i}`
+      and cached per job. The issue #47 dynamic frames remain the fallback.
+- [x] Animation controls: play/pause button + slider at ~20 fps
+      (`setInterval` 50 ms, wrapping), reusing the existing deform pipeline
+      (`activeDisplacements` prefers the selected frame's triples).
+- [x] Hand-rolled SVG XY plot of |u|max vs t below the viewport: frame box,
+      4 labeled ticks per axis, curve polyline, cyan current-frame marker
+      line that tracks the slider; hidden when fewer than 2 points.
+- [x] Click-probe in BOTH renderers: a click (pointer down/up with < 4 px
+      movement) runs the shared screen-space `nearestOf` search over the
+      displayed nodes (2D `worldToScreen` or 3D projected nodes); the
+      tooltip draws node id, |u| in mm, and nodal von Mises in MPa when
+      present, follows rotation/deformation, and clears on empty-space
+      clicks. Dragging/rotating never triggers a probe.
+- [x] PNG export button (`PNG`) downloads the current canvas via
+      `toDataURL("image/png")`; the filename carries the job and frame.
+- [x] Frame label distinguishes `t = X s` (transient jobs) from `λ = X`
+      (NL load fraction); the viewport label, result chips, and the
+      viewport copy-JSON payload include frame/playing/probe state.
+- [x] All copy-JSON buttons remain; new pure helpers (`xyPlotSVG`,
+      `nearestOf`, `frameLabelAt`) are exposed under
+      `window.__SOLVIX_EXPOSE_INTERNALS__`.
+
+### Browser-less and live checks
+
+- [x] `node --check crates/solvix-ui/static/app.js` passes (Node v24.21.0).
+- [x] HTML id uniqueness and CSS brace balance re-checked (52 ids, all
+      blocks closed).
+- [x] Node VM startup smoke test with DOM/Canvas stubs: embedded-mock
+      startup renders, `xyPlotSVG` emits the curve/marker/8 tick labels
+      and returns `""` for short series, `nearestOf` picks the nearest
+      entry and handles the empty list.
+- [x] Live server over HTTP: static assets 200, `dyn_cantilever` run →
+      200 capped frames with correct point JSON, `/api/agent` parses as
+      strict JSON.
+- [x] `cargo test --workspace` — all green; `cargo fmt --check` — passes;
+      `cargo clippy --workspace --all-targets -- -D warnings` — CLEAN.

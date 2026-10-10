@@ -19,6 +19,12 @@
 //!   `dynamic.time_history` (t, max |u| mm, <= 201 points) and
 //!   `dynamic.frames` (per-node displacement triples at the same times,
 //!   driving the frame slider) (issue #47)
+//! - `GET  /api/frames/{job}` → animation frame summaries (issue #50):
+//!   `{"frames":N,"points":[{"t":s-or-load-fraction,"max_abs_u_mm":mm}],
+//!   "has_full":bool}` for NL increments and dynamic output points,
+//!   subsampled to <= 200 frames; full per-node arrays stay in memory
+//!   behind `GET /api/frame/{job}/{i}`
+//!   → `{"t":x,"displacements":[[x,y,z] per node]}`
 //! - `GET  /api/agent` → machine-readable API description
 //!
 //! std-only: TcpListener + thread per connection, Connection: close.
@@ -31,7 +37,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use solvix_core::{
-    solve_modal, DynSolution, ElemKind, ModalOptions, ModalSolution, Model, Solution, SolveError,
+    solve_modal, DynSolution, ElemKind, ModalOptions, ModalSolution, Model, NlFrame, NlOptions,
+    Solution, SolveError, TimePoint,
 };
 
 const USAGE: &str = "\
@@ -41,7 +48,7 @@ Usage:
   solvix-ui serve [--port 8877] [--root .]   start HTTP server + JSON REST API
   solvix-ui help | --help | -h               show this text
 
-API: GET /api/model?job=NAME · POST /api/run · GET /api/results/{job} · GET /api/agent
+API: GET /api/model?job=NAME · POST /api/run · GET /api/results/{job} · GET /api/frames/{job} · GET /api/frame/{job}/{i} · GET /api/agent
 ";
 
 // ---------------------------------------------------------------- arguments
@@ -93,6 +100,8 @@ enum Route {
     Model,
     Run,
     Results(String),
+    Frames(String),
+    Frame(String, usize),
     Agent,
 }
 
@@ -119,6 +128,20 @@ fn route(method: &str, raw_path: &str) -> Option<Route> {
             if let Some(job) = path.strip_prefix("/api/results/") {
                 if valid_name(job) {
                     return Some(Route::Results(job.into()));
+                }
+            }
+            if let Some(rest) = path.strip_prefix("/api/frames/") {
+                if valid_name(rest) {
+                    return Some(Route::Frames(rest.into()));
+                }
+            }
+            if let Some(rest) = path.strip_prefix("/api/frame/") {
+                if let Some((job, idx)) = rest.rsplit_once('/') {
+                    if valid_name(job) {
+                        if let Ok(i) = idx.parse::<usize>() {
+                            return Some(Route::Frame(job.into(), i));
+                        }
+                    }
                 }
             }
             None
@@ -351,7 +374,8 @@ struct UiDynamic {
 }
 
 /// One cached solved job: model, solution, modal run if requested, plus
-/// auto-detected thermal temperatures (issue #46) and dynamics (issue #47).
+/// auto-detected thermal temperatures (issue #46), dynamics (issue #47)
+/// and animation frames (issue #50).
 struct JobResult {
     model: Model,
     /// Static/thermomech solution; for dynamic jobs the final-time frame
@@ -361,6 +385,76 @@ struct JobResult {
     /// Nodal temperatures (the deck's temperature units) of a thermal run.
     thermal: Option<Vec<f64>>,
     dynamic: Option<UiDynamic>,
+    /// Animation frames (issue #50): NL increments and dynamic output
+    /// points, subsampled to MAX_CACHED_FRAMES; empty for plain statics.
+    frames: Vec<FrameSummary>,
+}
+
+/// Frame ceiling cached per job for the animation endpoints (issue #50).
+const MAX_CACHED_FRAMES: usize = 200;
+
+/// One animation frame served by /api/frames + /api/frame (issue #50).
+/// `t` is the time in s for dynamic frames and the load fraction (0..1)
+/// for NL increments; `displacements` are the per-node triples the
+/// frontend deform pipeline consumes.
+struct FrameSummary {
+    t: f64,
+    load_fraction: f64,
+    displacements: Vec<[f64; 3]>,
+    max_abs_u_mm: f64,
+}
+
+/// Largest nodal displacement magnitude among per-node triples.
+fn max_abs_u_triples(triples: &[[f64; 3]]) -> f64 {
+    triples
+        .iter()
+        .map(|d| (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt())
+        .fold(0.0, f64::max)
+}
+
+/// NL increments → frame summaries (t = load fraction), subsampled to
+/// the cap. Mirrors the CLI's odb_frames NL branch (time 0, fraction).
+fn nl_frame_summaries(frames: &[NlFrame]) -> Vec<FrameSummary> {
+    subsample_indices(frames.len(), MAX_CACHED_FRAMES)
+        .into_iter()
+        .map(|i| {
+            let f = &frames[i];
+            nl_frame_summary(f.load_fraction, &f.solution.displacements)
+        })
+        .collect()
+}
+
+/// One NL increment as a frame summary.
+fn nl_frame_summary(load_fraction: f64, displacements: &[[f64; 3]]) -> FrameSummary {
+    FrameSummary {
+        t: load_fraction,
+        load_fraction,
+        max_abs_u_mm: max_abs_u_triples(displacements) * 1000.0,
+        displacements: displacements.to_vec(),
+    }
+}
+
+/// Dynamic output points → frame summaries (t = time in s, fraction =
+/// t/duration), subsampled to the cap. Mirrors the CLI's odb_frames
+/// dynamic branch.
+fn dyn_frame_summaries(nodes: usize, points: &[TimePoint], duration: f64) -> Vec<FrameSummary> {
+    subsample_indices(points.len(), MAX_CACHED_FRAMES)
+        .into_iter()
+        .map(|i| {
+            let p = &points[i];
+            let triples = flat_triples(&p.displacements, nodes);
+            FrameSummary {
+                t: p.time,
+                load_fraction: if duration > 0.0 {
+                    p.time / duration
+                } else {
+                    0.0
+                },
+                max_abs_u_mm: max_abs_u_triples(&triples) * 1000.0,
+                displacements: triples,
+            }
+        })
+        .collect()
 }
 
 /// Time-history/frames subsample ceiling served by /api/results.
@@ -389,6 +483,15 @@ fn has_thermal(model: &Model) -> bool {
         .steps
         .iter()
         .any(|s| !s.temp_bcs.is_empty() || !s.heat_fluxes.is_empty() || s.heat_source.is_some())
+}
+
+/// Whether `solvix_core::solve` would route through the NL machinery
+/// (contact pairs, plasticity or NLGEOM on the last step) — the CLI's
+/// detection, replicated to keep the frames (issue #50).
+fn is_nl(model: &Model) -> bool {
+    !model.contact_pairs.is_empty()
+        || model.plasticity.is_some()
+        || model.steps.last().is_some_and(|s| s.nlgeom)
 }
 
 /// Largest nodal displacement magnitude in a flat dof vector.
@@ -810,6 +913,20 @@ fn agent_json() -> String {
         ),
         (
             "GET",
+            "/api/frames/{job}",
+            "null",
+            "{\"ok\":true,\"frames\":N,\"points\":[{\"t\":x,\"max_abs_u_mm\":y}],\"has_full\":bool} (<=200 frames; t is seconds for *DYNAMIC jobs, load fraction 0..1 for NLGEOM/plasticity/contact jobs)",
+            "animation frame summaries of {job} driving the player and the |u|max XY plot; empty for plain static jobs",
+        ),
+        (
+            "GET",
+            "/api/frame/{job}/{i}",
+            "null",
+            "{\"ok\":true,\"t\":x,\"load_fraction\":f,\"displacements\":[[x,y,z] per node]}",
+            "per-node displacement triples of animation frame i of {job}",
+        ),
+        (
+            "GET",
             "/api/agent",
             "null",
             "this document",
@@ -827,8 +944,9 @@ fn agent_json() -> String {
         .iter()
         .map(|(m, p, b, r, d)| {
             format!(
-                "{{\"method\":\"{m}\",\"path\":\"{}\",\"body\":{b},\"response\":\"{}\",\"description\":\"{}\"}}",
+                "{{\"method\":\"{m}\",\"path\":\"{}\",\"body\":\"{}\",\"response\":\"{}\",\"description\":\"{}\"}}",
                 json_escape(p),
+                json_escape(b),
                 json_escape(r),
                 json_escape(d)
             )
@@ -909,9 +1027,11 @@ fn api_run(state: &AppState, body: &[u8]) -> Response {
         Err(p) => return Response::error(400, "parse", &format!("line {}: {}", p.line, p.message)),
     };
     let t0 = Instant::now();
-    // Analysis-type dispatch (issues #46/#47): *DYNAMIC wins; temperature
-    // data without dynamics runs the thermal-stress pass; else statics.
-    let (sol, thermal, dynamic) = if has_dynamics(&model) {
+    // Analysis-type dispatch (issues #46/#47/#50): *DYNAMIC wins;
+    // temperature data without dynamics runs the thermal-stress pass;
+    // NL decks (NLGEOM/plasticity/contact) ride solve_nl so the frames
+    // are kept; else statics. Same routing as the CLI's solve_auto.
+    let (sol, thermal, dynamic, frames) = if has_dynamics(&model) {
         let dyn_sol = match solvix_core::solve_dynamic(&model) {
             Ok(d) => d,
             Err(e) => return Response::error(400, "solve", &solve_error_message(e)),
@@ -925,6 +1045,7 @@ fn api_run(state: &AppState, body: &[u8]) -> Response {
             .expect("has_dynamics checked is_some");
         let info = ui_dynamic(&model, &dyn_sol, spec.dt, spec.duration);
         let nodes = model.mesh.nodes.len();
+        let frames = dyn_frame_summaries(nodes, &dyn_sol.points, spec.duration);
         let flat = dyn_sol
             .points
             .last()
@@ -941,7 +1062,7 @@ fn api_run(state: &AppState, body: &[u8]) -> Response {
             contact_forces: Vec::new(),
             cond_estimate: 0.0,
         };
-        (final_sol, None, Some(info))
+        (final_sol, None, Some(info), frames)
     } else if has_thermal(&model) {
         // solve_thermomech runs the conduction pass internally; the extra
         // solve_thermal recovers the temperature field for the API
@@ -955,13 +1076,25 @@ fn api_run(state: &AppState, body: &[u8]) -> Response {
             Ok(s) => s,
             Err(e) => return Response::error(400, "solve", &solve_error_message(e)),
         };
-        (sol, Some(temps.temperatures), None)
+        (sol, Some(temps.temperatures), None, Vec::new())
+    } else if is_nl(&model) {
+        // Same call solvix_core::solve makes, but the converged frames
+        // are kept for the animation endpoints (issue #50).
+        let nl_frames = match solvix_core::solve_nl(&model, &NlOptions::default()) {
+            Ok(f) => f,
+            Err(e) => return Response::error(400, "solve", &solve_error_message(e)),
+        };
+        let sol = nl_frames
+            .last()
+            .map(|f| f.solution.clone())
+            .unwrap_or_default();
+        (sol, None, None, nl_frame_summaries(&nl_frames))
     } else {
         let sol = match solvix_core::solve(&model) {
             Ok(s) => s,
             Err(e) => return Response::error(400, "solve", &solve_error_message(e)),
         };
-        (sol, None, None)
+        (sol, None, None, Vec::new())
     };
     // Optional modal pass (issue #40); count validated by solve_modal.
     let modal = match json_uint_field(body, "modes") {
@@ -987,6 +1120,7 @@ fn api_run(state: &AppState, body: &[u8]) -> Response {
         modal,
         thermal,
         dynamic,
+        frames,
     };
     let summary = run_summary_json(&jr, &job, solve_ms, &[vtu.display().to_string()]);
     if let Ok(mut cache) = state.results.lock() {
@@ -1007,6 +1141,79 @@ fn api_results(state: &AppState, job: &str) -> Response {
     }
 }
 
+/// Frame summaries JSON (issue #50): the points the XY plot draws, with
+/// `has_full` telling the frontend the per-node arrays are fetchable
+/// from /api/frame/{job}/{i}. `t` is seconds for dynamic frames and the
+/// load fraction for NL increments.
+fn frames_json(jr: &JobResult, job: &str) -> String {
+    let points = jr
+        .frames
+        .iter()
+        .map(|f| {
+            format!(
+                "{{\"t\":{},\"max_abs_u_mm\":{}}}",
+                num(f.t),
+                fixed3(f.max_abs_u_mm)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"ok\":true,\"job\":\"{}\",\"frames\":{},\"points\":[{}],\"has_full\":{}}}",
+        json_escape(job),
+        jr.frames.len(),
+        points,
+        !jr.frames.is_empty()
+    )
+}
+
+/// One full frame JSON (issue #50): per-node displacement triples.
+fn frame_json(f: &FrameSummary) -> String {
+    let disp = f
+        .displacements
+        .iter()
+        .map(|d| format!("[{},{},{}]", num(d[0]), num(d[1]), num(d[2])))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"ok\":true,\"t\":{},\"load_fraction\":{},\"displacements\":[{}]}}",
+        num(f.t),
+        num(f.load_fraction),
+        disp
+    )
+}
+
+fn api_frames(state: &AppState, job: &str) -> Response {
+    let cache = state.results.lock().unwrap_or_else(|p| p.into_inner());
+    match cache.get(job) {
+        Some(jr) => Response::json(200, frames_json(jr, job)),
+        None => Response::error(
+            404,
+            "io",
+            &format!("unknown job '{job}'; POST /api/run {{\"path\":\"{job}.inp\"}} first"),
+        ),
+    }
+}
+
+fn api_frame(state: &AppState, job: &str, i: usize) -> Response {
+    let cache = state.results.lock().unwrap_or_else(|p| p.into_inner());
+    match cache.get(job) {
+        Some(jr) => match jr.frames.get(i) {
+            Some(f) => Response::json(200, frame_json(f)),
+            None => Response::error(
+                404,
+                "io",
+                &format!("frame {i} out of range ({} frames)", jr.frames.len()),
+            ),
+        },
+        None => Response::error(
+            404,
+            "io",
+            &format!("unknown job '{job}'; POST /api/run {{\"path\":\"{job}.inp\"}} first"),
+        ),
+    }
+}
+
 /// Dispatch one request to a response. Pure given `state` + inputs — the
 /// unit-testable core of the server (no sockets).
 fn handle(state: &AppState, method: &str, target: &str, body: &[u8]) -> Response {
@@ -1015,6 +1222,8 @@ fn handle(state: &AppState, method: &str, target: &str, body: &[u8]) -> Response
         Some(Route::Model) => api_model(state, query_param(target, "job")),
         Some(Route::Run) => api_run(state, body),
         Some(Route::Results(job)) => api_results(state, &job),
+        Some(Route::Frames(job)) => api_frames(state, &job),
+        Some(Route::Frame(job, i)) => api_frame(state, &job, i),
         Some(Route::Agent) => Response::json(200, agent_json()),
         None => Response::error(404, "usage", &format!("no route: {method} {target}")),
     }
@@ -1229,6 +1438,7 @@ mod tests {
             modal,
             thermal: None,
             dynamic: None,
+            frames: Vec::new(),
         }
     }
 
@@ -1263,6 +1473,18 @@ mod tests {
             route("GET", "/api/results/cantilever"),
             Some(Route::Results("cantilever".into()))
         );
+        assert_eq!(
+            route("GET", "/api/frames/cantilever"),
+            Some(Route::Frames("cantilever".into()))
+        );
+        assert_eq!(
+            route("GET", "/api/frame/cantilever/7"),
+            Some(Route::Frame("cantilever".into(), 7))
+        );
+        assert_eq!(route("GET", "/api/frames/../run"), None, "job with ..");
+        assert_eq!(route("GET", "/api/frame/a/b/3"), None, "job with /");
+        assert_eq!(route("GET", "/api/frame/job/x"), None, "bad index");
+        assert_eq!(route("GET", "/api/frame/job/"), None, "empty index");
         assert_eq!(route("GET", "/api/agent"), Some(Route::Agent));
         assert_eq!(route("GET", "/nope"), None);
         assert_eq!(route("GET", "/api/run"), None, "POST-only route");
@@ -1827,6 +2049,218 @@ COLD, 0.0
         assert!(body.contains(r#""t":0.5,"#), "{body}");
     }
 
+    // -- issue #50: animation frames ---------------------------------------
+
+    /// t = load fraction, max from the triples (in mm).
+    #[test]
+    fn nl_frame_summary_values() {
+        let f = nl_frame_summary(0.25, &[[0.0, 0.0, 0.0], [3.0e-3, -4.0e-3, 0.0]]);
+        assert_eq!(f.t, 0.25);
+        assert_eq!(f.load_fraction, 0.25);
+        assert_eq!(f.max_abs_u_mm, 5.0);
+        assert_eq!(f.displacements.len(), 2);
+    }
+
+    /// 300 synthetic NL increments (fraction i/300, |u| = fraction mm):
+    /// capped at 200, first and last kept, t tracks the load fraction of
+    /// the kept index.
+    #[test]
+    fn nl_frame_summaries_subsample_to_cap() {
+        let nl: Vec<NlFrame> = (0..300)
+            .map(|i| NlFrame {
+                load_fraction: i as f64 / 300.0,
+                solution: Solution {
+                    displacements: vec![[(i as f64 / 300.0) * 1e-3, 0.0, 0.0]],
+                    ..Solution::default()
+                },
+            })
+            .collect();
+        let frames = nl_frame_summaries(&nl);
+        assert_eq!(frames.len(), MAX_CACHED_FRAMES);
+        assert_eq!(frames[0].t, 0.0);
+        assert!((frames.last().unwrap().t - 299.0 / 300.0).abs() < 1e-12);
+        assert!(frames.windows(2).all(|w| w[0].t < w[1].t));
+        // |u| of the kept increment (mm) == its load fraction.
+        assert!((frames[150].max_abs_u_mm - frames[150].t).abs() < 1e-9);
+        assert_eq!(frames[0].displacements.len(), 1);
+    }
+
+    /// 301 dynamic points over 3 s: capped at 200, t and load_fraction
+    /// track the kept point, displacements expand to per-node triples.
+    #[test]
+    fn dyn_frame_summaries_subsample_to_cap() {
+        let points: Vec<TimePoint> = (0..301)
+            .map(|i| TimePoint {
+                time: i as f64 * 0.01,
+                displacements: vec![0.0, i as f64 * 2e-5, 0.0, 0.0, i as f64 * 2e-5, 0.0],
+                ..TimePoint::default()
+            })
+            .collect();
+        let frames = dyn_frame_summaries(3, &points, 3.0);
+        assert_eq!(frames.len(), MAX_CACHED_FRAMES);
+        assert_eq!(frames[0].t, 0.0);
+        assert!((frames.last().unwrap().t - 3.0).abs() < 1e-12);
+        assert_eq!(frames.last().unwrap().load_fraction, 1.0);
+        assert_eq!(frames[0].displacements.len(), 3);
+        assert_eq!(frames[0].displacements[0], [0.0, 0.0, 0.0]);
+        // point 300: t=3, |u| per node = 300*2e-5 m = 6 mm.
+        assert_eq!(frames.last().unwrap().max_abs_u_mm, 6.0);
+    }
+
+    /// 2x1 CPS4 bar (the dynamic fixture's mesh), NLGEOM on the step:
+    /// solve_nl's default 20 increments become 20 frames with t = load
+    /// fraction 0.05..1.
+    fn tiny_nl_deck() -> String {
+        "\
+*HEADING
+    nl fixture
+*NODE
+1, 0.0, 0.0
+2, 0.05, 0.0
+3, 0.1, 0.0
+4, 0.0, 0.025
+5, 0.05, 0.025
+6, 0.1, 0.025
+*ELEMENT, TYPE=CPS4, ELSET=ALL
+1, 1, 2, 5, 4
+2, 2, 3, 6, 5
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210e9, 0.3
+*SOLID SECTION, ELSET=ALL, MATERIAL=STEEL
+0.01
+*STEP, NLGEOM=YES
+*STATIC
+*BOUNDARY
+1, 1, 2
+4, 1, 2
+*CLOAD
+3, 2, -100.0
+6, 2, -100.0
+*END STEP
+"
+        .to_string()
+    }
+
+    #[test]
+    fn run_nl_then_frames_end_to_end() {
+        let root = fixture_root("nlframes");
+        std::fs::write(root.join("examples/tiny_nl.inp"), tiny_nl_deck()).unwrap();
+        let state = test_state(&root);
+        let resp = handle(
+            &state,
+            "POST",
+            "/api/run",
+            br#"{"path":"examples/tiny_nl.inp"}"#,
+        );
+        assert_eq!(resp.status, 200, "{}", String::from_utf8_lossy(&resp.body));
+        let body = String::from_utf8(resp.body).unwrap();
+        // same summary schema as the linear path (final frame's solution)
+        assert!(
+            body.starts_with(r#"{"ok":true,"job":"tiny_nl","nodes":6"#),
+            "{body}"
+        );
+
+        let resp = handle(&state, "GET", "/api/frames/tiny_nl", b"");
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8(resp.body).unwrap();
+        assert!(
+            body.starts_with(
+                r#"{"ok":true,"job":"tiny_nl","frames":20,"points":[{"t":0.05,"max_abs_u_mm":"#
+            ),
+            "{body}"
+        );
+        assert!(body.contains(r#""has_full":true}"#), "{body}");
+        // NL t is the load fraction: last point is the full load.
+        assert!(body.contains(r#"{"t":1.0,"#), "{body}");
+
+        let resp = handle(&state, "GET", "/api/frame/tiny_nl/0", b"");
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8(resp.body).unwrap();
+        assert!(
+            body.starts_with(r#"{"ok":true,"t":0.05,"load_fraction":0.05,"displacements":[["#),
+            "{body}"
+        );
+        // 4 nodes per frame.
+        // 6 nodes per frame: 5 node-to-node separators.
+        assert_eq!(body.matches("],[").count(), 5, "{body}");
+        assert!(body.ends_with("]]}"), "{body}");
+
+        // frame indices are 0-based; 20 is out of range.
+        let resp = handle(&state, "GET", "/api/frame/tiny_nl/20", b"");
+        assert_eq!(resp.status, 404);
+        let body = String::from_utf8(resp.body).unwrap();
+        assert!(
+            body.starts_with(
+                r#"{"ok":false,"stage":"io","error":"frame 20 out of range (20 frames)""#
+            ),
+            "{body}"
+        );
+
+        // unknown job
+        let resp = handle(&state, "GET", "/api/frames/never-ran", b"");
+        assert_eq!(resp.status, 404);
+
+        // re-running the same deck as NLGEOM=NO drops the frames again
+        std::fs::write(
+            root.join("examples/tiny_nl.inp"),
+            tiny_nl_deck().replace("NLGEOM=YES", "NLGEOM=NO"),
+        )
+        .unwrap();
+        let resp = handle(
+            &state,
+            "POST",
+            "/api/run",
+            br#"{"path":"examples/tiny_nl.inp"}"#,
+        );
+        assert_eq!(resp.status, 200);
+        let resp = handle(&state, "GET", "/api/frames/tiny_nl", b"");
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8(resp.body).unwrap();
+        assert_eq!(
+            body,
+            r#"{"ok":true,"job":"tiny_nl","frames":0,"points":[],"has_full":false}"#
+        );
+    }
+
+    #[test]
+    fn dynamic_frames_endpoint_end_to_end() {
+        let root = fixture_root("dynframes");
+        // 501 points -> 201 in /api/results but the frame cache caps at 200.
+        std::fs::write(
+            root.join("examples/tiny_dynf.inp"),
+            tiny_dynamic_deck("1.0E-3", "0.5"),
+        )
+        .unwrap();
+        let state = test_state(&root);
+        let resp = handle(
+            &state,
+            "POST",
+            "/api/run",
+            br#"{"path":"examples/tiny_dynf.inp"}"#,
+        );
+        assert_eq!(resp.status, 200);
+        let resp = handle(&state, "GET", "/api/frames/tiny_dynf", b"");
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8(resp.body).unwrap();
+        assert!(
+            body.starts_with(r#"{"ok":true,"job":"tiny_dynf","frames":200,"points":[{"t":0.0,"max_abs_u_mm":0.000}"#),
+            "{body}"
+        );
+        assert!(body.contains(r#""has_full":true}"#), "{body}");
+        // last kept point is the final time, t = 0.5.
+        assert!(body.contains(r#"{"t":0.5,"#), "{body}");
+
+        let resp = handle(&state, "GET", "/api/frame/tiny_dynf/199", b"");
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8(resp.body).unwrap();
+        // dynamic frame: t in s, 6 nodes.
+        assert!(
+            body.starts_with(r#"{"ok":true,"t":0.5,"load_fraction":1.0,"displacements":[["#),
+            "{body}"
+        );
+    }
+
     // -- /api/agent ------------------------------------------------------------
 
     #[test]
@@ -1840,8 +2274,10 @@ COLD, 0.0
             r#""method":"GET","path":"/api/model?job=NAME""#,
             r#""method":"POST","path":"/api/run""#,
             r#""path":"/api/results/{job}""#,
+            r#""path":"/api/frames/{job}""#,
+            r#""path":"/api/frame/{job}/{i}""#,
             r#""path":"/api/agent""#,
-            r#""body":{"path": "examples/NAME.inp"}"#,
+            r#""body":"{\"path\": \"examples/NAME.inp\"} (+ optional"#,
             r#""description":""#,
             r#""response":""#,
         ] {

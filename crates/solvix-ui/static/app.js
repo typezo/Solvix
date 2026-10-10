@@ -110,6 +110,7 @@
     "dyn-list", "console-output", "console-form",
     "command-input", "command-hint", "status-job", "status-mesh",
     "status-cursor", "status-zoom", "status-message",
+    "xy-plot", "png-button",
   ];
 
   for (const id of requiredIds) {
@@ -136,6 +137,13 @@
     activeMode: null,
     activeFrame: null,
     jobs: ["cantilever3d", "cantilever"],
+    // Animation frames (issue #50): /api/frames payload + lazy per-frame
+    // triple cache; falls back to results.dynamic frames (issue #47).
+    frames: null,
+    frameTriples: new Map(),
+    playing: false,
+    playTimer: null,
+    probe: null,
     is3D: false,
     modelBounds: null,
     camera: { scale: 100, cx: 0, cy: 0 },
@@ -361,6 +369,9 @@
     const vonMises = (Array.isArray(raw.von_mises) ? raw.von_mises : [])
       .map((item) => number(item));
 
+    const nodalVonMises = (Array.isArray(raw.nodal_von_mises) ? raw.nodal_von_mises : [])
+      .map((item) => number(item));
+
     const frequenciesHz = (Array.isArray(raw.frequencies_hz) ? raw.frequencies_hz : [])
       .map((item) => number(item));
 
@@ -392,6 +403,7 @@
       job: String(raw.job || (model ? model.job : state.job)),
       displacements,
       vonMises,
+      nodalVonMises,
       frequenciesHz,
       modes,
       temperatures,
@@ -473,19 +485,192 @@
 
   /// Displacement array currently driving the viewport: the selected mode
   /// shape (issue #40, already scaled to max |component| = 1 by the API),
-  /// the selected dynamics frame (issue #47; null = final state, which is
-  /// what `displacements` holds for dynamic jobs) or the static result.
+  /// the selected animation frame (issue #50 via /api/frame, falling back
+  /// to the issue #47 dynamic frames; null = final state, which is what
+  /// `displacements` holds for dynamic jobs) or the static result.
   function activeDisplacements() {
     if (!state.results) return [];
     if (state.activeMode !== null) {
       const mode = state.results.modes[state.activeMode];
       if (mode) return mode;
     }
-    if (state.activeFrame !== null && state.results.dynamic) {
-      const frame = state.results.dynamic.frames[state.activeFrame];
-      if (frame) return frame;
+    if (state.activeFrame !== null) {
+      const triple = state.frameTriples.get(state.activeFrame);
+      if (triple) return triple;
+      if (state.results.dynamic) {
+        const frame = state.results.dynamic.frames[state.activeFrame];
+        if (frame) return frame;
+      }
     }
     return state.results.displacements;
+  }
+
+  /* Animation-frame helpers (issue #50). */
+
+  /// Unified frame summaries: the /api/frames points when loaded, else
+  /// the results payload's dynamic time history.
+  function framePoints() {
+    if (state.frames && state.frames.points.length) return state.frames.points;
+    if (state.results && state.results.dynamic) return state.results.dynamic.timeHistory;
+    return [];
+  }
+
+  function frameCount() {
+    if (state.frames) return state.frames.frames;
+    if (state.results && state.results.dynamic) return state.results.dynamic.frames.length;
+    return 0;
+  }
+
+  /// Frame x label: seconds for transient jobs, load fraction otherwise
+  /// (NL frames carry no results.dynamic).
+  function frameLabelAt(i) {
+    const points = framePoints();
+    const point = points[i];
+    const t = point ? point.t : 0;
+    return state.results && state.results.dynamic
+      ? dynFrameLabel(t)
+      : `λ = ${fmt(t, 3)}`;
+  }
+
+  /// Fetch and cache one frame's per-node triples, then re-render.
+  async function ensureFrameTriples(i) {
+    if (!state.frames || state.frames.job !== state.job) return;
+    if (state.frameTriples.has(i)) return;
+    try {
+      const payload = await requestJSON(
+        `/api/frame/${encodeURIComponent(state.frames.job)}/${i}`
+      );
+      if (payload.ok === false || !Array.isArray(payload.displacements)) return;
+      state.frameTriples.set(i, payload.displacements.map((item) => [
+        number(item[0]), number(item[1]), number(item[2]),
+      ]));
+      if (state.activeFrame === i) render();
+    } catch (_) {
+      // transport failure keeps the last rendered shape
+    }
+  }
+
+  function setFrame(i) {
+    const count = frameCount();
+    if (!count) return;
+    state.activeFrame = Math.min(Math.max(0, i), count - 1);
+    ensureFrameTriples(state.activeFrame);
+    if (state.activeMode !== null) state.activeMode = null;
+    if (state.module !== "results") setModule("results", false);
+    dom["viewport-mode-label"].textContent = viewportLabel();
+    renderResultChips();
+    renderDynPlayer();
+    renderXYPlot();
+    render();
+  }
+
+  function stopPlay() {
+    state.playing = false;
+    if (state.playTimer !== null) {
+      window.clearInterval(state.playTimer);
+      state.playTimer = null;
+    }
+  }
+
+  function togglePlay() {
+    if (state.playing) {
+      stopPlay();
+    } else if (frameCount() > 1) {
+      state.playing = true;
+      state.playTimer = window.setInterval(() => {
+        const count = frameCount();
+        if (!state.model || count < 2) {
+          stopPlay();
+          renderDynPlayer();
+          return;
+        }
+        const next = state.activeFrame === null ? 0 : (state.activeFrame + 1) % count;
+        setFrame(next);
+      }, 50);
+    }
+    renderDynPlayer();
+  }
+
+  /// Load the animation frame summaries of `job` (issue #50). Non-fatal:
+  /// on failure the player falls back to the results payload's dynamic
+  /// frames (issue #47).
+  async function loadFrames(job) {
+    try {
+      const payload = await requestJSON(`/api/frames/${encodeURIComponent(job)}`);
+      if (payload.ok === false || !Number(payload.frames)) return false;
+      state.frames = {
+        job: String(payload.job || job),
+        frames: Number(payload.frames) || 0,
+        points: (Array.isArray(payload.points) ? payload.points : []).map((point) => ({
+          t: number(point && point.t),
+          maxAbsUMm: number(point && point.max_abs_u_mm),
+        })),
+        hasFull: Boolean(payload.has_full),
+      };
+      state.frameTriples.clear();
+      stopPlay();
+      updateInterface();
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Hand-rolled SVG XY plot of |u|max vs t (issue #50): axes with 4
+  /// labeled ticks each and a vertical marker at the current frame.
+  /// Pure string builder — exposed for browser-less tests.
+  function xyPlotSVG(points, currentIndex, width = 320, height = 110) {
+    if (!Array.isArray(points) || points.length < 2) return "";
+    const left = 46;
+    const right = 10;
+    const top = 8;
+    const bottom = 18;
+    const plotW = Math.max(10, width - left - right);
+    const plotH = Math.max(10, height - top - bottom);
+    let tMin = Infinity;
+    let tMax = -Infinity;
+    let uMax = 0;
+    for (const p of points) {
+      tMin = Math.min(tMin, p.t);
+      tMax = Math.max(tMax, p.t);
+      uMax = Math.max(uMax, p.maxAbsUMm);
+    }
+    const tSpan = tMax - tMin;
+    const uSpan = uMax > 0 ? uMax * 1.06 : 1.0;
+    const xOf = (t) => left + (tSpan > 0 ? (t - tMin) / tSpan : 0.5) * plotW;
+    const yOf = (u) => top + plotH - (u / uSpan) * plotH;
+    const parts = [];
+    const grid = (i, n) => (n === 1 ? 0 : i / (n - 1));
+    const tickText = (v) => fmt(v, 3).replace(/^—$/, "0");
+    for (let i = 0; i < 4; i += 1) {
+      const gx = left + grid(i, 4) * plotW;
+      parts.push(`<line x1="${gx.toFixed(1)}" y1="${top}" x2="${gx.toFixed(1)}" y2="${top + plotH}" class="xy-grid"/>`);
+      parts.push(`<text x="${gx.toFixed(1)}" y="${(top + plotH + 12).toFixed(1)}" class="xy-tick" text-anchor="middle">${tickText(tMin + grid(i, 4) * tSpan)}</text>`);
+      const gy = top + plotH - grid(i, 4) * plotH;
+      parts.push(`<line x1="${left}" y1="${gy.toFixed(1)}" x2="${left + plotW}" y2="${gy.toFixed(1)}" class="xy-grid"/>`);
+      parts.push(`<text x="${(left - 4).toFixed(1)}" y="${(gy + 3).toFixed(1)}" class="xy-tick" text-anchor="end">${tickText(grid(i, 4) * uSpan)}</text>`);
+    }
+    parts.push(`<rect x="${left}" y="${top}" width="${plotW}" height="${plotH}" class="xy-frame"/>`);
+    const path = points.map((p, i) => `${i ? "L" : "M"}${xOf(p.t).toFixed(1)},${yOf(p.maxAbsUMm).toFixed(1)}`).join("");
+    parts.push(`<path d="${path}" class="xy-curve"/>`);
+    const current = points[Math.min(Math.max(currentIndex || 0, 0), points.length - 1)];
+    const mx = xOf(current.t).toFixed(1);
+    parts.push(`<line x1="${mx}" y1="${top}" x2="${mx}" y2="${top + plotH}" class="xy-marker"/>`);
+    parts.push(`<text x="${left + 2}" y="${(top - 1).toFixed(1)}" class="xy-title">|u|max vs t (mm)</text>`);
+    return `<svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="xMidYMid meet" role="img" aria-label="max displacement versus time plot">${parts.join("")}</svg>`;
+  }
+
+  function renderXYPlot() {
+    const host = dom["xy-plot"];
+    const points = framePoints();
+    if (points.length < 2) {
+      host.replaceChildren();
+      host.hidden = true;
+      return;
+    }
+    const index = state.activeFrame === null ? points.length - 1 : state.activeFrame;
+    host.innerHTML = xyPlotSVG(points, index);
+    host.hidden = false;
   }
 
   function displayNodes() {
@@ -853,6 +1038,7 @@
       }
       applyResults(payload, source);
       if (!options.silent) logJSON("ok", payload, "GET results");
+      if (source === "api") await loadResultsFrames(requestedJob);
       return true;
     } catch (apiError) {
       // Never splice a compact 3D mock result onto a full API-sized model.
@@ -884,11 +1070,25 @@
     }
   }
 
+  /// Fetch the animation frames after a successful API results load
+  /// (issue #50); log + render the player when they arrive.
+  async function loadResultsFrames(job) {
+    if (await loadFrames(job)) {
+      logJSON("ok", {
+        ok: true,
+        job: state.frames.job,
+        frames: state.frames.frames,
+        has_full: state.frames.hasFull,
+      }, "GET frames");
+    }
+  }
+
   function applyModel(raw, source) {
     state.model = normalizeModel(raw);
     state.modelSource = source;
     state.modelError = null;
     state.activeMode = null;
+    state.probe = null;
     state.job = state.model.job;
     state.is3D = is3DModel(state.model.nodes, state.model.elements);
     state.modelBounds = boundsOf(state.model.nodes);
@@ -913,6 +1113,10 @@
     state.resultsError = null;
     state.activeMode = null;
     state.activeFrame = null;
+    state.probe = null;
+    stopPlay();
+    state.frames = null;
+    state.frameTriples.clear();
     if (!state.jobs.includes(state.results.job)) {
       state.jobs.push(state.results.job);
     }
@@ -984,6 +1188,7 @@
     renderResultChips();
     renderModeList();
     renderDynPlayer();
+    renderXYPlot();
     updateToolbarStates();
   }
 
@@ -1024,56 +1229,43 @@
     host.hidden = false;
   }
 
-  /// Dynamics player (issue #47): max-|u| sparkline + frame slider that
-  /// re-renders the deformed shape from that time point's displacements.
+  /// Animation player (issues #47/#50): play/pause + frame slider that
+  /// re-renders the deformed shape from that frame's displacements.
+  /// Frame data comes from /api/frames when loaded (NL + dynamic jobs),
+  /// else the results payload's dynamic frames.
   function renderDynPlayer() {
     const host = dom["dyn-list"];
-    const dyn = state.results && state.results.dynamic;
-    if (!dyn || !dyn.frames.length) {
+    const count = frameCount();
+    if (!count) {
       host.replaceChildren();
       host.hidden = true;
       return;
     }
-    const index = state.activeFrame === null ? dyn.frames.length - 1 : state.activeFrame;
-    const pointAt = (i) => (dyn.timeHistory[i] ? dyn.timeHistory[i].t : 0);
+    const index = state.activeFrame === null ? count - 1 : state.activeFrame;
 
-    const svgNS = "http://www.w3.org/2000/svg";
-    const svg = document.createElementNS(svgNS, "svg");
-    svg.setAttribute("viewBox", "0 0 120 40");
-    svg.setAttribute("width", "120");
-    svg.setAttribute("height", "40");
-    svg.setAttribute("role", "img");
-    svg.setAttribute("aria-label", "max |u| time history");
-    svg.classList.add("dyn-sparkline");
-    const polyline = document.createElementNS(svgNS, "polyline");
-    polyline.setAttribute(
-      "points",
-      sparklinePath(dyn.timeHistory.map((p) => p.maxAbsUMm), 120, 40)
-    );
-    polyline.setAttribute("fill", "none");
-    polyline.setAttribute("stroke", "#7aa2f4");
-    polyline.setAttribute("stroke-width", "1.5");
-    svg.appendChild(polyline);
+    const play = document.createElement("button");
+    play.type = "button";
+    play.className = "dyn-play";
+    play.setAttribute("aria-label", state.playing ? "pause animation" : "play animation");
+    play.textContent = state.playing ? "⏸" : "▶";
+    play.disabled = count < 2;
+    play.addEventListener("click", togglePlay);
 
     const slider = document.createElement("input");
     slider.type = "range";
     slider.min = "0";
-    slider.max = String(dyn.frames.length - 1);
+    slider.max = String(count - 1);
     slider.value = String(index);
     slider.setAttribute("aria-label", "time frame");
     const label = document.createElement("span");
     label.className = "dyn-frame-label";
-    label.textContent = dynFrameLabel(pointAt(index));
+    label.textContent = frameLabelAt(index);
     slider.addEventListener("input", () => {
-      state.activeFrame = Number(slider.value);
-      label.textContent = dynFrameLabel(pointAt(state.activeFrame));
-      if (state.module !== "results") setModule("results", false);
-      dom["viewport-mode-label"].textContent = viewportLabel();
-      renderResultChips();
-      render();
+      stopPlay();
+      setFrame(Number(slider.value));
     });
 
-    host.replaceChildren(svg, slider, label);
+    host.replaceChildren(play, slider, label);
     host.hidden = false;
   }
 
@@ -1257,9 +1449,8 @@
       const mode = `${modeLabel(state.activeMode, state.results.frequenciesHz[state.activeMode])}`;
       return `${projection}${mode} · ${contour}`;
     }
-    if (state.activeFrame !== null && state.results.dynamic) {
-      const point = state.results.dynamic.timeHistory[state.activeFrame];
-      return `${projection}${dynFrameLabel(point ? point.t : 0)} · ${contour}`;
+    if (state.activeFrame !== null && frameCount()) {
+      return `${projection}${frameLabelAt(state.activeFrame)} · ${contour}`;
     }
     return `${projection}Deformed · ${contour}`;
   }
@@ -1376,11 +1567,14 @@
             ? modeLabel(state.activeMode, state.results.frequenciesHz[state.activeMode])
             : null,
           activeFrame: state.activeFrame,
-          frameLabel: state.activeFrame !== null && state.results && state.results.dynamic
-            ? dynFrameLabel(
-              (state.results.dynamic.timeHistory[state.activeFrame] || {}).t || 0
-            )
+          frameLabel: state.activeFrame !== null && frameCount()
+            ? frameLabelAt(state.activeFrame)
             : null,
+          frames: state.frames
+            ? { job: state.frames.job, frames: state.frames.frames, hasFull: state.frames.hasFull }
+            : null,
+          playing: state.playing,
+          probe: state.probe,
           renderer: state.is3D ? "3d-orthographic" : "2d",
           camera: Object.assign({}, state.camera),
           camera3D: Object.assign({}, state.camera3D),
@@ -1432,6 +1626,91 @@
       x: (x - width / 2) / state.camera.scale + state.camera.cx,
       y: state.camera.cy - (y - height / 2) / state.camera.scale,
     };
+  }
+
+  /// Nearest entry of a screen-space point list (shared by the 2D and 3D
+  /// probe paths). Pure — exposed for browser-less tests.
+  function nearestOf(x, y, entries) {
+    if (!Array.isArray(entries) || !entries.length) return null;
+    let best = null;
+    let bestDist = Infinity;
+    entries.forEach((entry, index) => {
+      if (!entry || !Number.isFinite(entry.x) || !Number.isFinite(entry.y)) return;
+      const dist = Math.hypot(entry.x - x, entry.y - y);
+      if (dist < bestDist) {
+        bestDist = dist;
+        best = { index, id: entry.id, dist };
+      }
+    });
+    return best;
+  }
+
+  /// Screen positions of the displayed nodes in model order — the
+  /// renderer-agnostic input of the click probe.
+  function screenNodes() {
+    if (!state.model) return [];
+    const nodes = displayNodes();
+    if (state.is3D) {
+      return Array.from(projected3DNodes(nodes).values(), (point) => ({
+        id: point.id, x: point.x, y: point.y,
+      }));
+    }
+    return Array.from(nodes.values(), (node) => {
+      const screen = worldToScreen(node);
+      return { id: node.id, x: screen.x, y: screen.y };
+    });
+  }
+
+  const PROBE_PICK_RADIUS_PX = 28;
+
+  /// Click probe (issue #50): remember the nearest node within the pick
+  /// radius; a click on empty space clears it.
+  function probeAt(sx, sy) {
+    const hit = nearestOf(sx, sy, screenNodes());
+    state.probe = hit && hit.dist <= PROBE_PICK_RADIUS_PX
+      ? { index: hit.index, id: hit.id }
+      : null;
+    render();
+  }
+
+  /// Draw the probe tooltip on the canvas (so PNG export keeps it).
+  function drawProbe() {
+    if (!state.probe || !state.model || !state.results) return;
+    const nodes = screenNodes();
+    const point = nodes[state.probe.index];
+    const displacement = activeDisplacements()[state.probe.index];
+    if (!point || !displacement) return;
+    const uMm = Math.hypot(displacement[0], displacement[1], displacement[2] || 0) * 1000;
+    const lines = [`node ${state.probe.id}`, `|u| = ${fmt(uMm, 4)} mm`];
+    const misesPa = state.results.nodalVonMises[state.probe.index];
+    if (Number.isFinite(misesPa) && misesPa > 0) {
+      lines.push(`von Mises = ${fmt(misesPa / 1e6, 3)} MPa`);
+    }
+
+    ctx.save();
+    ctx.strokeStyle = "#00d3ff";
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    ctx.arc(point.x, point.y, 6, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.font = "11px ui-monospace, monospace";
+    ctx.textAlign = "left";
+    ctx.textBaseline = "top";
+    const width = Math.max(...lines.map((line) => ctx.measureText(line).width)) + 12;
+    const height = lines.length * 14 + 8;
+    const boxX = Math.min(point.x + 10, canvasSize().width - width - 4);
+    const boxY = Math.max(point.y - height - 10, 4);
+    ctx.fillStyle = "rgba(13, 14, 22, 0.9)";
+    ctx.strokeStyle = "rgba(0, 211, 255, 0.75)";
+    ctx.beginPath();
+    ctx.roundRect(boxX, boxY, width, height, 3);
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = "#d9f4ff";
+    lines.forEach((line, i) => {
+      ctx.fillText(line, boxX + 6, boxY + 5 + i * 14);
+    });
+    ctx.restore();
   }
 
   function fitView() {
@@ -1548,6 +1827,14 @@
 
   function finishPointer(event) {
     if (!state.pointer || state.pointer.id !== event.pointerId) return;
+    // A click (pointerdown→up with ~no movement) probes the nearest
+    // node instead of navigating (issue #50).
+    const moved = Math.abs(event.clientX - state.pointer.x)
+      + Math.abs(event.clientY - state.pointer.y);
+    if (moved < 4 && event.type === "pointerup") {
+      const rect = canvas.getBoundingClientRect();
+      probeAt(event.clientX - rect.left, event.clientY - rect.top);
+    }
     if (canvas.hasPointerCapture(event.pointerId)) {
       canvas.releasePointerCapture(event.pointerId);
     }
@@ -2270,6 +2557,7 @@
       draw3DNodalContour(projected);
       drawLegend();
       draw3DViewportDecorations();
+      drawProbe();
       return;
     }
     if (deformed) {
@@ -2286,12 +2574,23 @@
     drawNodesAndIds(nodes);
     drawLegend();
     drawViewportDecorations();
+    drawProbe();
   }
 
   /* UI event wiring */
   dom["fit-button"].addEventListener("click", () => {
     fitView();
     render();
+  });
+
+  /// PNG export (issue #50): the current canvas as a download.
+  dom["png-button"].addEventListener("click", () => {
+    const suffix = state.activeFrame !== null ? `-frame${state.activeFrame}` : "";
+    const link = document.createElement("a");
+    link.download = `solvix-${state.job}${suffix}.png`;
+    link.href = canvas.toDataURL("image/png");
+    link.click();
+    setStatus(`Exported ${link.download}`);
   });
 
   dom["wireframe-button"].addEventListener("click", () => {
@@ -2591,6 +2890,7 @@
       dynFrameLabel,
       edgeIndicesForElement,
       fitOrthographic,
+      frameLabelAt,
       initial3DRotation,
       is3DModel,
       matrixIdentity,
@@ -2598,6 +2898,7 @@
       matrixTranspose,
       matrixVectorMultiply,
       modeLabel,
+      nearestOf,
       painterSortEdges,
       panOrthographic,
       projectOrthographic,
@@ -2606,6 +2907,7 @@
       rotationXY,
       screenToCenterWorld,
       sparklinePath,
+      xyPlotSVG,
       zoomOrthographicAt,
     };
   }

@@ -555,7 +555,7 @@ input[type="checkbox"] {
   display: none !important;
 }
 
-/* Dynamics player (issue #47): sparkline + frame slider. */
+/* Animation player (issues #47/#50): play/pause + frame slider. */
 .dyn-list {
   position: absolute;
   bottom: 40px;
@@ -578,11 +578,76 @@ input[type="checkbox"] {
   margin: 0;
 }
 
+.dyn-play {
+  width: 24px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid rgba(122, 162, 244, 0.45);
+  border-radius: 3px;
+  background: rgba(44, 66, 132, 0.9);
+  color: #e8edfb;
+  font-size: 10px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.dyn-play:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
 .dyn-frame-label {
   color: #b9c8f2;
   font-size: 11px;
   font-family: ui-monospace, monospace;
   min-width: 74px;
+}
+
+/* XY plot of |u|max vs t below the viewport (issue #50). */
+.xy-plot {
+  padding: 2px 8px 4px;
+  border-top: 1px solid var(--panel-border);
+  background: rgba(13, 14, 22, 0.6);
+}
+
+.xy-plot svg {
+  display: block;
+  width: 100%;
+  max-height: 118px;
+}
+
+.xy-plot .xy-grid {
+  stroke: rgba(122, 162, 244, 0.18);
+  stroke-width: 1;
+}
+
+.xy-plot .xy-frame {
+  fill: none;
+  stroke: rgba(151, 162, 205, 0.55);
+  stroke-width: 1;
+}
+
+.xy-plot .xy-curve {
+  fill: none;
+  stroke: #7aa2f4;
+  stroke-width: 1.6;
+}
+
+.xy-plot .xy-marker {
+  stroke: #00d3ff;
+  stroke-width: 1.2;
+}
+
+.xy-plot .xy-tick {
+  fill: #969cb5;
+  font-size: 8px;
+  font-family: ui-monospace, monospace;
+}
+
+.xy-plot .xy-title {
+  fill: #b9c8f2;
+  font-size: 9px;
+  font-family: ui-monospace, monospace;
 }
 
 /* Console */
