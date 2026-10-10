@@ -117,15 +117,50 @@ pub struct ConcentratedLoad {
     pub value: f64,
 }
 
-/// A complete, solvable v0.1 model: one static step.
+/// Distributed load (`*DLOAD`): pressure on one element edge, in Pa.
+/// `face` is 1-based Abaqus edge numbering (P1..P4 on CPS4, P1..P3 on
+/// CPS3): edge `n` connects local nodes `n` and `n+1` (cyclic). Positive
+/// magnitude acts INTO the element.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DistributedLoad {
+    pub element_id: u32,
+    pub face: usize,
+    pub magnitude: f64,
+}
+
+/// One analysis step: its boundary conditions and loads. Steps built by
+/// the `solvix-io` parser carry the ACCUMULATED state at the end of that
+/// step (linear static = superposition): OP=NEW/MOD semantics are
+/// resolved when the steps are produced, so each step's loads are its
+/// own plus everything still active from earlier steps.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Step {
+    pub name: String,
+    pub boundary_conditions: Vec<BoundaryCondition>,
+    pub cloads: Vec<ConcentratedLoad>,
+    pub dloads: Vec<DistributedLoad>,
+    /// Gravity: (magnitude in m/s^2, direction vector). Body force per
+    /// unit mass is `magnitude * dir`; `dir` need not be normalized.
+    /// Plane models use only the x/y components.
+    pub gravity: Option<(f64, [f64; 3])>,
+}
+
+/// A complete, solvable model.
+///
+/// Step duality: loads/BCs live either in [`Model::steps`] (multi-step
+/// decks, v0.3) or in the legacy top-level [`Model::boundary_conditions`]
+/// and [`Model::cloads`] fields (the implicit "step 0", single-step decks
+/// and programmatic models). [`solve`] normalizes through
+/// [`Model::load_state`]: `steps` wins when non-empty (the last step's
+/// accumulated state), otherwise the legacy fields.
 #[derive(Debug, Clone)]
 pub struct Model {
     pub mesh: Mesh,
     /// Out-of-plane thickness for plane-stress elements (default 1.0).
     pub thickness: f64,
-    /// Mass density in kg/m^3 for modal analysis ([`solve_modal`]).
-    /// Default 7850.0 (steel). Per-material `*DENSITY` parsing lands with
-    /// the input crate (#26); until then one value covers the model.
+    /// Mass density in kg/m^3 (feeds `*DENSITY`, gravity loads and
+    /// [`solve_modal`]). Default 7850.0 (steel); one value covers the
+    /// whole model (per-material density is v0.4).
     pub density: f64,
     pub materials: Vec<Material>,
     pub elsets: Vec<ElementSet>,
@@ -133,6 +168,7 @@ pub struct Model {
     pub mat_assignments: Vec<(String, String)>,
     pub boundary_conditions: Vec<BoundaryCondition>,
     pub cloads: Vec<ConcentratedLoad>,
+    pub steps: Vec<Step>,
 }
 
 impl Default for Model {
@@ -148,8 +184,18 @@ impl Default for Model {
             mat_assignments: Vec::new(),
             boundary_conditions: Vec::new(),
             cloads: Vec::new(),
+            steps: Vec::new(),
         }
     }
+}
+
+/// Borrowed view of a model's effective BC/load state after step
+/// normalization (see [`Model::load_state`]).
+pub(crate) struct LoadState<'a> {
+    pub(crate) bcs: &'a [BoundaryCondition],
+    pub(crate) cloads: &'a [ConcentratedLoad],
+    pub(crate) dloads: &'a [DistributedLoad],
+    pub(crate) gravity: Option<(f64, [f64; 3])>,
 }
 
 impl Model {
@@ -167,6 +213,27 @@ impl Model {
         None
     }
 
+    /// The model's effective BC/load state after step normalization: the
+    /// LAST step's accumulated state when `steps` is non-empty (linear
+    /// superposition; OP=NEW/MOD were resolved when the steps were
+    /// built), otherwise the legacy top-level fields.
+    pub(crate) fn load_state(&self) -> LoadState<'_> {
+        match self.steps.last() {
+            Some(s) => LoadState {
+                bcs: &s.boundary_conditions,
+                cloads: &s.cloads,
+                dloads: &s.dloads,
+                gravity: s.gravity,
+            },
+            None => LoadState {
+                bcs: &self.boundary_conditions,
+                cloads: &self.cloads,
+                dloads: &[],
+                gravity: None,
+            },
+        }
+    }
+
     /// Structural checks shared by parser tests and the solver.
     pub fn validate(&self) -> Result<(), ModelError> {
         if self.mesh.nodes.is_empty() || self.mesh.elements.is_empty() {
@@ -175,7 +242,7 @@ impl Model {
         if self.materials.is_empty() {
             return Err(ModelError::NoMaterial);
         }
-        if self.boundary_conditions.is_empty() {
+        if self.load_state().bcs.is_empty() {
             return Err(ModelError::NoBoundaryConditions);
         }
         for e in &self.mesh.elements {
@@ -270,11 +337,14 @@ pub fn solve(model: &Model) -> Result<Solution, SolveError> {
     solve_with_method(model, Method::Auto)
 }
 
-/// [`solve`] with the linear solver pinned; see [`Method`].
+/// [`solve`] with the linear solver pinned; see [`Method`]. Multi-step
+/// models solve the accumulated state at the end of the LAST step
+/// (linear static superposition).
 pub fn solve_with_method(model: &Model, method: Method) -> Result<Solution, SolveError> {
     // Free-body check first: validate() reports NoBoundaryConditions as a
     // ModelError, but the contract wants SolveError::NoConstraints.
-    if model.boundary_conditions.is_empty() {
+    let loads = model.load_state();
+    if loads.bcs.is_empty() {
         return Err(SolveError::NoConstraints);
     }
     if let Err(e) = model.validate() {
@@ -287,8 +357,8 @@ pub fn solve_with_method(model: &Model, method: Method) -> Result<Solution, Solv
     }
 
     let ndof = ndof_per_node(model)?;
-    let (mut k, mut f, elems) = assembly::assemble(model, ndof)?;
-    let constrained = solver::constrained_dofs(model, ndof)?;
+    let (mut k, mut f, elems) = assembly::assemble(model, ndof, &loads)?;
+    let constrained = solver::constrained_dofs(&model.mesh, loads.bcs, ndof)?;
 
     // Keep the unmodified system for reaction recovery.
     let k_orig = assembly::Csr {
@@ -651,6 +721,7 @@ mod tests {
     fn cps3_patch_two_triangles() {
         // Unit square split diagonally; uniform tension is exact for CST.
         let model = Model {
+            steps: Vec::new(),
             mesh: Mesh {
                 nodes: vec![
                     Node {
@@ -895,6 +966,97 @@ mod tests {
             value: 1.0,
         }];
         assert!(matches!(solve(&model), Err(SolveError::NoConstraints)));
+    }
+
+    #[test]
+    fn edge_pressure_matches_equivalent_cload() {
+        // Pressure P on edge 2 (right, nodes 2-3) of one CPS4 == the total
+        // P*len split 1/2-1/2 as CLOADs: consistent linear-edge nodal forces.
+        let mut m = quad_model(1, 1, 1.0, 1.0);
+        fix_left_edge_x(&mut m, 1, 1);
+        let p = 1.0e6;
+        let mut pressurized = m.clone();
+        pressurized.steps = vec![Step {
+            name: "pressure".into(),
+            boundary_conditions: m.boundary_conditions.clone(),
+            dloads: vec![DistributedLoad {
+                element_id: 1,
+                face: 2,
+                magnitude: p,
+            }],
+            ..Step::default()
+        }];
+        m.cloads = vec![
+            ConcentratedLoad {
+                node_id: 2,
+                dof: 1,
+                value: -p / 2.0,
+            },
+            ConcentratedLoad {
+                node_id: 4,
+                dof: 1,
+                value: -p / 2.0,
+            },
+        ];
+        let a = solve(&pressurized).unwrap();
+        let b = solve(&m).unwrap();
+        for (i, (ua, ub)) in a.displacements.iter().zip(&b.displacements).enumerate() {
+            for d in 0..3 {
+                assert!(
+                    (ua[d] - ub[d]).abs() < 1e-9,
+                    "node {i} dof {d}: dload={ua:?} cload={ub:?}"
+                );
+            }
+        }
+        // Uniform uniaxial compression: the patch stress is exactly P.
+        for method in BOTH_METHODS {
+            let sol = solve_with_method(&pressurized, method).unwrap();
+            assert!((sol.von_mises[0] - p).abs() / p < 1e-6);
+            let rx: f64 = sol
+                .reactions
+                .iter()
+                .filter(|r| r.dof == 1)
+                .map(|r| r.value)
+                .sum();
+            assert!((rx - p).abs() < 1e-6 * p);
+        }
+    }
+
+    #[test]
+    fn gravity_column_base_reactions_balance_weight() {
+        // Column w=0.1 x L=1 x t=0.01 under g=9.81 downward: the summed
+        // vertical base reactions equal rho * A * L * g exactly.
+        let (w, l, t) = (0.1, 1.0, 0.01);
+        let mut m = quad_model(1, 8, w, l);
+        m.thickness = t;
+        let bcs = vec![
+            BoundaryCondition {
+                node_ids: vec![1, 2],
+                dofs: vec![2],
+            },
+            BoundaryCondition {
+                node_ids: vec![1],
+                dofs: vec![1],
+            },
+        ];
+        m.steps = vec![Step {
+            name: "gravity".into(),
+            boundary_conditions: bcs,
+            gravity: Some((9.81, [0.0, -1.0, 0.0])),
+            ..Step::default()
+        }];
+        let sol = solve(&m).unwrap();
+        let ry: f64 = sol
+            .reactions
+            .iter()
+            .filter(|r| r.dof == 2)
+            .map(|r| r.value)
+            .sum();
+        let expect = 7850.0 * w * t * l * 9.81;
+        assert!(
+            (ry - expect).abs() < 1e-9 * expect,
+            "sum R_y={ry:.6}, weight={expect:.6}"
+        );
     }
 
     #[test]

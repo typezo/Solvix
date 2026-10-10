@@ -1,7 +1,7 @@
 //! Dirichlet constraints and Jacobi-preconditioned conjugate gradient.
 
 use crate::assembly::Csr;
-use crate::{Model, SolveError};
+use crate::{BoundaryCondition, Mesh, SolveError};
 
 /// One constrained dof, kept for reaction output.
 pub(crate) struct ConstrainedDof {
@@ -13,13 +13,14 @@ pub(crate) struct ConstrainedDof {
 /// Expand boundary conditions to constrained dof rows. `ndof` is the
 /// model's dof count per node (2 or 3).
 pub(crate) fn constrained_dofs(
-    model: &Model,
+    mesh: &Mesh,
+    bcs: &[BoundaryCondition],
     ndof: usize,
 ) -> Result<Vec<ConstrainedDof>, SolveError> {
     let mut out = Vec::new();
-    for bc in &model.boundary_conditions {
+    for bc in bcs {
         for &nid in &bc.node_ids {
-            let idx = model.mesh.node_index(nid).ok_or_else(|| {
+            let idx = mesh.node_index(nid).ok_or_else(|| {
                 SolveError::InvalidModel(format!("boundary condition on unknown node {nid}"))
             })?;
             for &dof in &bc.dofs {

@@ -1,15 +1,23 @@
-//! Abaqus `.inp` parser for the v0.1 keyword subset (issue #2).
+//! Abaqus `.inp` parser for the v0.1 keyword subset (issue #2), extended
+//! with multi-step, `*DLOAD` and `*DENSITY` (issue #26).
 //!
 //! Line model: `**…` comments and blank lines are dropped up front; every
 //! remaining line is either a keyword line (`*NAME, KEY=VALUE, …`, parsed
 //! case-insensitively) or a data line (comma-separated fields). A keyword
 //! "block" owns the run of data lines that follows it.
+//!
+//! Steps (#26): `*BOUNDARY`/`*CLOAD`/`*DLOAD` inside `*STEP` blocks
+//! accumulate into steps that each store the TOTAL BC/load state at the
+//! end of that step (OP=NEW/MOD resolved here; linear superposition).
+//! A single-step deck mirrors its BCs/loads into the legacy top-level
+//! Model fields so v0.1 consumers see exactly the old picture.
 
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 use solvix_core::{
-    BoundaryCondition, ConcentratedLoad, ElemKind, Element, ElementSet, Material, Model, Node,
+    BoundaryCondition, ConcentratedLoad, DistributedLoad, ElemKind, Element, ElementSet, Material,
+    Model, Node, Step,
 };
 
 use super::{ParseError, ParseReport};
@@ -25,6 +33,34 @@ enum Item {
     Data { line: usize, text: String },
 }
 
+/// Working accumulator for one step's (or the model data's) BCs/loads.
+#[derive(Default, Clone)]
+struct StepAcc {
+    name: String,
+    bcs: Vec<BoundaryCondition>,
+    cloads: Vec<ConcentratedLoad>,
+    dloads: Vec<DistributedLoad>,
+    gravity: Option<(f64, [f64; 3])>,
+}
+
+/// OP=NEW/MOD of a keyword line: `true` when OP=NEW, warning on anything
+/// other than NEW/MOD (treated as MOD).
+fn op_is_new(kw: &KwLine, report: &mut ParseReport) -> bool {
+    match kw.params.get("op").map(|s| s.to_lowercase()) {
+        None => false,
+        Some(v) if v == "new" => true,
+        Some(v) if v == "mod" => false,
+        Some(v) => {
+            report.warnings.push(format!(
+                "line {}: unsupported OP='{v}' on *{} — treated as MOD",
+                kw.line,
+                kw.name.to_uppercase()
+            ));
+            false
+        }
+    }
+}
+
 pub(super) fn parse_inp(text: &str) -> Result<(Model, ParseReport), ParseError> {
     let items = tokenize(text);
     let mut model = Model {
@@ -36,7 +72,12 @@ pub(super) fn parse_inp(text: &str) -> Result<(Model, ParseReport), ParseError> 
     let mut node_ids: HashSet<u32> = HashSet::new();
     let mut elem_ids: HashSet<u32> = HashSet::new();
     let mut pending_material: Option<String> = None;
-    let mut steps = 0usize;
+    let mut cur_material: Option<String> = None;
+    let mut density_seen = false;
+    let mut model_data = StepAcc::default();
+    let mut steps_done: Vec<StepAcc> = Vec::new();
+    let mut cur: Option<StepAcc> = None;
+    let mut step_no = 0usize;
 
     let mut j = 0usize;
     while j < items.len() {
@@ -52,7 +93,7 @@ pub(super) fn parse_inp(text: &str) -> Result<(Model, ParseReport), ParseError> 
         };
 
         if let Some(name) = &pending_material {
-            if kw.name != "elastic" {
+            if kw.name != "elastic" && kw.name != "density" {
                 report.warnings.push(format!(
                     "line {}: material '{name}' has no *ELASTIC block",
                     kw.line
@@ -235,7 +276,11 @@ pub(super) fn parse_inp(text: &str) -> Result<(Model, ParseReport), ParseError> 
 
             "material" => {
                 match kw.params.get("name") {
-                    Some(n) => pending_material = Some(n.to_uppercase()),
+                    Some(n) => {
+                        let key = n.to_uppercase();
+                        pending_material = Some(key.clone());
+                        cur_material = Some(key);
+                    }
                     None => report.warnings.push(format!(
                         "line {}: *MATERIAL without NAME — block ignored",
                         kw.line
@@ -243,6 +288,43 @@ pub(super) fn parse_inp(text: &str) -> Result<(Model, ParseReport), ParseError> 
                 }
                 j += 1;
                 while matches!(items.get(j), Some(Item::Data { .. })) {
+                    j += 1;
+                }
+            }
+
+            "density" => {
+                j += 1;
+                let mut rows = 0usize;
+                while let Some(Item::Data { line: dno, text }) = items.get(j) {
+                    let f = fields(text);
+                    if rows == 0 {
+                        if cur_material.is_none() {
+                            report
+                                .warnings
+                                .push(format!("line {dno}: *DENSITY outside *MATERIAL — ignored"));
+                        } else if f.is_empty() {
+                            return err(*dno, "*DENSITY expects a density value".to_string());
+                        } else {
+                            let d = num(f[0], *dno, "density")?;
+                            if density_seen && model.density != d {
+                                report.warnings.push(format!(
+                                    "line {dno}: *DENSITY overwrites an earlier value (per-material density is v0.4)"
+                                ));
+                            }
+                            model.density = d;
+                            density_seen = true;
+                            if f.len() > 1 {
+                                report.warnings.push(format!(
+                                    "line {dno}: extra *DENSITY fields ignored (temperature dependence is v0.2)"
+                                ));
+                            }
+                        }
+                    } else {
+                        report.warnings.push(format!(
+                            "line {dno}: extra *DENSITY row ignored (temperature dependence is v0.2)"
+                        ));
+                    }
+                    rows += 1;
                     j += 1;
                 }
             }
@@ -338,6 +420,24 @@ pub(super) fn parse_inp(text: &str) -> Result<(Model, ParseReport), ParseError> 
             }
 
             "boundary" => {
+                let mut op_new = op_is_new(kw, &mut report);
+                let in_step = cur.is_some();
+                if !in_step {
+                    if op_new {
+                        report
+                            .warnings
+                            .push(format!("line {}: OP=NEW outside *STEP ignored", kw.line));
+                        op_new = false;
+                    }
+                    if !steps_done.is_empty() {
+                        report.warnings.push(format!(
+                            "line {}: *BOUNDARY between steps — ignored",
+                            kw.line
+                        ));
+                    }
+                } else if op_new {
+                    cur.as_mut().unwrap().bcs.clear();
+                }
                 j += 1;
                 while let Some(Item::Data { line: dno, text }) = items.get(j) {
                     let f = fields(text);
@@ -366,14 +466,33 @@ pub(super) fn parse_inp(text: &str) -> Result<(Model, ParseReport), ParseError> 
                             ));
                         }
                     }
-                    model
-                        .boundary_conditions
-                        .push(BoundaryCondition { node_ids, dofs });
+                    let bc = BoundaryCondition { node_ids, dofs };
+                    match cur.as_mut() {
+                        Some(acc) => acc.bcs.push(bc),
+                        None => model_data.bcs.push(bc),
+                    }
                     j += 1;
                 }
             }
 
             "cload" => {
+                let mut op_new = op_is_new(kw, &mut report);
+                let in_step = cur.is_some();
+                if !in_step {
+                    if op_new {
+                        report
+                            .warnings
+                            .push(format!("line {}: OP=NEW outside *STEP ignored", kw.line));
+                        op_new = false;
+                    }
+                    if !steps_done.is_empty() {
+                        report
+                            .warnings
+                            .push(format!("line {}: *CLOAD between steps — ignored", kw.line));
+                    }
+                } else if op_new {
+                    cur.as_mut().unwrap().cloads.clear();
+                }
                 j += 1;
                 while let Some(Item::Data { line: dno, text }) = items.get(j) {
                     let f = fields(text);
@@ -390,31 +509,167 @@ pub(super) fn parse_inp(text: &str) -> Result<(Model, ParseReport), ParseError> 
                     let dof: usize = num(f[1], *dno, "dof")?;
                     let value = num(f[2], *dno, "load value")?;
                     for node_id in nodes {
-                        model.cloads.push(ConcentratedLoad {
+                        let cl = ConcentratedLoad {
                             node_id,
                             dof,
                             value,
-                        });
+                        };
+                        match cur.as_mut() {
+                            Some(acc) => acc.cloads.push(cl),
+                            None => model_data.cloads.push(cl),
+                        }
+                    }
+                    j += 1;
+                }
+            }
+
+            "dload" => {
+                let op_new = op_is_new(kw, &mut report);
+                let Some(acc) = cur.as_mut() else {
+                    report.warnings.push(format!(
+                        "line {}: *DLOAD outside *STEP — ignored (distributed loads live in steps)",
+                        kw.line
+                    ));
+                    j += 1;
+                    while matches!(items.get(j), Some(Item::Data { .. })) {
+                        j += 1;
+                    }
+                    continue;
+                };
+                if op_new {
+                    acc.dloads.clear();
+                    acc.gravity = None;
+                }
+                j += 1;
+                while let Some(Item::Data { line: dno, text }) = items.get(j) {
+                    let f = fields(text);
+                    if f[0].eq_ignore_ascii_case("GRAV") {
+                        if f.len() < 3 || f.len() > 5 {
+                            return err(
+                                *dno,
+                                format!(
+                                    "*DLOAD GRAV expects GRAV, magnitude, dir1[, dir2][, dir3]; got {} field(s)",
+                                    f.len()
+                                ),
+                            );
+                        }
+                        let g = num(f[1], *dno, "gravity magnitude")?;
+                        let d1 = num(f[2], *dno, "gravity direction")?;
+                        let d2 = if f.len() > 3 {
+                            num(f[3], *dno, "gravity direction")?
+                        } else {
+                            0.0
+                        };
+                        let d3 = if f.len() > 4 {
+                            num(f[4], *dno, "gravity direction")?
+                        } else {
+                            0.0
+                        };
+                        acc.gravity = Some((g, [d1, d2, d3]));
+                    } else {
+                        if f.len() != 3 {
+                            return err(
+                                *dno,
+                                format!(
+                                    "*DLOAD expects element/elset, P1..P4, magnitude; got {} field(s)",
+                                    f.len()
+                                ),
+                            );
+                        }
+                        let ltype = f[1].to_uppercase();
+                        let face = match ltype
+                            .strip_prefix('P')
+                            .and_then(|n| n.parse::<usize>().ok())
+                        {
+                            Some(n) if (1..=4).contains(&n) => n,
+                            _ => {
+                                report.warnings.push(format!(
+                                    "line {dno}: *DLOAD type '{ltype}' unsupported (v0.3: P1|P2|P3|P4, GRAV) — line ignored"
+                                ));
+                                j += 1;
+                                continue;
+                            }
+                        };
+                        let magnitude = num(f[2], *dno, "pressure magnitude")?;
+                        match resolve_elements(&model, f[0]) {
+                            Some(ids) => {
+                                for id in ids {
+                                    match model.mesh.elements.iter().find(|e| e.id == id) {
+                                        None => report.warnings.push(format!(
+                                            "line {dno}: *DLOAD on unknown element {id} — ignored"
+                                        )),
+                                        Some(e) => {
+                                            let faces = match e.kind {
+                                                ElemKind::Cps3 => 3,
+                                                ElemKind::Cps4 => 4,
+                                                _ => 0,
+                                            };
+                                            if face > faces {
+                                                report.warnings.push(format!(
+                                                    "line {dno}: element {id} ({}) has no face {face} — ignored",
+                                                    kind_name(e.kind)
+                                                ));
+                                            } else {
+                                                acc.dloads.push(DistributedLoad {
+                                                    element_id: id,
+                                                    face,
+                                                    magnitude,
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            None => report.warnings.push(format!(
+                                "line {dno}: *DLOAD target '{}' is not a known element or ELSET — line ignored",
+                                f[0]
+                            )),
+                        }
                     }
                     j += 1;
                 }
             }
 
             "step" => {
-                steps += 1;
-                if steps > 1 {
-                    report.warnings.push(format!(
-                        "line {}: more than one *STEP — later steps merged into step 1 (v0.1)",
-                        kw.line
-                    ));
+                if let Some(open) = cur.take() {
+                    steps_done.push(open);
                 }
-                if kw
+                step_no += 1;
+                let mut op_new = false;
+                if let Some(v) = kw.params.get("op").map(|s| s.to_lowercase()) {
+                    match v.as_str() {
+                        "new" => op_new = true,
+                        "mod" => {}
+                        other => report.warnings.push(format!(
+                            "line {}: unsupported OP='{other}' on *STEP — treated as MOD",
+                            kw.line
+                        )),
+                    }
+                }
+                let mut acc = if op_new {
+                    StepAcc::default()
+                } else {
+                    steps_done
+                        .last()
+                        .cloned()
+                        .unwrap_or_else(|| model_data.clone())
+                };
+                acc.name = kw
                     .params
-                    .get("op")
-                    .is_some_and(|s| s.eq_ignore_ascii_case("new"))
-                {
+                    .get("name")
+                    .cloned()
+                    .unwrap_or_else(|| format!("Step-{step_no}"));
+                cur = Some(acc);
+                j += 1;
+                while matches!(items.get(j), Some(Item::Data { .. })) {
+                    j += 1;
+                }
+            }
+
+            "static" => {
+                if !kw.params.is_empty() {
                     report.warnings.push(format!(
-                        "line {}: OP=NEW ignored — BCs/loads accumulate (v0.1)",
+                        "line {}: *STATIC parameters ignored (v0.1: linear static only)",
                         kw.line
                     ));
                 }
@@ -424,7 +679,10 @@ pub(super) fn parse_inp(text: &str) -> Result<(Model, ParseReport), ParseError> 
                 }
             }
 
-            "static" | "end step" => {
+            "end step" => {
+                if let Some(open) = cur.take() {
+                    steps_done.push(open);
+                }
                 j += 1;
                 while matches!(items.get(j), Some(Item::Data { .. })) {
                     j += 1;
@@ -449,6 +707,33 @@ pub(super) fn parse_inp(text: &str) -> Result<(Model, ParseReport), ParseError> 
         report
             .warnings
             .push(format!("material '{name}' has no *ELASTIC block"));
+    }
+    if let Some(open) = cur.take() {
+        steps_done.push(open);
+    }
+
+    if steps_done.is_empty() {
+        // Legacy single-step (or step-less) deck: model data IS the model.
+        model.boundary_conditions = model_data.bcs;
+        model.cloads = model_data.cloads;
+    } else {
+        // Single-step decks mirror the (accumulated) step state into the
+        // legacy top-level fields so v0.1 consumers behave exactly as
+        // before; multi-step decks are steps-only.
+        if steps_done.len() == 1 {
+            model.boundary_conditions = steps_done[0].bcs.clone();
+            model.cloads = steps_done[0].cloads.clone();
+        }
+        model.steps = steps_done
+            .into_iter()
+            .map(|a| Step {
+                name: a.name,
+                boundary_conditions: a.bcs,
+                cloads: a.cloads,
+                dloads: a.dloads,
+                gravity: a.gravity,
+            })
+            .collect();
     }
     Ok((model, report))
 }
@@ -528,6 +813,24 @@ fn resolve_nodes(
             line,
             message: format!("unknown node set '{target}'"),
         })
+}
+
+/// Resolve a *DLOAD target: element-set name first, then a bare element id.
+fn resolve_elements(model: &Model, target: &str) -> Option<Vec<u32>> {
+    let key = target.to_uppercase();
+    if let Some(s) = model.elsets.iter().find(|s| s.name == key) {
+        return Some(s.element_ids.clone());
+    }
+    target.parse::<u32>().ok().map(|id| vec![id])
+}
+
+fn kind_name(k: ElemKind) -> &'static str {
+    match k {
+        ElemKind::Cps3 => "cps3",
+        ElemKind::Cps4 => "cps4",
+        ElemKind::C3d8 => "c3d8",
+        ElemKind::C3d4 => "c3d4",
+    }
 }
 
 /// Create `name` (uppercased) in `sets` or append to it — `*ELEMENT, ELSET=`
@@ -792,5 +1095,206 @@ TIP, 2, -50.0
                 );
             }
         }
+    }
+
+    // ---- issue #26: *DLOAD, *DENSITY, multi-step ----
+
+    /// 3x3-node unit-square CPS4 deck (ids row-major from 1).
+    fn plate_deck(pre: &str, steps: &str) -> String {
+        format!(
+            concat!(
+                "*NODE\n",
+                "1, 0.0, 0.0\n2, 0.5, 0.0\n3, 1.0, 0.0\n",
+                "4, 0.0, 0.5\n5, 0.5, 0.5\n6, 1.0, 0.5\n",
+                "7, 0.0, 1.0\n8, 0.5, 1.0\n9, 1.0, 1.0\n",
+                "*ELEMENT, TYPE=CPS4, ELSET=ALL\n",
+                "1, 1, 2, 5, 4\n2, 2, 3, 6, 5\n3, 4, 5, 8, 7\n4, 5, 6, 9, 8\n",
+                "*NSET, NSET=BASE\n1, 2, 3\n",
+                "*MATERIAL, NAME=STEEL\n",
+                "*ELASTIC\n210.0E9, 0.3\n",
+                "{pre}",
+                "*SOLID SECTION, ELSET=ALL, MATERIAL=STEEL\n0.01\n",
+                "{steps}"
+            ),
+            pre = pre,
+            steps = steps
+        )
+    }
+
+    #[test]
+    fn dload_edges_grav_and_density_parse() {
+        let deck = plate_deck(
+            "*DENSITY\n7850.,\n",
+            concat!(
+                "*STEP, NAME=PRESS\n",
+                "*STATIC\n",
+                "*DLOAD\n",
+                "ALL, P1, 1.5e6\n",
+                "3, P3, 2.5e5\n",
+                "GRAV, 9.81, 0.0, -1.0\n",
+                "*BOUNDARY\n",
+                "BASE, 1, 2\n",
+                "*END STEP\n"
+            ),
+        );
+        let (m, r) = parse_inp(&deck).unwrap();
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert_eq!(m.density, 7850.0);
+        assert_eq!(m.steps.len(), 1);
+        let s = &m.steps[0];
+        assert_eq!(s.name, "PRESS");
+        assert_eq!(s.dloads.len(), 5); // ALL expands to 4 quads + element 3
+        assert!(s.dloads.contains(&DistributedLoad {
+            element_id: 4,
+            face: 1,
+            magnitude: 1.5e6
+        }));
+        assert_eq!(
+            s.gravity,
+            Some((9.81, [0.0, -1.0, 0.0])),
+            "GRAV row feeds the step"
+        );
+        // Single step mirrors BCs into the legacy fields (v0.1 duality).
+        assert_eq!(m.boundary_conditions.len(), 1);
+        assert_eq!(m.boundary_conditions[0].node_ids, vec![1, 2, 3]);
+        assert!(m.validate().is_ok());
+    }
+
+    #[test]
+    fn dload_unsupported_types_and_targets_warn() {
+        let deck = plate_deck(
+            "",
+            concat!(
+                "*STEP\n*STATIC\n*DLOAD\n",
+                "NOSUCHSET, P1, 1.0\n", // unknown target
+                "ALL, P5, 2.0\n",       // not P1..P4
+                "ALL, TRVEC, 3.0\n",    // not P1..P4
+                "3, P4, 4.0\n",         // CPS4 has face 4 — ok
+                "ALL, P3, 5.0\n",       // includes the CPS4s — ok
+                "*BOUNDARY\nBASE, 1, 2\n*END STEP\n"
+            ),
+        );
+        let (m, r) = parse_inp(&deck).unwrap();
+        // 3 warnings: unknown target, P5, TRVEC. P4 on element 3 is fine.
+        assert_eq!(r.warnings.len(), 3, "{:?}", r.warnings);
+        assert!(r.warnings[0].contains("not a known element"));
+        assert!(r.warnings[1].contains("P5"));
+        assert!(r.warnings[2].contains("TRVEC"));
+        assert_eq!(m.steps[0].dloads.len(), 5);
+    }
+
+    #[test]
+    fn density_after_elastic_and_overwrite_warning() {
+        let deck = plate_deck(
+            "*DENSITY\n2500.,\n",
+            "*STEP\n*STATIC\n*BOUNDARY\nBASE, 1, 2\n*CLOAD\n9, 2, -1.0\n*END STEP\n",
+        );
+        let (m, r) = parse_inp(&deck).unwrap();
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert_eq!(m.density, 2500.0);
+        assert_eq!(m.materials.len(), 1);
+        assert_eq!(m.materials[0].youngs_modulus, 210.0e9);
+    }
+
+    fn single_step_deck(p: f64) -> String {
+        plate_deck(
+            "",
+            &format!("*STEP\n*STATIC\n*BOUNDARY\nBASE, 1, 2\n*CLOAD\n8, 2, {p}\n*END STEP\n"),
+        )
+    }
+
+    fn two_step_deck(op_new: bool) -> String {
+        let op = if op_new { ", OP=NEW" } else { "" };
+        plate_deck(
+            "",
+            &format!(
+                concat!(
+                    "*STEP\n*STATIC\n*BOUNDARY\nBASE, 1, 2\n*CLOAD\n8, 2, -100.0\n*END STEP\n",
+                    "*STEP\n*STATIC\n*CLOAD{op}\n8, 2, -250.0\n*END STEP\n"
+                ),
+                op = op
+            ),
+        )
+    }
+
+    #[test]
+    fn two_step_mod_accumulates_and_matches_superposition() {
+        let (m, r) = parse_inp(&two_step_deck(false)).unwrap();
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert_eq!(m.steps.len(), 2);
+        assert_eq!(m.steps[0].cloads.len(), 1);
+        // Step 2 carries the ACCUMULATED state: P1 + P2.
+        assert_eq!(
+            m.steps[1].cloads,
+            vec![
+                ConcentratedLoad {
+                    node_id: 8,
+                    dof: 2,
+                    value: -100.0
+                },
+                ConcentratedLoad {
+                    node_id: 8,
+                    dof: 2,
+                    value: -250.0
+                },
+            ]
+        );
+        // BCs seeded from step 1 persist into step 2.
+        assert_eq!(
+            m.steps[1].boundary_conditions,
+            m.steps[0].boundary_conditions
+        );
+
+        let a = solvix_core::solve(&m).unwrap();
+        let b = solvix_core::solve(&parse_inp(&single_step_deck(-350.0)).unwrap().0).unwrap();
+        for (ua, ub) in a.displacements.iter().zip(&b.displacements) {
+            for d in 0..3 {
+                assert!((ua[d] - ub[d]).abs() < 1e-9, "{ua:?} vs {ub:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn two_step_op_new_replaces_previous_loads() {
+        let (m, r) = parse_inp(&two_step_deck(true)).unwrap();
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert_eq!(m.steps.len(), 2);
+        assert_eq!(
+            m.steps[1].cloads,
+            vec![ConcentratedLoad {
+                node_id: 8,
+                dof: 2,
+                value: -250.0
+            }],
+            "OP=NEW drops step 1's loads"
+        );
+
+        let a = solvix_core::solve(&m).unwrap();
+        let b = solvix_core::solve(&parse_inp(&single_step_deck(-250.0)).unwrap().0).unwrap();
+        for (ua, ub) in a.displacements.iter().zip(&b.displacements) {
+            for d in 0..3 {
+                assert!((ua[d] - ub[d]).abs() < 1e-9, "{ua:?} vs {ub:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn step_op_new_clears_bcs_and_loads_static_params_warn() {
+        let deck = plate_deck(
+            "",
+            concat!(
+                "*STEP\n*STATIC, INITIAL\n*BOUNDARY\nBASE, 1, 2\n*CLOAD\n8, 2, -1.0\n*END STEP\n",
+                "*STEP, OP=NEW\n*STATIC\n*BOUNDARY\nBASE, 1, 2\n*CLOAD\n9, 2, -5.0\n*END STEP\n"
+            ),
+        );
+        let (m, r) = parse_inp(&deck).unwrap();
+        assert_eq!(r.warnings.len(), 1);
+        assert!(r.warnings[0].contains("*STATIC parameters ignored"));
+        assert_eq!(m.steps.len(), 2);
+        assert_eq!(m.steps[0].cloads.len(), 1);
+        // *STEP, OP=NEW starts from a clean slate.
+        assert_eq!(m.steps[1].boundary_conditions.len(), 1);
+        assert_eq!(m.steps[1].cloads.len(), 1);
+        assert_eq!(m.steps[1].cloads[0].node_id, 9);
     }
 }

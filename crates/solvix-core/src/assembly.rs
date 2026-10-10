@@ -6,7 +6,7 @@ use crate::element::{
     c3d4_stiffness, c3d8_stiffness, cps3_stiffness, cps4_stiffness, d3_matrix, d_matrix, invalid,
     CentroidB, Constitutive,
 };
-use crate::{ElemKind, Model, SolveError};
+use crate::{DistributedLoad, ElemKind, LoadState, Model, SolveError};
 
 /// Compressed sparse row matrix (symmetric pattern, sorted column indices).
 #[derive(Clone)]
@@ -86,10 +86,12 @@ pub(crate) fn scatter<const N: usize>(
 }
 
 /// Assemble K (CSR) and f. Assumes `Model::validate()` already passed and
-/// `ndof = ndof_per_node(model)` (2 or 3).
+/// `ndof = ndof_per_node(model)` (2 or 3). The load vector collects the
+/// state's concentrated loads, edge pressures and gravity.
 pub(crate) fn assemble(
     model: &Model,
     ndof: usize,
+    loads: &LoadState,
 ) -> Result<(Csr, Vec<f64>, Vec<ElemInfo>), SolveError> {
     let ndof_total = model.mesh.nodes.len() * ndof;
     let mut trips = Vec::new();
@@ -167,7 +169,7 @@ pub(crate) fn assemble(
         elems.push(ElemInfo { node_idx, b, d });
     }
 
-    for cl in &model.cloads {
+    for cl in loads.cloads {
         if cl.dof == 0 || cl.dof > ndof {
             return Err(SolveError::InvalidModel(format!(
                 "load on node {} has unsupported dof {}",
@@ -184,7 +186,135 @@ pub(crate) fn assemble(
         f[row] += cl.value;
     }
 
+    edge_pressure_forces(model, loads.dloads, ndof, &mut f)?;
+    gravity_forces(model, loads.gravity, ndof, &mut f)?;
+
     Ok((csr_from_triplets(ndof_total, trips), f, elems))
+}
+
+/// Consistent nodal forces for edge pressure (`*DLOAD` Pn). Linear edge:
+/// the total `magnitude * thickness * edge_length` splits 1/2 - 1/2 over
+/// the two end nodes (quadratic edges are v0.4). With CCW connectivity
+/// the outward normal is the edge tangent crossed with +z; positive
+/// pressure acts INTO the element.
+fn edge_pressure_forces(
+    model: &Model,
+    dloads: &[DistributedLoad],
+    ndof: usize,
+    f: &mut [f64],
+) -> Result<(), SolveError> {
+    for dl in dloads {
+        let e = model
+            .mesh
+            .elements
+            .iter()
+            .find(|e| e.id == dl.element_id)
+            .ok_or_else(|| {
+                SolveError::InvalidModel(format!(
+                    "distributed load on unknown element {}",
+                    dl.element_id
+                ))
+            })?;
+        let max_face = match e.kind {
+            ElemKind::Cps3 => 3,
+            ElemKind::Cps4 => 4,
+            _ => {
+                return Err(SolveError::InvalidModel(format!(
+                    "edge pressure on element {} ({:?}) unsupported (v0.3: CPS3/CPS4)",
+                    e.id, e.kind
+                )))
+            }
+        };
+        if dl.face == 0 || dl.face > max_face {
+            return Err(SolveError::InvalidModel(format!(
+                "element {} ({:?}) has no face {}",
+                e.id, e.kind, dl.face
+            )));
+        }
+        let n = e.connectivity.len();
+        let na = e.connectivity[dl.face - 1];
+        let nb = e.connectivity[dl.face % n];
+        let (ia, ib) = (
+            model.mesh.node_index(na).unwrap(),
+            model.mesh.node_index(nb).unwrap(),
+        );
+        let xy = |i: usize| [model.mesh.nodes[i].coords[0], model.mesh.nodes[i].coords[1]];
+        let (pa, pb) = (xy(ia), xy(ib));
+        let d = [pb[0] - pa[0], pb[1] - pa[1]];
+        let len = (d[0] * d[0] + d[1] * d[1]).sqrt();
+        if len == 0.0 {
+            return Err(SolveError::InvalidModel(format!(
+                "zero-length pressure edge on element {}",
+                e.id
+            )));
+        }
+        let n_in = [-d[1] / len, d[0] / len];
+        let fmag = dl.magnitude * model.thickness * len / 2.0;
+        for &i in &[ia, ib] {
+            f[i * ndof] += fmag * n_in[0];
+            f[i * ndof + 1] += fmag * n_in[1];
+        }
+    }
+    Ok(())
+}
+
+/// Gravity body force: per element `f = rho * t * A * g * dir`, lumped by
+/// the shape-function integral (equal quarters for CPS4, thirds for
+/// CPS3). Plane elements only in v0.3.
+fn gravity_forces(
+    model: &Model,
+    gravity: Option<(f64, [f64; 3])>,
+    ndof: usize,
+    f: &mut [f64],
+) -> Result<(), SolveError> {
+    let Some((g, dir)) = gravity else {
+        return Ok(());
+    };
+    let dir2 = [dir[0], dir[1]];
+    if dir2 == [0.0, 0.0] {
+        return Err(SolveError::InvalidModel(
+            "gravity direction has no in-plane component".into(),
+        ));
+    }
+    for e in &model.mesh.elements {
+        let idx: Vec<usize> = e
+            .connectivity
+            .iter()
+            .map(|&nid| model.mesh.node_index(nid).unwrap())
+            .collect();
+        let per = match e.kind {
+            ElemKind::Cps3 => {
+                let p = [
+                    coords2(model, &idx, 0),
+                    coords2(model, &idx, 1),
+                    coords2(model, &idx, 2),
+                ];
+                let cross = (p[1][0] - p[0][0]) * (p[2][1] - p[0][1])
+                    - (p[1][1] - p[0][1]) * (p[2][0] - p[0][0]);
+                model.density * model.thickness * cross.abs() / 2.0 * g / 3.0
+            }
+            ElemKind::Cps4 => {
+                let p: Vec<[f64; 2]> = (0..4).map(|k| coords2(model, &idx, k)).collect();
+                let mut shoelace = 0.0;
+                for k in 0..4 {
+                    let a = p[k];
+                    let b = p[(k + 1) % 4];
+                    shoelace += a[0] * b[1] - b[0] * a[1];
+                }
+                model.density * model.thickness * shoelace.abs() / 2.0 * g / 4.0
+            }
+            _ => {
+                return Err(SolveError::InvalidModel(
+                    "gravity on solid elements unsupported (v0.3: plane only)".into(),
+                ))
+            }
+        };
+        for &i in &idx {
+            f[i * ndof] += per * dir2[0];
+            f[i * ndof + 1] += per * dir2[1];
+        }
+    }
+    Ok(())
 }
 
 /// In-plane coordinates of the k-th element node (plane elements).
@@ -275,6 +405,7 @@ pub(crate) mod tests {
     pub(crate) fn model_with_mesh(mesh: Mesh) -> Model {
         let n_elem = mesh.elements.len();
         Model {
+            steps: Vec::new(),
             mesh,
             thickness: 1.0,
             materials: vec![Material {
@@ -317,7 +448,7 @@ pub(crate) mod tests {
     #[test]
     fn free_free_stiffness_is_symmetric_and_kills_translation() {
         let model = model_with_mesh(quad_mesh(2, 2, 1.0, 1.0));
-        let (k, _, _) = assemble(&model, 2).unwrap();
+        let (k, _, _) = assemble(&model, 2, &model.load_state()).unwrap();
 
         assert_symmetric(&k);
         let u: Vec<f64> = model.mesh.nodes.iter().flat_map(|_| [1.0, 0.5]).collect();
@@ -328,7 +459,7 @@ pub(crate) mod tests {
     #[test]
     fn free_free_solid_stiffness_is_symmetric_and_kills_translations() {
         let model = model_with_mesh(hex_mesh(2, 2, 2, 1.0, 1.0, 1.0));
-        let (k, _, _) = assemble(&model, 3).unwrap();
+        let (k, _, _) = assemble(&model, 3, &model.load_state()).unwrap();
 
         assert_symmetric(&k);
         let u: Vec<f64> = model

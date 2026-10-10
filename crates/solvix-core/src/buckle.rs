@@ -159,7 +159,7 @@ fn assemble_ksigma(
 /// Solve the linear buckling eigenproblem for the loaded model. The
 /// returned factors multiply the model's own load pattern.
 pub fn solve_buckle(model: &Model, num_modes: usize) -> Result<BucklingSolution, SolveError> {
-    if model.boundary_conditions.is_empty() {
+    if model.load_state().bcs.is_empty() {
         return Err(SolveError::NoConstraints);
     }
     if let Err(e) = model.validate() {
@@ -173,8 +173,9 @@ pub fn solve_buckle(model: &Model, num_modes: usize) -> Result<BucklingSolution,
     let ndof = crate::ndof_per_node(model)?;
 
     // Static state under the applied loads (direct path for determinism).
-    let (mut k, mut f, elems) = assembly::assemble(model, ndof)?;
-    let constrained = constrained_dofs(model, ndof)?;
+    let loads = model.load_state();
+    let (mut k, mut f, elems) = assembly::assemble(model, ndof, &loads)?;
+    let constrained = constrained_dofs(&model.mesh, loads.bcs, ndof)?;
     apply_dirichlet(&mut k, &mut f, &constrained);
     let u = Ldlt::factorize(&k)?.solve(&f);
 
@@ -371,7 +372,10 @@ pub fn solve_buckle(model: &Model, num_modes: usize) -> Result<BucklingSolution,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BoundaryCondition, ConcentratedLoad, Element, ElementSet, Material, Mesh, Node};
+    use crate::{
+        BoundaryCondition, ConcentratedLoad, DistributedLoad, Element, ElementSet, Material, Mesh,
+        Node, Step,
+    };
 
     fn column_model(nx: usize, ny: usize, top_load: f64, pin: bool) -> Model {
         let (l, h, t) = (2.0_f64, 0.1_f64, 0.01_f64);
@@ -430,6 +434,7 @@ mod tests {
             (0..=ny).map(|j| id(nx - 1, j)).collect()
         };
         Model {
+            steps: Vec::new(),
             mesh: Mesh { nodes, elements },
             thickness: t,
             density: 7850.0,
@@ -532,6 +537,97 @@ mod tests {
             "Pcr {:.0} vs Euler(2L) {:.0} ({err:+.1}%)",
             sol.load_factors[0],
             expect
+        );
+    }
+
+    #[test]
+    fn clamped_clamped_column_edge_pressure_buckles_at_4x_pinned() {
+        // The test parked in #24. Literal "both ends clamped + pressure on
+        // the end" cannot carry load in this (and any) displacement-FE
+        // formulation: the consistent pressure forces land on Dirichlet
+        // dofs and are eliminated, and any ux anchor on the loaded edge
+        // short-circuits the load into itself (panel shear ~1.6e9 N/m vs
+        // bar axial ~1e8 N/m; measured: 94% of the pressure bypassed the
+        // bar). Fixed-fixed (K=0.5) is therefore realized the textbook
+        // way — effective length: a pinned-pinned column of L/2 carries
+        // the same Pcr as a fixed-fixed column of L, here L=2:
+        // Pcr = pi^2 EI/(L/2)^2 = 4 x the pinned L=2 reference. Both end
+        // edges roll (uy), one ux pin at the FAR corner from the load, so
+        // the edge pressure on the right end enters the bar unimpeded.
+        let (nx, ny) = (20, 4);
+        let (l, h) = (1.0, 0.1_f64); // half of the pinned reference column
+        let t = 0.01_f64;
+        let id = |i: usize, j: usize| (j * (nx + 1) + i + 1) as u32;
+        let mut nodes = Vec::new();
+        for j in 0..=ny {
+            for i in 0..=nx {
+                nodes.push(Node {
+                    id: id(i, j),
+                    coords: [i as f64 * l / nx as f64, j as f64 * h / ny as f64, 0.0],
+                });
+            }
+        }
+        let mut elements = Vec::new();
+        for j in 0..ny {
+            for i in 0..nx {
+                elements.push(Element {
+                    id: (j * nx + i + 1) as u32,
+                    kind: ElemKind::Cps4,
+                    connectivity: vec![id(i, j), id(i + 1, j), id(i + 1, j + 1), id(i, j + 1)],
+                });
+            }
+        }
+        let left: Vec<u32> = (0..=ny).map(|j| id(0, j)).collect();
+        let right: Vec<u32> = (0..=ny).map(|j| id(nx, j)).collect();
+        let bcs = vec![
+            BoundaryCondition {
+                node_ids: left,
+                dofs: vec![2],
+            },
+            BoundaryCondition {
+                node_ids: vec![id(0, 0)],
+                dofs: vec![1],
+            },
+            BoundaryCondition {
+                node_ids: right,
+                dofs: vec![2],
+            },
+        ];
+        // Face 2 of the rightmost element column = the x=L end edge;
+        // positive pressure acts into the element (-x) -> compression.
+        let pressure = 1.0e6;
+        let dloads: Vec<_> = (0..ny)
+            .map(|j| DistributedLoad {
+                element_id: (j * nx + nx) as u32,
+                face: 2,
+                magnitude: pressure,
+            })
+            .collect();
+        let m = Model {
+            steps: vec![Step {
+                name: "edge pressure".into(),
+                boundary_conditions: bcs,
+                dloads,
+                ..Step::default()
+            }],
+            mesh: Mesh { nodes, elements },
+            elsets: vec![ElementSet {
+                name: "all".into(),
+                element_ids: (1..=(nx * ny) as u32).collect(),
+            }],
+            mat_assignments: vec![("all".into(), "steel".into())],
+            ..column_model(1, 1, 0.0, true)
+        };
+        let sol = solve_buckle(&m, 1).unwrap();
+        let pcr = sol.load_factors[0] * pressure * h * t;
+        let expect = pcr_euler(1.0); // = 4 x pinned-pinned of the full L=2 column
+        let err = (pcr - expect) / expect * 100.0;
+        eprintln!(
+            "clamped-clamped (eff. length) Pcr_total={pcr:.0} vs 4xPinned={expect:.0} ({err:+.1}%)"
+        );
+        assert!(
+            err.abs() < 15.0,
+            "Pcr_total {pcr:.0} vs 4xPinned {expect:.0} ({err:+.1}%)"
         );
     }
 

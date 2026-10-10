@@ -599,6 +599,7 @@ mod tests {
                 dof: 2,
                 value: 1000.0,
             }],
+            steps: Vec::new(),
         }
     }
 

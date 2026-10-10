@@ -285,7 +285,9 @@ mod tests {
 
     fn grid_csr(nx: usize, ny: usize) -> Csr {
         let model = model_with_mesh(quad_mesh(nx, ny, 1.0, 1.0));
-        assembly::assemble(&model, 2).unwrap().0
+        assembly::assemble(&model, 2, &model.load_state())
+            .unwrap()
+            .0
     }
 
     #[test]
@@ -382,8 +384,9 @@ mod tests {
         }];
 
         let ndof = crate::ndof_per_node(&model).unwrap();
-        let (mut k, mut f, _) = assembly::assemble(&model, ndof).unwrap();
-        let constrained = solver::constrained_dofs(&model, ndof).unwrap();
+        let loads = model.load_state();
+        let (mut k, mut f, _) = assembly::assemble(&model, ndof, &loads).unwrap();
+        let constrained = solver::constrained_dofs(&model.mesh, loads.bcs, ndof).unwrap();
         solver::apply_dirichlet(&mut k, &mut f, &constrained);
 
         let t0 = Instant::now();

@@ -481,7 +481,7 @@ pub fn solve_modal(model: &Model, opts: &ModalOptions) -> Result<ModalSolution, 
     // at lambda = 0 that plain inverse iteration cannot separate from
     // the elastic ones; v1 requires constraints like the static solve —
     // free-free: add shift sigma later (factor K - sigma*M here).
-    if model.boundary_conditions.is_empty() {
+    if model.load_state().bcs.is_empty() {
         return Err(SolveError::NoConstraints);
     }
     if let Err(e) = model.validate() {
@@ -503,9 +503,10 @@ pub fn solve_modal(model: &Model, opts: &ModalOptions) -> Result<ModalSolution, 
     }
 
     let ndof = crate::ndof_per_node(model)?;
-    let (k_full, _, _) = assembly::assemble(model, ndof)?;
+    let loads = model.load_state();
+    let (k_full, _, _) = assembly::assemble(model, ndof, &loads)?;
     let m_full = assemble_mass(model, ndof)?;
-    let constrained = solver::constrained_dofs(model, ndof)?;
+    let constrained = solver::constrained_dofs(&model.mesh, loads.bcs, ndof)?;
 
     let n = k_full.row_ptr.len() - 1;
     let mut is_constrained = vec![false; n];
