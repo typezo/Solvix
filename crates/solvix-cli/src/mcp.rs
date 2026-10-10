@@ -345,7 +345,7 @@ impl Default for McpState {
 }
 
 const TOOL_INFO: &str = r#"{"name":"solvix_info","description":"Parse a Solvix .inp deck and report mesh, BC and load statistics without solving. Units: SI in (m, N, Pa).","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Path to the .inp deck (SI units: m, N, Pa)"}},"required":["path"]}}"#;
-const TOOL_RUN: &str = r#"{"name":"solvix_run","description":"Parse, solve and write <jobname>.vtu for a .inp deck; returns the run summary with solver_method (pcg or ldlt) and cond_estimate (a diagonal conditioning indicator). The analysis type is AUTO-DETECTED from the deck (no flags): a *DYNAMIC step runs transient Newmark dynamics — JSON gains \"dynamic\":true, steps, dt, duration, final_disp_mm, and max_disp_mm is the max over all time points; step temperature data (*HEAT TRANSFER, *TEMPERATURE, *DFLUX) without dynamics runs a thermal-stress pass — JSON gains \"thermal\":true and max_temperature_c; anything else is linear statics. Optional \"modes\": N also extracts the N lowest natural frequencies (modal analysis; JSON gains modes and frequencies_hz). Units: SI in (m, N, Pa); mm and MPa out.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Path to the .inp deck (SI units: m, N, Pa)"},"outdir":{"type":"string","description":"Output directory for the .vtu file (default: working directory)"},"modes":{"type":"integer","minimum":1,"description":"Also extract the N lowest natural frequencies (modal analysis)"}},"required":["path"]}}"#;
+const TOOL_RUN: &str = r#"{"name":"solvix_run","description":"Parse, solve and write <jobname>.vtu for a .inp deck; returns the run summary with solver_method (pcg or ldlt) and cond_estimate (a diagonal conditioning indicator). The analysis type is AUTO-DETECTED from the deck (no flags): a *DYNAMIC step runs transient Newmark dynamics — JSON gains \"dynamic\":true, steps, dt, duration, final_disp_mm, and max_disp_mm is the max over all time points; step temperature data (*HEAT TRANSFER, *TEMPERATURE, *DFLUX) without dynamics runs a thermal-stress pass — JSON gains \"thermal\":true and max_temperature_c; anything else is linear statics. Optional \"modes\": N also extracts the N lowest natural frequencies (modal analysis; JSON gains modes and frequencies_hz). Optional \"odb\": true (the CLI's `run --odb` flag) also writes <jobname>.solvix, a binary output database with result frames and per-node |u| history — inspect it with `solvix odb <file> --inspect` / `--frame N`. Units: SI in (m, N, Pa); mm and MPa out.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Path to the .inp deck (SI units: m, N, Pa)"},"outdir":{"type":"string","description":"Output directory for the .vtu file (default: working directory)"},"modes":{"type":"integer","minimum":1,"description":"Also extract the N lowest natural frequencies (modal analysis)"},"odb":{"type":"boolean","description":"Also write <jobname>.solvix, a binary output database (run --odb)"}},"required":["path"]}}"#;
 const TOOL_RESULTS: &str = r#"{"name":"solvix_results","description":"Solve a .inp deck (reuses a cached solution per path) and return per-node displacements plus nodal and element von Mises arrays. Units: SI in (m, N, Pa); mm and MPa out.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Path to the .inp deck (SI units: m, N, Pa)"}},"required":["path"]}}"#;
 const TOOL_BENCH: &str = r#"{"name":"solvix_bench","description":"Run the built-in verification suite (cantilever40x4, kirsch, patch_cps4) and report values vs analytical references with pass/fail gates. Metrics in mm / MPa.","inputSchema":{"type":"object","properties":{},"required":[]}}"#;
 
@@ -431,12 +431,19 @@ fn tool_run(args: &Json) -> Result<String, (Stage, String)> {
     };
     solvix_io::write_vtu(&vtu, &model, sol_for_vtu)
         .map_err(|e| (Stage::Io, format!("cannot write {}: {e}", vtu.display())))?;
+    let mut outputs = vec![vtu.display().to_string()];
+    if matches!(args.get("odb"), Some(Json::Bool(true))) {
+        // Issue #32: binary output database alongside the VTU.
+        let odb = std::path::Path::new(&outdir).join(format!("{}.solvix", job_name(path)));
+        crate::write_job_odb(&odb, &model, &outcome)?;
+        outputs.push(odb.display().to_string());
+    }
     let s = run_summary(
         &model,
         &outcome,
         &job_name(path),
         solve_ms,
-        vec![vtu.display().to_string()],
+        outputs,
         frequencies_hz,
     );
     Ok(success_json(&s))

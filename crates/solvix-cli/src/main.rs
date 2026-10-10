@@ -1,14 +1,20 @@
 //! # solvix — the agent-era FEA CLI
 //!
 //! Implementation owned by issue #3; `bench` by issue #17. Subcommands:
-//!   solvix run <job.inp> [-o outdir] [--json]
+//!   solvix run <job.inp> [-o outdir] [--odb] [--json]
 //!   solvix info <job.inp> [--json]
+//!   solvix odb <file.solvix> [--inspect | --frame N] [--json]
 //!   solvix bench [--json]
 //!
 //! `run` auto-detects the analysis type from the deck (issues #46/#47):
 //! a `*DYNAMIC` step runs transient Newmark dynamics, temperature data
 //! without dynamics runs the thermal-stress pass, anything else is
 //! linear statics. No flags — see [`solve_auto`].
+//!
+//! `--odb` additionally writes a binary `<job>.solvix` output database
+//! (issue #32): static jobs store one frame, NLGEOM/plasticity/contact
+//! jobs one frame per load increment, dynamics up to 200 subsampled
+//! frames. `solvix odb` inspects them.
 //!
 //! Exit codes: 0 ok · 1 usage/IO · 2 parse error · 3 solve error.
 //! stdout carries the payload (human table or single-line JSON), stderr
@@ -17,8 +23,10 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use solvix_core::{DynSolution, ElemKind, Model, Solution, SolveError};
-use solvix_io::ParseReport;
+use solvix_core::{
+    DynSolution, ElemKind, Model, NlFrame, NlOptions, Solution, SolveError, TimePoint,
+};
+use solvix_io::{Odb, OdbFrame, OdbWriter, ParseReport};
 
 mod bench;
 mod mcp;
@@ -29,22 +37,34 @@ solvix 0.1.0 — the agent-era FEA CLI
 solvix is designed for AI agents: all subcommands accept --json and exit 0/1/2/3.
 
 Usage:
-  solvix run <job.inp> [-o outdir] [--modes N] [--json]
-                                              parse, solve, write <jobname>.vtu;
-                                              --modes N also extracts the N lowest
-                                              natural frequencies (modal analysis).
-                                              Analysis type is AUTO-DETECTED from
-                                              the deck (no flags): a *DYNAMIC step
-                                              runs transient Newmark dynamics (JSON
-                                              gains \"dynamic\":true, steps, dt,
-                                              duration, final_disp_mm; max_disp_mm
-                                              is the max over all time points); step
-                                              temperature data (*HEAT TRANSFER,
-                                              *TEMPERATURE, *DFLUX) without dynamics
-                                              runs a thermal-stress pass (JSON gains
-                                              \"thermal\":true, max_temperature_c);
-                                              anything else is linear statics
+  solvix run <job.inp> [-o outdir] [--modes N] [--odb] [--json]
+                                               parse, solve, write <jobname>.vtu;
+                                               --modes N also extracts the N lowest
+                                               natural frequencies (modal analysis).
+                                               --odb also writes <jobname>.solvix, a
+                                               binary output database (frames with
+                                               displacements, von Mises, temperatures
+                                               or velocities, plus per-node |u|
+                                               history; inspect with `solvix odb`).
+                                               Analysis type is AUTO-DETECTED from
+                                               the deck (no flags): a *DYNAMIC step
+                                               runs transient Newmark dynamics (JSON
+                                               gains \"dynamic\":true, steps, dt,
+                                               duration, final_disp_mm; max_disp_mm
+                                               is the max over all time points); step
+                                               temperature data (*HEAT TRANSFER,
+                                               *TEMPERATURE, *DFLUX) without dynamics
+                                               runs a thermal-stress pass (JSON gains
+                                               \"thermal\":true, max_temperature_c);
+                                               anything else is linear statics
   solvix info <job.inp> [--json]              parse-only model report, never solves
+  solvix odb <file.solvix> [--inspect | --frame N] [--json]
+                                               binary output database reader: default
+                                               (or --inspect) prints the file schema
+                                               (frames, fields, model size, bytes);
+                                               --frame N prints that frame's summary
+                                               (time, load fraction, max displacement
+                                               / stress / temperature / velocity)
   solvix bench [--json]                       built-in verification suite (all-pass exit 0, else 3)
   solvix mcp                                  MCP server on stdio (JSON-RPC 2.0, one object per line)
   solvix help | --help | -h                   show this text
@@ -87,10 +107,17 @@ enum Command {
         inp: String,
         outdir: String,
         modes: Option<usize>,
+        odb: bool,
         json: bool,
     },
     Info {
         inp: String,
+        json: bool,
+    },
+    Odb {
+        file: String,
+        /// `None` means inspect (the schema); `Some(n)` reads frame n.
+        frame: Option<usize>,
         json: bool,
     },
     Bench {
@@ -112,6 +139,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
             let mut inp: Option<String> = None;
             let mut outdir = ".".to_string();
             let mut modes: Option<usize> = None;
+            let mut odb = false;
             let mut json = false;
             let rest: Vec<&String> = it.collect();
             let mut i = 0;
@@ -119,6 +147,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                 let a = rest[i].as_str();
                 match a {
                     "--json" => json = true,
+                    "--odb" if run => odb = true,
                     "--modes" if run => {
                         i += 1;
                         let Some(v) = rest.get(i) else {
@@ -146,7 +175,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                 return Err(format!(
                     "usage: solvix {first} <job.inp>{}",
                     if run {
-                        " [-o outdir] [--modes N] [--json]"
+                        " [-o outdir] [--modes N] [--odb] [--json]"
                     } else {
                         " [--json]"
                     }
@@ -157,11 +186,50 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                     inp,
                     outdir,
                     modes,
+                    odb,
                     json,
                 })
             } else {
                 Ok(Command::Info { inp, json })
             }
+        }
+        "odb" => {
+            let mut file: Option<String> = None;
+            let mut inspect = false;
+            let mut frame: Option<usize> = None;
+            let mut json = false;
+            let rest: Vec<&String> = it.collect();
+            let mut i = 0;
+            while i < rest.len() {
+                let a = rest[i].as_str();
+                match a {
+                    "--json" => json = true,
+                    "--inspect" => inspect = true,
+                    "--frame" => {
+                        i += 1;
+                        let Some(v) = rest.get(i) else {
+                            return Err("--frame requires a value".into());
+                        };
+                        frame = Some(
+                            v.parse()
+                                .map_err(|_| format!("invalid --frame value: {v}"))?,
+                        );
+                    }
+                    _ if a.starts_with('-') => return Err(format!("unknown flag: {a}")),
+                    _ if file.is_none() => file = Some(a.to_string()),
+                    _ => return Err(format!("unexpected argument: {a}")),
+                }
+                i += 1;
+            }
+            if inspect && frame.is_some() {
+                return Err("--inspect and --frame are mutually exclusive".into());
+            }
+            let Some(file) = file else {
+                return Err(
+                    "usage: solvix odb <file.solvix> [--inspect | --frame N] [--json]".into(),
+                );
+            };
+            Ok(Command::Odb { file, frame, json })
         }
         "bench" => {
             let mut json = false;
@@ -272,8 +340,10 @@ fn run_summary(
     frequencies_hz: Vec<f64>,
 ) -> RunSummary {
     let (sol, thermal, dynamic) = match outcome {
-        AutoOutcome::Static { sol, thermal } => (sol, *thermal, None),
-        AutoOutcome::Dynamic { info, final_sol } => (final_sol, None, Some(*info)),
+        AutoOutcome::Static { sol, thermal, .. } => (sol, *thermal, None),
+        AutoOutcome::Dynamic {
+            info, final_sol, ..
+        } => (final_sol, None, Some(*info)),
     };
     // Dynamic runs report the max over ALL time points, not just the
     // final frame packed into `sol`.
@@ -346,17 +416,28 @@ pub(crate) struct DynamicInfo {
 /// What a run actually solved (issues #46/#47): `*DYNAMIC` in any step
 /// wins (transient Newmark; thermal data in the same deck is ignored in
 /// v1 with a stderr warning), temperature data without dynamics runs the
-/// thermal-stress pass, anything else is plain linear statics.
+/// thermal-stress pass, anything else is plain linear statics (NLGEOM,
+/// plasticity and contact ride the NL machinery with one frame per load
+/// increment, kept in [`AutoOutcome::Static::nl_frames`]).
 pub(crate) enum AutoOutcome {
     Static {
         sol: Solution,
         thermal: Option<ThermalInfo>,
+        /// Nodal temperatures of a thermal run (parallel to
+        /// `mesh.nodes`); kept for the `.solvix` output database.
+        temps: Option<Vec<f64>>,
+        /// Converged NL increments (NLGEOM/plasticity/contact decks);
+        /// empty for linear statics. `sol` is the last frame's solution.
+        nl_frames: Vec<NlFrame>,
     },
     Dynamic {
         info: DynamicInfo,
         /// Final-time displacements packed as a [`Solution`] for the VTU
         /// writer and summary fields (v1 dynamics recovers no stresses).
         final_sol: Solution,
+        /// All output points (kept for the `.solvix` output database;
+        /// v1 dynamics recovers no stresses).
+        dyn_points: Vec<TimePoint>,
     },
 }
 
@@ -369,6 +450,14 @@ pub(crate) fn has_thermal(model: &Model) -> bool {
         .steps
         .iter()
         .any(|s| !s.temp_bcs.is_empty() || !s.heat_fluxes.is_empty() || s.heat_source.is_some())
+}
+
+/// Whether `solvix_core::solve` would route through the NL machinery
+/// (contact pairs, plasticity or NLGEOM on the last step).
+fn is_nl(model: &Model) -> bool {
+    !model.contact_pairs.is_empty()
+        || model.plasticity.is_some()
+        || model.steps.last().is_some_and(|s| s.nlgeom)
 }
 
 /// Largest nodal displacement magnitude in a flat dof vector.
@@ -462,13 +551,17 @@ pub(crate) fn solve_auto(model: &Model) -> Result<AutoOutcome, SolveError> {
             final_disp_m,
         };
         let final_sol = final_frame_solution(model, &dyn_sol);
-        return Ok(AutoOutcome::Dynamic { info, final_sol });
+        return Ok(AutoOutcome::Dynamic {
+            info,
+            final_sol,
+            dyn_points: dyn_sol.points,
+        });
     }
     if has_thermal(model) {
         // solve_thermomech runs the conduction pass internally; the extra
         // solve_thermal recovers the temperature field for the summary
-        // (core offers no temps-out variant — the double conduction solve
-        // is the v0.4 price).
+        // and the output database (core offers no temps-out variant —
+        // the double conduction solve is the v0.4 price).
         let temps = solvix_core::solve_thermal(model)?;
         let sol = solvix_core::solve_thermomech(model)?;
         let info = ThermalInfo {
@@ -486,12 +579,244 @@ pub(crate) fn solve_auto(model: &Model) -> Result<AutoOutcome, SolveError> {
         return Ok(AutoOutcome::Static {
             sol,
             thermal: Some(info),
+            temps: Some(temps.temperatures),
+            nl_frames: Vec::new(),
+        });
+    }
+    if is_nl(model) {
+        // Same routing solvix_core::solve applies, but the frames are
+        // kept for the output database.
+        let nl_frames = solvix_core::solve_nl(model, &NlOptions::default())?;
+        let sol = nl_frames
+            .last()
+            .map(|f| f.solution.clone())
+            .unwrap_or_default();
+        return Ok(AutoOutcome::Static {
+            sol,
+            thermal: None,
+            temps: None,
+            nl_frames,
         });
     }
     Ok(AutoOutcome::Static {
         sol: solvix_core::solve(model)?,
         thermal: None,
+        temps: None,
+        nl_frames: Vec::new(),
     })
+}
+
+// ---- issue #32: .solvix output database ----
+
+/// Frame ceiling for dynamic jobs written to the output database.
+const ODB_MAX_FRAMES: usize = 200;
+
+/// Indices of the output points kept when subsampling to
+/// [`ODB_MAX_FRAMES`]: all of them when there are fewer, else 200
+/// evenly spaced from first to last (inclusive).
+fn dyn_frame_indices(n: usize) -> Vec<usize> {
+    if n <= ODB_MAX_FRAMES {
+        (0..n).collect()
+    } else {
+        (0..ODB_MAX_FRAMES)
+            .map(|k| k * (n - 1) / (ODB_MAX_FRAMES - 1))
+            .collect()
+    }
+}
+
+/// The output-database frames of a run: static jobs one frame, NL jobs
+/// one per converged increment, dynamic jobs the subsampled time points
+/// with velocities.
+fn odb_frames(model: &Model, outcome: &AutoOutcome) -> Vec<OdbFrame> {
+    let nodes = model.mesh.nodes.len();
+    match outcome {
+        AutoOutcome::Static {
+            sol,
+            temps,
+            nl_frames,
+            ..
+        } => {
+            if nl_frames.is_empty() {
+                vec![OdbFrame {
+                    time: 0.0,
+                    load_fraction: 1.0,
+                    displacements: sol.displacements.clone(),
+                    von_mises: sol.von_mises.clone(),
+                    nodal_von_mises: sol.nodal_von_mises.clone(),
+                    temperatures: temps.clone(),
+                    velocities: None,
+                }]
+            } else {
+                nl_frames
+                    .iter()
+                    .map(|f| OdbFrame {
+                        time: 0.0,
+                        load_fraction: f.load_fraction,
+                        displacements: f.solution.displacements.clone(),
+                        von_mises: f.solution.von_mises.clone(),
+                        nodal_von_mises: f.solution.nodal_von_mises.clone(),
+                        temperatures: None,
+                        velocities: None,
+                    })
+                    .collect()
+            }
+        }
+        AutoOutcome::Dynamic {
+            info, dyn_points, ..
+        } => dyn_frame_indices(dyn_points.len())
+            .into_iter()
+            .map(|i| {
+                let p = &dyn_points[i];
+                let load_fraction = if info.duration > 0.0 {
+                    p.time / info.duration
+                } else {
+                    0.0
+                };
+                OdbFrame {
+                    time: p.time,
+                    load_fraction,
+                    displacements: flat_triples(&p.displacements, nodes),
+                    von_mises: Vec::new(),
+                    nodal_von_mises: Vec::new(),
+                    temperatures: None,
+                    velocities: Some(flat_triples(&p.velocities, nodes)),
+                }
+            })
+            .collect(),
+    }
+}
+
+/// Write a run's output database to `path` (model once, then frames).
+fn write_job_odb(path: &Path, model: &Model, outcome: &AutoOutcome) -> Result<(), (Stage, String)> {
+    let wrap = |e: std::io::Error| (Stage::Io, format!("cannot write {}: {e}", path.display()));
+    let mut w = OdbWriter::create(path, &model.mesh).map_err(wrap)?;
+    for frame in odb_frames(model, outcome) {
+        w.append_frame(&frame).map_err(wrap)?;
+    }
+    w.finish().map_err(wrap)?;
+    Ok(())
+}
+
+/// Schema report for `solvix odb --inspect` (issue #32).
+struct OdbInspect {
+    file: String,
+    frames: usize,
+    fields: Vec<&'static str>,
+    nodes: usize,
+    elements: usize,
+    bytes: u64,
+}
+
+/// One frame's summary for `solvix odb --frame N`.
+struct FrameSummary {
+    frame: usize,
+    time: f64,
+    load_fraction: f64,
+    max_disp_m: f64,
+    max_von_mises_pa: f64,
+    max_nodal_von_mises_pa: f64,
+    max_temperature: Option<f64>,
+    max_velocity_m: Option<f64>,
+}
+
+fn frame_summary(frame: usize, f: &OdbFrame) -> FrameSummary {
+    let max_disp_m = f
+        .displacements
+        .iter()
+        .map(|d| (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt())
+        .fold(0.0, f64::max);
+    let max_vel_m = f.velocities.as_ref().map(|vs| {
+        vs.iter()
+            .map(|v| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt())
+            .fold(0.0, f64::max)
+    });
+    FrameSummary {
+        frame,
+        time: f.time,
+        load_fraction: f.load_fraction,
+        max_disp_m,
+        max_von_mises_pa: f.von_mises.iter().copied().fold(0.0, f64::max),
+        max_nodal_von_mises_pa: f.nodal_von_mises.iter().copied().fold(0.0, f64::max),
+        max_temperature: f
+            .temperatures
+            .as_ref()
+            .map(|t| t.iter().copied().fold(f64::NEG_INFINITY, f64::max))
+            .filter(|t| t.is_finite()),
+        max_velocity_m: max_vel_m,
+    }
+}
+
+fn inspect_json(r: &OdbInspect) -> String {
+    format!(
+        "{{\"ok\":true,\"file\":\"{}\",\"version\":1,\"nodes\":{},\"elements\":{},\"frames\":{},\"fields\":[{}],\"bytes\":{}}}",
+        json_escape(&r.file),
+        r.nodes,
+        r.elements,
+        r.frames,
+        r.fields
+            .iter()
+            .map(|f| format!("\"{f}\""))
+            .collect::<Vec<_>>()
+            .join(","),
+        r.bytes,
+    )
+}
+
+fn inspect_human(r: &OdbInspect) -> String {
+    let mut out = String::new();
+    out.push_str(&row("file", &r.file));
+    out.push_str(&row("format", "SLVXODB1 v1"));
+    out.push_str(&row("nodes", &r.nodes.to_string()));
+    out.push_str(&row("elements", &r.elements.to_string()));
+    out.push_str(&row("frames", &r.frames.to_string()));
+    out.push_str(&row("fields", &r.fields.join(", ")));
+    out.push_str(&row("bytes", &r.bytes.to_string()));
+    out
+}
+
+fn frame_json(file: &str, s: &FrameSummary) -> String {
+    let mut j = format!(
+        "{{\"ok\":true,\"file\":\"{}\",\"frame\":{},\"time\":{},\"load_fraction\":{},\"max_disp_mm\":{},\"max_von_mises_mpa\":{},\"max_nodal_von_mises_mpa\":{}",
+        json_escape(file),
+        s.frame,
+        fmt_secs(s.time),
+        fmt_secs(s.load_fraction),
+        fmt_mm(s.max_disp_m),
+        fmt_mpa(s.max_von_mises_pa),
+        fmt_mpa(s.max_nodal_von_mises_pa),
+    );
+    if let Some(t) = s.max_temperature {
+        j.push_str(&format!(",\"max_temperature_c\":{}", fmt_c(t)));
+    }
+    if let Some(v) = s.max_velocity_m {
+        j.push_str(&format!(",\"max_velocity_mm_s\":{}", fmt_mm(v)));
+    }
+    j.push('}');
+    j
+}
+
+fn frame_human(file: &str, s: &FrameSummary) -> String {
+    let mut out = String::new();
+    out.push_str(&row("file", file));
+    out.push_str(&row("frame", &s.frame.to_string()));
+    out.push_str(&row("time", &format!("{} s", fmt_secs(s.time))));
+    out.push_str(&row("load fraction", &fmt_secs(s.load_fraction)));
+    out.push_str(&row("max |disp|", &format!("{} mm", fmt_mm(s.max_disp_m))));
+    out.push_str(&row(
+        "max von Mises",
+        &format!("{} MPa", fmt_mpa(s.max_von_mises_pa)),
+    ));
+    out.push_str(&row(
+        "max nodal vM",
+        &format!("{} MPa", fmt_mpa(s.max_nodal_von_mises_pa)),
+    ));
+    if let Some(t) = s.max_temperature {
+        out.push_str(&row("max temp", &format!("{} C", fmt_c(t))));
+    }
+    if let Some(v) = s.max_velocity_m {
+        out.push_str(&row("max |vel|", &format!("{} mm/s", fmt_mm(v))));
+    }
+    out
 }
 
 fn success_json(s: &RunSummary) -> String {
@@ -774,6 +1099,7 @@ fn do_run(
     inp: &str,
     outdir: &str,
     modes: Option<usize>,
+    odb: bool,
     json: bool,
 ) -> Result<(), (Stage, String)> {
     let text = read_deck(inp)?;
@@ -807,14 +1133,14 @@ fn do_run(
     };
     solvix_io::write_vtu(&vtu, &model, sol_for_vtu)
         .map_err(|e| (Stage::Io, format!("cannot write {}: {e}", vtu.display())))?;
-    let s = run_summary(
-        &model,
-        &outcome,
-        &job,
-        solve_ms,
-        vec![vtu.display().to_string()],
-        frequencies_hz,
-    );
+    let mut outputs = vec![vtu.display().to_string()];
+    if odb {
+        // Issue #32: binary output database alongside the VTU.
+        let odb_path: PathBuf = Path::new(outdir).join(format!("{job}.solvix"));
+        write_job_odb(&odb_path, &model, &outcome)?;
+        outputs.push(odb_path.display().to_string());
+    }
+    let s = run_summary(&model, &outcome, &job, solve_ms, outputs, frequencies_hz);
     if json {
         println!("{}", success_json(&s));
     } else {
@@ -832,6 +1158,62 @@ fn do_info(inp: &str, json: bool) -> Result<(), (Stage, String)> {
         println!("{}", info_json(&r));
     } else {
         print!("{}", info_human(&r));
+    }
+    Ok(())
+}
+
+/// `solvix odb <file>`: `frame == None` inspects the schema, `Some(n)`
+/// prints frame n's summary. A malformed database (bad magic/version)
+/// maps to the parse stage; other IO failures to the io stage.
+fn do_odb(file: &str, frame: Option<usize>, json: bool) -> Result<(), (Stage, String)> {
+    let odb = Odb::open(Path::new(file)).map_err(|e| {
+        let stage = if e.kind() == std::io::ErrorKind::InvalidData {
+            Stage::Parse
+        } else {
+            Stage::Io
+        };
+        (stage, format!("cannot open {file}: {e}"))
+    })?;
+    match frame {
+        None => {
+            let mut fields = vec!["displacements", "von_mises", "nodal_von_mises"];
+            if odb.has_temperatures() {
+                fields.push("temperatures");
+            }
+            if odb.has_velocities() {
+                fields.push("velocities");
+            }
+            let r = OdbInspect {
+                file: file.to_string(),
+                frames: odb.frame_count(),
+                fields,
+                nodes: odb.model().nodes.len(),
+                elements: odb.model().elements.len(),
+                bytes: odb.file_len(),
+            };
+            if json {
+                println!("{}", inspect_json(&r));
+            } else {
+                print!("{}", inspect_human(&r));
+            }
+        }
+        Some(n) => {
+            if n >= odb.frame_count() {
+                return Err((
+                    Stage::Usage,
+                    format!("frame {n} out of range ({} frames)", odb.frame_count()),
+                ));
+            }
+            let f = odb
+                .frame(n)
+                .map_err(|e| (Stage::Parse, format!("cannot read frame {n}: {e}")))?;
+            let s = frame_summary(n, &f);
+            if json {
+                println!("{}", frame_json(file, &s));
+            } else {
+                print!("{}", frame_human(file, &s));
+            }
+        }
     }
     Ok(())
 }
@@ -870,12 +1252,14 @@ fn cli(args: &[String]) -> i32 {
             0
         }
         Command::Info { inp, json } => finish(do_info(&inp, json), json),
+        Command::Odb { file, frame, json } => finish(do_odb(&file, frame, json), json),
         Command::Run {
             inp,
             outdir,
             modes,
+            odb,
             json,
-        } => finish(do_run(&inp, &outdir, modes, json), json),
+        } => finish(do_run(&inp, &outdir, modes, odb, json), json),
         Command::Bench { json } => bench::run(json),
         Command::Mcp => mcp::serve(),
     }
@@ -959,6 +1343,8 @@ mod tests {
         AutoOutcome::Static {
             sol: fake_solution(),
             thermal: None,
+            temps: None,
+            nl_frames: Vec::new(),
         }
     }
 
@@ -994,6 +1380,7 @@ mod tests {
                 inp: "job.inp".into(),
                 outdir: ".".into(),
                 modes: None,
+                odb: false,
                 json: false
             })
         );
@@ -1003,6 +1390,7 @@ mod tests {
                 inp: "job.inp".into(),
                 outdir: "out".into(),
                 modes: None,
+                odb: false,
                 json: true
             })
         );
@@ -1012,6 +1400,7 @@ mod tests {
                 inp: "a.inp".into(),
                 outdir: "b".into(),
                 modes: None,
+                odb: false,
                 json: true
             })
         );
@@ -1021,6 +1410,7 @@ mod tests {
                 inp: "job.inp".into(),
                 outdir: ".".into(),
                 modes: Some(3),
+                odb: false,
                 json: true
             })
         );
@@ -1030,6 +1420,7 @@ mod tests {
                 inp: "job.inp".into(),
                 outdir: ".".into(),
                 modes: Some(6),
+                odb: false,
                 json: false
             })
         );
@@ -1409,7 +1800,10 @@ COLD, 0.0
     fn auto_dynamic_run_json_and_human() {
         let (model, _) = solvix_io::parse_inp(DYNAMIC_DECK).unwrap();
         let outcome = solve_auto(&model).unwrap();
-        let AutoOutcome::Dynamic { info, final_sol } = &outcome else {
+        let AutoOutcome::Dynamic {
+            info, final_sol, ..
+        } = &outcome
+        else {
             panic!("dynamic deck must take the transient path");
         };
         assert_eq!(info.steps, 10);
@@ -1472,5 +1866,284 @@ COLD, 0.0
         assert_eq!(fmt_secs(1.5), "1.5");
         assert_eq!(fmt_secs(0.0), "0");
         assert_eq!(fmt_secs(f64::NAN), "0");
+    }
+
+    // ---- issue #32: .solvix output database ----
+
+    /// Same mesh as THERMAL_DECK, NLGEOM static step.
+    const NLGEOM_DECK: &str = "\
+*HEADING
+    nl fixture
+*NODE
+1, 0.0, 0.0
+2, 0.05, 0.0
+3, 0.1, 0.0
+4, 0.0, 0.025
+5, 0.05, 0.025
+6, 0.1, 0.025
+*ELEMENT, TYPE=CPS4, ELSET=ALL
+1, 1, 2, 5, 4
+2, 2, 3, 6, 5
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210e9, 0.3
+*SOLID SECTION, ELSET=ALL, MATERIAL=STEEL
+0.01
+*STEP, NLGEOM=YES
+*STATIC
+*BOUNDARY
+1, 1, 2
+4, 1, 2
+*CLOAD
+3, 2, -500.0
+6, 2, -500.0
+*END STEP
+";
+
+    fn tmp_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "solvix_cli_odb_{name}_{}.solvix",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn args_odb() {
+        // Bare odb defaults to inspect (frame: None).
+        assert_eq!(
+            parse_args(&sv(&["odb", "job.solvix"])),
+            Ok(Command::Odb {
+                file: "job.solvix".into(),
+                frame: None,
+                json: false
+            })
+        );
+        assert_eq!(
+            parse_args(&sv(&["odb", "job.solvix", "--inspect", "--json"])),
+            Ok(Command::Odb {
+                file: "job.solvix".into(),
+                frame: None,
+                json: true
+            })
+        );
+        assert_eq!(
+            parse_args(&sv(&["odb", "job.solvix", "--frame", "3", "--json"])),
+            Ok(Command::Odb {
+                file: "job.solvix".into(),
+                frame: Some(3),
+                json: true
+            })
+        );
+        assert!(parse_args(&sv(&["odb"])).is_err());
+        assert!(parse_args(&sv(&["odb", "f.solvix", "--frame"])).is_err());
+        let err = parse_args(&sv(&["odb", "f.solvix", "--frame", "x"])).unwrap_err();
+        assert!(err.contains("invalid --frame value"), "{err}");
+        let err = parse_args(&sv(&["odb", "f.solvix", "--inspect", "--frame", "1"])).unwrap_err();
+        assert!(err.contains("mutually exclusive"), "{err}");
+        let err = parse_args(&sv(&["odb", "f.solvix", "--wat"])).unwrap_err();
+        assert!(err.contains("unknown flag"), "{err}");
+        let err = parse_args(&sv(&["odb", "a.solvix", "b.solvix"])).unwrap_err();
+        assert!(err.contains("unexpected argument"), "{err}");
+    }
+
+    #[test]
+    fn args_run_odb_flag() {
+        assert_eq!(
+            parse_args(&sv(&["run", "job.inp", "--odb", "--json"])),
+            Ok(Command::Run {
+                inp: "job.inp".into(),
+                outdir: ".".into(),
+                modes: None,
+                odb: true,
+                json: true
+            })
+        );
+        let err = parse_args(&sv(&["info", "a.inp", "--odb"])).unwrap_err();
+        assert!(err.contains("unknown flag"), "{err}");
+    }
+
+    #[test]
+    fn dyn_frame_indices_subsamples() {
+        assert_eq!(dyn_frame_indices(0), Vec::<usize>::new());
+        assert_eq!(dyn_frame_indices(11), (0..11).collect::<Vec<_>>());
+        let idx = dyn_frame_indices(1001);
+        assert_eq!(idx.len(), ODB_MAX_FRAMES);
+        assert_eq!(idx.first(), Some(&0));
+        assert_eq!(idx.last(), Some(&1000));
+        assert!(idx.windows(2).all(|w| w[0] < w[1]));
+        let idx = dyn_frame_indices(201);
+        assert_eq!(idx.len(), ODB_MAX_FRAMES);
+        assert_eq!(idx.last(), Some(&200));
+    }
+
+    #[test]
+    fn odb_static_one_frame() {
+        let model = fake_model();
+        let frames = odb_frames(&model, &static_outcome());
+        assert_eq!(frames.len(), 1);
+        let f = &frames[0];
+        assert_eq!(f.load_fraction, 1.0);
+        assert_eq!(f.displacements, fake_solution().displacements);
+        assert_eq!(f.von_mises.len(), 1);
+        assert!(f.temperatures.is_none() && f.velocities.is_none());
+    }
+
+    #[test]
+    fn odb_run_pipeline_static_round_trip() {
+        let path = tmp_path("static");
+        let model = fake_model();
+        write_job_odb(&path, &model, &static_outcome()).unwrap();
+        let odb = Odb::open(&path).unwrap();
+        assert_eq!(odb.frame_count(), 1);
+        assert_eq!(odb.model().nodes.len(), 2);
+        let f = odb.frame(0).unwrap();
+        assert_eq!(f.displacements[1][0].to_bits(), 0.0047619f64.to_bits());
+        assert!(!odb.has_temperatures() && !odb.has_velocities());
+        assert_eq!(odb.history(1).unwrap().len(), 1);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn odb_thermal_stores_temperatures() {
+        let (model, _) = solvix_io::parse_inp(THERMAL_DECK).unwrap();
+        let outcome = solve_auto(&model).unwrap();
+        let frames = odb_frames(&model, &outcome);
+        assert_eq!(frames.len(), 1);
+        let temps = frames[0].temperatures.as_ref().unwrap();
+        assert_eq!(temps.len(), model.mesh.nodes.len());
+        assert!((temps.iter().copied().fold(f64::NEG_INFINITY, f64::max) - 100.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn odb_nl_one_frame_per_increment() {
+        let (model, _) = solvix_io::parse_inp(NLGEOM_DECK).unwrap();
+        let outcome = solve_auto(&model).unwrap();
+        let AutoOutcome::Static { nl_frames, .. } = &outcome else {
+            panic!("NLGEOM deck must keep its frames");
+        };
+        assert_eq!(nl_frames.len(), 20, "default max_increments = 20");
+        assert!((nl_frames.last().unwrap().load_fraction - 1.0).abs() < 1e-12);
+        let path = tmp_path("nl");
+        write_job_odb(&path, &model, &outcome).unwrap();
+        let odb = Odb::open(&path).unwrap();
+        assert_eq!(odb.frame_count(), 20);
+        let f = odb.frame(19).unwrap();
+        assert!((f.load_fraction - 1.0).abs() < 1e-12);
+        let hist = odb.history(2).unwrap();
+        assert_eq!(hist.len(), 20);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn odb_dynamic_keeps_small_runs_and_velocities() {
+        let (model, _) = solvix_io::parse_inp(DYNAMIC_DECK).unwrap();
+        let outcome = solve_auto(&model).unwrap();
+        // 11 output points stay 11 frames (no sub-sampling needed).
+        let frames = odb_frames(&model, &outcome);
+        assert_eq!(frames.len(), 11);
+        let last = &frames[10];
+        assert!((last.time - 0.01).abs() < 1e-12);
+        assert!((last.load_fraction - 1.0).abs() < 1e-12);
+        let v = last.velocities.as_ref().unwrap();
+        assert_eq!(v.len(), model.mesh.nodes.len());
+        assert!(last.von_mises.is_empty(), "v1 dynamics has no stresses");
+    }
+
+    #[test]
+    fn inspect_json_exact() {
+        let r = OdbInspect {
+            file: "job.solvix".into(),
+            frames: 11,
+            fields: vec![
+                "displacements",
+                "von_mises",
+                "nodal_von_mises",
+                "temperatures",
+            ],
+            nodes: 6,
+            elements: 2,
+            bytes: 4096,
+        };
+        assert_eq!(
+            inspect_json(&r),
+            r#"{"ok":true,"file":"job.solvix","version":1,"nodes":6,"elements":2,"frames":11,"fields":["displacements","von_mises","nodal_von_mises","temperatures"],"bytes":4096}"#
+        );
+        let h = inspect_human(&r);
+        assert!(h.contains("frames        11"), "{h}");
+        assert!(
+            h.contains("fields        displacements, von_mises, nodal_von_mises, temperatures"),
+            "{h}"
+        );
+    }
+
+    #[test]
+    fn frame_json_exact() {
+        let s = FrameSummary {
+            frame: 3,
+            time: 0.003,
+            load_fraction: 0.3,
+            max_disp_m: 0.0047619,
+            max_von_mises_pa: 38.2e6,
+            max_nodal_von_mises_pa: 40.0e6,
+            max_temperature: Some(100.0),
+            max_velocity_m: None,
+        };
+        assert_eq!(
+            frame_json("job.solvix", &s),
+            r#"{"ok":true,"file":"job.solvix","frame":3,"time":0.003,"load_fraction":0.3,"max_disp_mm":4.762,"max_von_mises_mpa":38.200,"max_nodal_von_mises_mpa":40.000,"max_temperature_c":100.000}"#
+        );
+        let h = frame_human("job.solvix", &s);
+        assert!(h.contains("max |disp|    4.762 mm"), "{h}");
+        assert!(h.contains("max temp      100.000 C"), "{h}");
+        // Empty optional fields are omitted entirely.
+        let bare = FrameSummary {
+            max_temperature: None,
+            max_velocity_m: Some(0.5),
+            ..s
+        };
+        let j = frame_json("job.solvix", &bare);
+        assert!(!j.contains("max_temperature_c"), "{j}");
+        assert!(j.contains(r#""max_velocity_mm_s":500.000"#), "{j}");
+    }
+
+    #[test]
+    fn frame_summary_maxes() {
+        let f = OdbFrame {
+            time: 1.0,
+            load_fraction: 0.5,
+            displacements: vec![[3.0, 4.0, 0.0], [0.0, 0.0, 0.0]],
+            von_mises: vec![1.0, 9.0, 4.0],
+            nodal_von_mises: vec![2.0],
+            temperatures: Some(vec![-5.0, 80.0]),
+            velocities: Some(vec![[0.0, 0.0, 2.0]]),
+        };
+        let s = frame_summary(0, &f);
+        assert_eq!(s.max_disp_m, 5.0);
+        assert_eq!(s.max_von_mises_pa, 9.0);
+        assert_eq!(s.max_nodal_von_mises_pa, 2.0);
+        assert_eq!(s.max_temperature, Some(80.0));
+        assert_eq!(s.max_velocity_m, Some(2.0));
+    }
+
+    #[test]
+    fn do_odb_error_stages() {
+        // Missing file: io.
+        let (stage, msg) = do_odb("/nonexistent/x.solvix", None, true).unwrap_err();
+        assert_eq!(stage, Stage::Io);
+        assert!(msg.contains("cannot open"), "{msg}");
+        // Garbage magic: parse.
+        let path = tmp_path("garbage");
+        std::fs::write(&path, b"definitely not an odb").unwrap();
+        let (stage, _) = do_odb(&path.display().to_string(), None, true).unwrap_err();
+        assert_eq!(stage, Stage::Parse);
+        // Valid file, frame out of range: usage.
+        write_job_odb(&path, &fake_model(), &static_outcome()).unwrap();
+        let (stage, msg) = do_odb(&path.display().to_string(), Some(5), true).unwrap_err();
+        assert_eq!(stage, Stage::Usage);
+        assert!(msg.contains("out of range"), "{msg}");
+        // Success paths print and return Ok.
+        assert!(do_odb(&path.display().to_string(), None, true).is_ok());
+        assert!(do_odb(&path.display().to_string(), Some(0), true).is_ok());
+        std::fs::remove_file(&path).unwrap();
     }
 }
