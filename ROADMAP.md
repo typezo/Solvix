@@ -57,9 +57,9 @@ CPS3/CPS4 plane stress · `.inp` subset parser · VTU out · `solvix run/info --
 - [ ] Thermal transient (v0.5 candidate)
 
 ### v0.5.0 — Nonlinearity
-- [ ] Geometric: Updated Lagrangian + Newton–Raphson (#27)
-- [ ] Material: J2 plasticity, return mapping (#28)
-- [ ] Contact 2D: penalty node-to-surface (#29)
+- [x] Geometric: Updated Lagrangian + Newton–Raphson (#29)
+- [x] Material: J2 plasticity, radial return (#30)
+- [x] Contact 2D: penalty node-to-surface (#31)
 
 ### v0.6.0 — Output database + history
 - [ ] `.solvix` binary ODB: frames, field/history outputs, random access
