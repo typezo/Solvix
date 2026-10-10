@@ -36,6 +36,14 @@ Inspect a deck before spending time on a solve:
 $ ./target/release/solvix info examples/cantilever.inp --json
 ```
 
+## Examples gallery
+
+The [`examples/`](examples/) directory contains runnable decks for 2D and 3D
+static bending, the Kirsch stress concentration, thermal stress, transient
+dynamics, and parser-failure handling. Each entry includes the exact CLI
+command and its expected QA result in
+[docs/examples.md](docs/examples.md).
+
 ## Screenshots
 
 The bundled web UI (`cargo run -p solvix-ui -- serve`) recreates the
@@ -116,7 +124,8 @@ elastic properties in pascals.
 | `*STATIC` | Supported | Linear-static analysis declaration |
 
 Unsupported or malformed keywords are reported rather than silently changing
-the meaning of a solve.
+the meaning of a solve. The full per-keyword coverage matrix, parameters,
+and error taxonomy live in [docs/KEYWORDS.md](docs/KEYWORDS.md).
 
 ## Roadmap
 
