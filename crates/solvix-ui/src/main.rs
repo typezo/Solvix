@@ -436,11 +436,17 @@ fn results_json(job: &str, sol: &Solution) -> String {
     let disp = sol
         .displacements
         .iter()
-        .map(|d| format!("[{},{}]", num(d[0]), num(d[1])))
+        .map(|d| format!("[{},{},{}]", num(d[0]), num(d[1]), num(d[2])))
         .collect::<Vec<_>>()
         .join(",");
     let mises = sol
         .von_mises
+        .iter()
+        .map(|v| num(*v))
+        .collect::<Vec<_>>()
+        .join(",");
+    let nodal = sol
+        .nodal_von_mises
         .iter()
         .map(|v| num(*v))
         .collect::<Vec<_>>()
@@ -452,10 +458,11 @@ fn results_json(job: &str, sol: &Solution) -> String {
         .fold(0.0, f64::max);
     let max_mises = sol.von_mises.iter().copied().fold(0.0, f64::max);
     format!(
-        "{{\"ok\":true,\"job\":\"{}\",\"displacements\":[{}],\"von_mises\":[{}],\"max_disp_mm\":{},\"max_von_mises_mpa\":{},\"iterations\":{},\"residual\":{}}}",
+        "{{\"ok\":true,\"job\":\"{}\",\"displacements\":[{}],\"von_mises\":[{}],\"nodal_von_mises\":[{}],\"max_disp_mm\":{},\"max_von_mises_mpa\":{},\"iterations\":{},\"residual\":{}}}",
         json_escape(job),
         disp,
         mises,
+        nodal,
         fixed3(max_disp_m * 1000.0),
         fixed3(max_mises / 1e6),
         sol.iterations,
@@ -1049,7 +1056,7 @@ mod tests {
         };
         assert_eq!(
             results_json("cantilever", &sol),
-            r#"{"ok":true,"job":"cantilever","displacements":[[0.0,0.0],[4e-6,-8e-6]],"von_mises":[120000000.0,119000000.0],"max_disp_mm":0.009,"max_von_mises_mpa":120.000,"iterations":390,"residual":6.933e-11}"#
+            r#"{"ok":true,"job":"cantilever","displacements":[[0.0,0.0,0.0],[4e-6,-8e-6,0.0]],"von_mises":[120000000.0,119000000.0],"nodal_von_mises":[120000000.0,119000000.0],"max_disp_mm":0.009,"max_von_mises_mpa":120.000,"iterations":390,"residual":6.933e-11}"#
         );
     }
 
