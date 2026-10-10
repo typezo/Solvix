@@ -15,13 +15,28 @@ fn gather_ue(u: &[f64], node_idx: &[usize], ndof: usize) -> Vec<f64> {
         .collect()
 }
 
-/// Von Mises per element, parallel to `model.mesh.elements`.
-pub(crate) fn von_mises_at_centroids(u: &[f64], ndof: usize, elems: &[ElemInfo]) -> Vec<f64> {
+/// Von Mises per element, parallel to `model.mesh.elements`. With
+/// `thermal`, each element's recovered stress has its (constant)
+/// thermal stress vector subtracted first: sigma = D(B u) - sigma_th,
+/// so the value includes thermal strain.
+pub(crate) fn von_mises_at_centroids(
+    u: &[f64],
+    ndof: usize,
+    elems: &[ElemInfo],
+    thermal: Option<&[[f64; 6]]>,
+) -> Vec<f64> {
     elems
         .iter()
-        .map(|info| {
+        .enumerate()
+        .map(|(ei, info)| {
             let ue = gather_ue(u, &info.node_idx, ndof);
-            von_mises(&centroid_stress(&info.b, &info.d, &ue))
+            let mut s = centroid_stress(&info.b, &info.d, &ue);
+            if let Some(th) = thermal {
+                for (a, b) in s.iter_mut().zip(&th[ei]) {
+                    *a -= b;
+                }
+            }
+            von_mises(&s)
         })
         .collect()
 }
@@ -30,6 +45,9 @@ pub(crate) fn von_mises_at_centroids(u: &[f64], ndof: usize, elems: &[ElemInfo])
 /// stress components at the Gauss points are extrapolated to the corner
 /// nodes (bilinear for quads, trilinear for hexes; Abaqus-style) or taken
 /// constant (triangles, tets), then averaged over contributing elements.
+/// With `thermal`, each element's thermal stress vector is subtracted
+/// from its own contributions BEFORE the nodal average (it is constant
+/// per element but differs between neighbors).
 /// v1 choice: simple unweighted average per node; volume weighting of
 /// contributions is a possible later refinement.
 pub(crate) fn nodal_von_mises(
@@ -37,15 +55,21 @@ pub(crate) fn nodal_von_mises(
     ndof: usize,
     elems: &[ElemInfo],
     n_nodes: usize,
+    thermal: Option<&[[f64; 6]]>,
 ) -> Vec<f64> {
     let mut sum = vec![[0.0f64; 6]; n_nodes];
     let mut count = vec![0u32; n_nodes];
-    for info in elems {
+    for (ei, info) in elems.iter().enumerate() {
         let ue = gather_ue(u, &info.node_idx, ndof);
-        for (i, s) in nodal_stresses(&info.b, &info.d, &ue)
+        for (i, mut s) in nodal_stresses(&info.b, &info.d, &ue)
             .into_iter()
             .enumerate()
         {
+            if let Some(th) = thermal {
+                for (a, b) in s.iter_mut().zip(&th[ei]) {
+                    *a -= b;
+                }
+            }
             let node = info.node_idx[i];
             for k in 0..6 {
                 sum[node][k] += s[k];

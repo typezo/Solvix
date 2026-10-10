@@ -1,5 +1,7 @@
 //! Abaqus `.inp` parser for the v0.1 keyword subset (issue #2), extended
-//! with multi-step, `*DLOAD` and `*DENSITY` (issue #26).
+//! with multi-step, `*DLOAD` and `*DENSITY` (issue #26), and the thermal
+//! keywords `*CONDUCTIVITY`, `*EXPANSION`, `*TEMPERATURE`, `*DFLUX`
+//! (issue #27).
 //!
 //! Line model: `**…` comments and blank lines are dropped up front; every
 //! remaining line is either a keyword line (`*NAME, KEY=VALUE, …`, parsed
@@ -11,13 +13,15 @@
 //! end of that step (OP=NEW/MOD resolved here; linear superposition).
 //! A single-step deck mirrors its BCs/loads into the legacy top-level
 //! Model fields so v0.1 consumers see exactly the old picture.
+//! Thermal BCs/fluxes (#27) accumulate the same way but live on steps
+//! only (no legacy top-level counterpart).
 
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 use solvix_core::{
-    BoundaryCondition, ConcentratedLoad, DistributedLoad, ElemKind, Element, ElementSet, Material,
-    Model, Node, Step,
+    BoundaryCondition, ConcentratedLoad, DistributedLoad, ElemKind, Element, ElementSet, HeatFlux,
+    Material, Model, Node, Step, TempBc,
 };
 
 use super::{ParseError, ParseReport};
@@ -41,6 +45,9 @@ struct StepAcc {
     cloads: Vec<ConcentratedLoad>,
     dloads: Vec<DistributedLoad>,
     gravity: Option<(f64, [f64; 3])>,
+    temp_bcs: Vec<TempBc>,
+    heat_fluxes: Vec<HeatFlux>,
+    heat_source: Option<f64>,
 }
 
 /// OP=NEW/MOD of a keyword line: `true` when OP=NEW, warning on anything
@@ -74,6 +81,8 @@ pub(super) fn parse_inp(text: &str) -> Result<(Model, ParseReport), ParseError> 
     let mut pending_material: Option<String> = None;
     let mut cur_material: Option<String> = None;
     let mut density_seen = false;
+    let mut conductivity_seen = false;
+    let mut expansion_seen = false;
     let mut model_data = StepAcc::default();
     let mut steps_done: Vec<StepAcc> = Vec::new();
     let mut cur: Option<StepAcc> = None;
@@ -93,7 +102,10 @@ pub(super) fn parse_inp(text: &str) -> Result<(Model, ParseReport), ParseError> 
         };
 
         if let Some(name) = &pending_material {
-            if kw.name != "elastic" && kw.name != "density" {
+            if !matches!(
+                kw.name.as_str(),
+                "elastic" | "density" | "conductivity" | "expansion"
+            ) {
                 report.warnings.push(format!(
                     "line {}: material '{name}' has no *ELASTIC block",
                     kw.line
@@ -326,6 +338,58 @@ pub(super) fn parse_inp(text: &str) -> Result<(Model, ParseReport), ParseError> 
                     } else {
                         report.warnings.push(format!(
                             "line {dno}: extra *DENSITY row ignored (temperature dependence is v0.2)"
+                        ));
+                    }
+                    rows += 1;
+                    j += 1;
+                }
+            }
+
+            "conductivity" | "expansion" => {
+                let is_k = kw.name == "conductivity";
+                let (kwd, what) = if is_k {
+                    ("*CONDUCTIVITY", "conductivity")
+                } else {
+                    ("*EXPANSION", "thermal expansion coefficient")
+                };
+                j += 1;
+                let mut rows = 0usize;
+                while let Some(Item::Data { line: dno, text }) = items.get(j) {
+                    let f = fields(text);
+                    if rows == 0 {
+                        if cur_material.is_none() {
+                            report
+                                .warnings
+                                .push(format!("line {dno}: {kwd} outside *MATERIAL — ignored"));
+                        } else if f.is_empty() {
+                            return err(*dno, format!("{kwd} expects a {what} value"));
+                        } else {
+                            let v = num(f[0], *dno, what)?;
+                            let (seen, slot) = if is_k {
+                                (conductivity_seen, &mut model.conductivity)
+                            } else {
+                                (expansion_seen, &mut model.thermal_expansion)
+                            };
+                            if seen && *slot != v {
+                                report.warnings.push(format!(
+                                    "line {dno}: {kwd} overwrites an earlier value (one value covers the whole model)"
+                                ));
+                            }
+                            *slot = v;
+                            if is_k {
+                                conductivity_seen = true;
+                            } else {
+                                expansion_seen = true;
+                            }
+                            if f.len() > 1 {
+                                report.warnings.push(format!(
+                                    "line {dno}: extra {kwd} fields ignored (temperature dependence is v0.2)"
+                                ));
+                            }
+                        }
+                    } else {
+                        report.warnings.push(format!(
+                            "line {dno}: extra {kwd} row ignored (temperature dependence is v0.2)"
                         ));
                     }
                     rows += 1;
@@ -689,6 +753,167 @@ pub(super) fn parse_inp(text: &str) -> Result<(Model, ParseReport), ParseError> 
                 }
             }
 
+            "temperature" => {
+                let Some(acc) = cur.as_mut() else {
+                    report.warnings.push(format!(
+                        "line {}: *TEMPERATURE outside *STEP — ignored (temperature BCs live in steps)",
+                        kw.line
+                    ));
+                    j += 1;
+                    while matches!(items.get(j), Some(Item::Data { .. })) {
+                        j += 1;
+                    }
+                    continue;
+                };
+                if op_is_new(kw, &mut report) {
+                    acc.temp_bcs.clear();
+                }
+                j += 1;
+                while let Some(Item::Data { line: dno, text }) = items.get(j) {
+                    let f = fields(text);
+                    if f.len() != 2 {
+                        return err(
+                            *dno,
+                            format!(
+                                "*TEMPERATURE expects node/set, temperature; got {} field(s)",
+                                f.len()
+                            ),
+                        );
+                    }
+                    let node_ids = resolve_nodes(&nsets, f[0], *dno)?;
+                    let temperature = num(f[1], *dno, "temperature")?;
+                    acc.temp_bcs.push(TempBc {
+                        node_ids,
+                        temperature,
+                    });
+                    j += 1;
+                }
+            }
+
+            "dflux" => {
+                let Some(acc) = cur.as_mut() else {
+                    report.warnings.push(format!(
+                        "line {}: *DFLUX outside *STEP — ignored (heat fluxes live in steps)",
+                        kw.line
+                    ));
+                    j += 1;
+                    while matches!(items.get(j), Some(Item::Data { .. })) {
+                        j += 1;
+                    }
+                    continue;
+                };
+                if op_is_new(kw, &mut report) {
+                    acc.heat_fluxes.clear();
+                    acc.heat_source = None;
+                }
+                j += 1;
+                while let Some(Item::Data { line: dno, text }) = items.get(j) {
+                    let f = fields(text);
+                    if f.len() != 3 {
+                        return err(
+                            *dno,
+                            format!(
+                                "*DFLUX expects element/elset, S1..S4|BN, magnitude; got {} field(s)",
+                                f.len()
+                            ),
+                        );
+                    }
+                    let label = f[1].to_uppercase();
+                    let magnitude: f64 = num(f[2], *dno, "flux magnitude")?;
+                    if label == "BN" {
+                        if acc.heat_source.is_some_and(|q| (q - magnitude).abs() > 0.0) {
+                            report.warnings.push(format!(
+                                "line {dno}: *DFLUX BN overwrites an earlier body flux (one value covers the whole model)"
+                            ));
+                        }
+                        acc.heat_source = Some(magnitude);
+                    } else {
+                        let face = match label
+                            .strip_prefix('S')
+                            .and_then(|n| n.parse::<usize>().ok())
+                        {
+                            Some(n) if (1..=4).contains(&n) => n,
+                            _ => {
+                                report.warnings.push(format!(
+                                    "line {dno}: *DFLUX type '{label}' unsupported (v0.4: S1|S2|S3|S4, BN) — line ignored"
+                                ));
+                                j += 1;
+                                continue;
+                            }
+                        };
+                        match resolve_elements(&model, f[0]) {
+                            Some(ids) => {
+                                for id in ids {
+                                    match model.mesh.elements.iter().find(|e| e.id == id) {
+                                        None => report.warnings.push(format!(
+                                            "line {dno}: *DFLUX on unknown element {id} — ignored"
+                                        )),
+                                        Some(e) => {
+                                            let faces = match e.kind {
+                                                ElemKind::Cps3 => 3,
+                                                ElemKind::Cps4
+                                                | ElemKind::Cpe4
+                                                | ElemKind::Cps8
+                                                | ElemKind::Cpe8 => 4,
+                                                _ => 0,
+                                            };
+                                            if faces == 0 {
+                                                report.warnings.push(format!(
+                                                    "line {dno}: heat flux on element {id} ({}) unsupported (plane edges only) — ignored",
+                                                    kind_name(e.kind)
+                                                ));
+                                            } else if face > faces {
+                                                report.warnings.push(format!(
+                                                    "line {dno}: element {id} ({}) has no face {face} — ignored",
+                                                    kind_name(e.kind)
+                                                ));
+                                            } else {
+                                                acc.heat_fluxes.push(HeatFlux {
+                                                    element_id: id,
+                                                    face,
+                                                    magnitude,
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            None => report.warnings.push(format!(
+                                "line {dno}: *DFLUX target '{}' is not a known element or ELSET — line ignored",
+                                f[0]
+                            )),
+                        }
+                    }
+                    j += 1;
+                }
+            }
+
+            "cflux" => {
+                report.warnings.push(format!(
+                    "line {}: *CFLUX unsupported (v0.4: *TEMPERATURE, *DFLUX S/BN only) — block skipped",
+                    kw.line
+                ));
+                j += 1;
+                while matches!(items.get(j), Some(Item::Data { .. })) {
+                    j += 1;
+                }
+            }
+
+            "heat transfer" => {
+                for key in kw.params.keys() {
+                    if key != "steady state" {
+                        report.warnings.push(format!(
+                            "line {}: *HEAT TRANSFER parameter '{key}' ignored (v0.4: STEADY STATE only)",
+                            kw.line
+                        ));
+                    }
+                }
+                j += 1;
+                while matches!(items.get(j), Some(Item::Data { .. })) {
+                    j += 1;
+                }
+            }
+
             "step" => {
                 if let Some(open) = cur.take() {
                     steps_done.push(open);
@@ -791,6 +1016,9 @@ pub(super) fn parse_inp(text: &str) -> Result<(Model, ParseReport), ParseError> 
                 cloads: a.cloads,
                 dloads: a.dloads,
                 gravity: a.gravity,
+                temp_bcs: a.temp_bcs,
+                heat_fluxes: a.heat_fluxes,
+                heat_source: a.heat_source,
             })
             .collect();
     }
@@ -1436,5 +1664,111 @@ TIP, 2, -50.0
         assert_eq!(m.steps[1].boundary_conditions.len(), 1);
         assert_eq!(m.steps[1].cloads.len(), 1);
         assert_eq!(m.steps[1].cloads[0].node_id, 9);
+    }
+
+    // ---- issue #27: thermal keywords ----
+
+    #[test]
+    fn thermal_keywords_round_trip() {
+        let deck = plate_deck(
+            concat!(
+                "*NSET, NSET=LEFT\n1, 4, 7\n",
+                "*CONDUCTIVITY\n12.5,\n",
+                "*EXPANSION\n2.3E-5,\n"
+            ),
+            concat!(
+                "*STEP, NAME=HEAT\n",
+                "*HEAT TRANSFER, STEADY STATE\n",
+                "*TEMPERATURE\nLEFT, 100.0\n",
+                "*DFLUX\nALL, S2, 5.0E3\nALL, BN, 2.0E3\n",
+                "*CFLUX\n9, 11, 1.0\n",
+                "*END STEP\n"
+            ),
+        );
+        let (m, r) = parse_inp(&deck).unwrap();
+        assert_eq!(m.conductivity, 12.5);
+        assert_eq!(m.thermal_expansion, 2.3e-5);
+        assert_eq!(m.steps.len(), 1);
+        let s = &m.steps[0];
+        assert_eq!(
+            s.temp_bcs,
+            vec![TempBc {
+                node_ids: vec![1, 4, 7],
+                temperature: 100.0
+            }]
+        );
+        assert_eq!(s.heat_fluxes.len(), 4); // ALL expands to the 4 quads
+        assert!(s.heat_fluxes.contains(&HeatFlux {
+            element_id: 4,
+            face: 2,
+            magnitude: 5.0e3
+        }));
+        assert_eq!(s.heat_source, Some(2.0e3));
+        // Only *CFLUX warns.
+        assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
+        assert!(r.warnings[0].contains("*CFLUX"));
+    }
+
+    #[test]
+    fn thermal_unsupported_types_and_errors_carry_line_numbers() {
+        // plate_deck: data starts at line 2; *STEP block at line 23.
+        let deck = plate_deck(
+            "",
+            concat!(
+                "*STEP\n*HEAT TRANSFER\n",
+                "*DFLUX\nALL, S7, 1.0\nALL, NU, 2.0\n",
+                "*TEMPERATURE\n5\n",
+                "*END STEP\n"
+            ),
+        );
+        let e = parse_inp(&deck).unwrap_err();
+        assert_eq!(e.line, 29);
+        assert!(e
+            .message
+            .contains("*TEMPERATURE expects node/set, temperature"));
+
+        let deck = plate_deck(
+            "",
+            concat!(
+                "*STEP\n*HEAT TRANSFER, TRANSIENT\n",
+                "*DFLUX\nALL, S7, 1.0\nALL, NU, 2.0\nALL, S2, 1.0\n",
+                "*TEMPERATURE\nBASE, 10.0\n",
+                "*END STEP\n"
+            ),
+        );
+        let (m, r) = parse_inp(&deck).unwrap();
+        assert_eq!(r.warnings.len(), 3, "{:?}", r.warnings);
+        assert!(r.warnings[0].contains("*HEAT TRANSFER parameter 'transient'"));
+        assert!(r.warnings[1].contains("S7"));
+        assert!(r.warnings[2].contains("NU"));
+        assert_eq!(m.steps[0].heat_fluxes.len(), 4); // S2 on the 4 quads
+        assert_eq!(m.steps[0].temp_bcs[0].node_ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn heat_transfer_deck_solves_to_linear_profile() {
+        // 4x1 CPS4 bar over [0,1]x[0,0.1]; T=100 at x=0, 0 at x=1:
+        // T(x) = 100(1-x) regardless of k (no sources).
+        let mut deck = String::from(
+            "*NODE\n1, 0.0, 0.0\n2, 0.25, 0.0\n3, 0.5, 0.0\n4, 0.75, 0.0\n5, 1.0, 0.0\n\
+             6, 0.0, 0.1\n7, 0.25, 0.1\n8, 0.5, 0.1\n9, 0.75, 0.1\n10, 1.0, 0.1\n\
+             *ELEMENT, TYPE=CPS4, ELSET=ALL\n\
+             1, 1, 2, 7, 6\n2, 2, 3, 8, 7\n3, 3, 4, 9, 8\n4, 4, 5, 10, 9\n\
+             *NSET, NSET=COLD\n1, 6\n*NSET, NSET=HOT\n5, 10\n\
+             *MATERIAL, NAME=STEEL\n*ELASTIC\n210.0E9, 0.3\n\
+             *SOLID SECTION, ELSET=ALL, MATERIAL=STEEL\n1.0\n",
+        );
+        deck.push_str(concat!(
+            "*STEP, NAME=HEAT\n*HEAT TRANSFER, STEADY STATE\n",
+            "*TEMPERATURE\nHOT, 100.0\nCOLD, 0.0\n*END STEP\n"
+        ));
+        let (m, r) = parse_inp(&deck).unwrap();
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let sol = solvix_core::solve_thermal(&m).unwrap();
+        for node in &m.mesh.nodes {
+            let exact = 100.0 * node.coords[0]; // HOT=100 at x=1, COLD=0 at x=0
+            let got = sol.temperatures[m.mesh.node_index(node.id).unwrap()];
+            assert!((got - exact).abs() < 1e-8, "node: {got} vs {exact}");
+        }
     }
 }

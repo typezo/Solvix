@@ -12,11 +12,14 @@
 //! and falls back to the RCM-ordered sparse LDLT in `ldl` when the
 //! iteration budget runs out; [`solve_with_method`] pins the method.
 //! [`solve_modal`] (backed by `modal`) extracts the smallest natural
-//! frequencies and mass-normalized mode shapes.
+//! frequencies and mass-normalized mode shapes. [`solve_thermal`] and
+//! [`solve_thermomech`] (backed by `heat`) run steady-state conduction
+//! and the sequential thermal-stress pass.
 
 mod assembly;
 pub mod buckle;
 mod element;
+mod heat;
 mod ldl;
 mod modal;
 mod solver;
@@ -141,6 +144,26 @@ pub struct DistributedLoad {
     pub magnitude: f64,
 }
 
+/// Prescribed temperature (`*TEMPERATURE`) on a list of nodes. Units are
+/// caller's choice (only differences enter the stress pass, against
+/// T_ref = 0).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TempBc {
+    pub node_ids: Vec<u32>,
+    pub temperature: f64,
+}
+
+/// Surface heat flux (`*DFLUX` S-face) on one element edge, in W/m^2.
+/// `face` uses the same 1-based Abaqus edge numbering as
+/// [`DistributedLoad`] (S1..S4 on quads, S1..S3 on CPS3). Positive
+/// magnitude is heat flux INTO the element.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HeatFlux {
+    pub element_id: u32,
+    pub face: usize,
+    pub magnitude: f64,
+}
+
 /// One analysis step: its boundary conditions and loads. Steps built by
 /// the `solvix-io` parser carry the ACCUMULATED state at the end of that
 /// step (linear static = superposition): OP=NEW/MOD semantics are
@@ -156,6 +179,15 @@ pub struct Step {
     /// unit mass is `magnitude * dir`; `dir` need not be normalized.
     /// Plane models use only the x/y components.
     pub gravity: Option<(f64, [f64; 3])>,
+    /// Prescribed temperatures (`*TEMPERATURE`), already expanded to
+    /// node lists. Thermal BCs live on steps only (no legacy top-level
+    /// counterpart).
+    pub temp_bcs: Vec<TempBc>,
+    /// Surface heat fluxes (`*DFLUX` S1..S4).
+    pub heat_fluxes: Vec<HeatFlux>,
+    /// Volumetric heat generation in W/m^3 (`*DFLUX` BN), one value for
+    /// the whole model.
+    pub heat_source: Option<f64>,
 }
 
 /// A complete, solvable model.
@@ -175,6 +207,13 @@ pub struct Model {
     /// [`solve_modal`]). Default 7850.0 (steel); one value covers the
     /// whole model (per-material density is v0.4).
     pub density: f64,
+    /// Isotropic thermal conductivity in W/(m·K) (`*CONDUCTIVITY`).
+    /// Default 45.0 (steel); one value covers the whole model
+    /// (per-material thermal constants are a later refinement).
+    pub conductivity: f64,
+    /// Coefficient of thermal expansion in 1/K (`*EXPANSION`). Default
+    /// 1.2e-5 (steel); one value covers the whole model.
+    pub thermal_expansion: f64,
     pub materials: Vec<Material>,
     pub elsets: Vec<ElementSet>,
     /// (elset name, material name) pairs from `*SOLID SECTION` and
@@ -189,13 +228,16 @@ pub struct Model {
 }
 
 impl Default for Model {
-    /// Non-zero defaults: `thickness` 1.0 and `density` 7850.0 (steel);
-    /// the remaining fields default as their own types do.
+    /// Non-zero defaults: `thickness` 1.0, `density` 7850.0,
+    /// `conductivity` 45.0 and `thermal_expansion` 1.2e-5 (steel); the
+    /// remaining fields default as their own types do.
     fn default() -> Self {
         Self {
             mesh: Mesh::default(),
             thickness: 1.0,
             density: 7850.0,
+            conductivity: 45.0,
+            thermal_expansion: 1.2e-5,
             materials: Vec::new(),
             elsets: Vec::new(),
             mat_assignments: Vec::new(),
@@ -214,6 +256,15 @@ pub(crate) struct LoadState<'a> {
     pub(crate) cloads: &'a [ConcentratedLoad],
     pub(crate) dloads: &'a [DistributedLoad],
     pub(crate) gravity: Option<(f64, [f64; 3])>,
+}
+
+/// Equivalent thermal loads for [`solve_thermomech`]: an extra RHS
+/// vector (already in the model's dof layout, added to the assembled
+/// mechanical loads before reactions are recovered) and per-element
+/// thermal stress vectors subtracted during stress recovery.
+pub(crate) struct ThermalLoads {
+    pub(crate) f: Vec<f64>,
+    pub(crate) sigma_th: Vec<[f64; 6]>,
 }
 
 impl Model {
@@ -356,6 +407,7 @@ pub enum Method {
     Ldlt,
 }
 
+pub use heat::{solve_thermal, solve_thermomech, ThermalSolution};
 pub use modal::{solve_modal, ModalOptions, ModalSolution};
 
 /// Solve the linear-static problem `K u = f` with homogeneous Dirichlet
@@ -374,6 +426,17 @@ pub fn solve(model: &Model) -> Result<Solution, SolveError> {
 /// models solve the accumulated state at the end of the LAST step
 /// (linear static superposition).
 pub fn solve_with_method(model: &Model, method: Method) -> Result<Solution, SolveError> {
+    solve_with_thermal(model, method, None)
+}
+
+/// The shared static-solve pipeline: [`solve_with_method`] passes no
+/// thermal loads; `heat::solve_thermomech` adds the equivalent thermal
+/// load vector and per-element thermal stress for recovery.
+pub(crate) fn solve_with_thermal(
+    model: &Model,
+    method: Method,
+    thermal: Option<ThermalLoads>,
+) -> Result<Solution, SolveError> {
     // Free-body check first: validate() reports NoBoundaryConditions as a
     // ModelError, but the contract wants SolveError::NoConstraints.
     let loads = model.load_state();
@@ -391,6 +454,11 @@ pub fn solve_with_method(model: &Model, method: Method) -> Result<Solution, Solv
 
     let ndof = ndof_per_node(model)?;
     let (mut k, mut f, elems) = assembly::assemble(model, ndof, &loads)?;
+    if let Some(th) = &thermal {
+        for (a, b) in f.iter_mut().zip(&th.f) {
+            *a += b;
+        }
+    }
     let constrained = solver::constrained_dofs(&model.mesh, loads.bcs, ndof)?;
 
     // Keep the unmodified system for reaction recovery.
@@ -470,8 +538,10 @@ pub fn solve_with_method(model: &Model, method: Method) -> Result<Solution, Solv
             [u[b], u[b + 1], if ndof == 3 { u[b + 2] } else { 0.0 }]
         })
         .collect();
-    let von_mises = stress::von_mises_at_centroids(&u, ndof, &elems);
-    let nodal_von_mises = stress::nodal_von_mises(&u, ndof, &elems, model.mesh.nodes.len());
+    let thermal_sigma = thermal.as_ref().map(|t| t.sigma_th.as_slice());
+    let von_mises = stress::von_mises_at_centroids(&u, ndof, &elems, thermal_sigma);
+    let nodal_von_mises =
+        stress::nodal_von_mises(&u, ndof, &elems, model.mesh.nodes.len(), thermal_sigma);
     let reactions = stress::reactions(&k_orig, &u, &f_orig, &constrained);
 
     Ok(Solution {
@@ -833,6 +903,7 @@ mod tests {
                     value: 5e5,
                 },
             ],
+            ..Model::default()
         };
         let sigma = 1e6;
         for method in BOTH_METHODS {

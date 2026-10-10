@@ -468,6 +468,7 @@ mod tests {
                     value: top_load,
                 })
                 .collect(),
+            ..Model::default()
         }
     }
 

@@ -584,6 +584,7 @@ pub(crate) mod tests {
                 dofs: vec![1, 2],
             }],
             cloads: vec![],
+            ..Model::default()
         }
     }
 

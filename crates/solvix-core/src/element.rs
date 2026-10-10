@@ -551,13 +551,12 @@ pub(crate) fn c3d8_stiffness(
     ))
 }
 
-/// C3D4 stiffness, constant-strain tetrahedron. Returns `None` for zero
-/// volume. Works for either node ordering: shape-function gradients are
-/// built from the signed 6V determinant, the integral uses |V|.
-pub(crate) fn c3d4_stiffness(
-    coords: &[[f64; 3]; 4],
-    d: &[[f64; 6]; 6],
-) -> Option<([[f64; 12]; 12], CentroidB)> {
+/// C3D4 shape-function gradients (constant per element): one 3-vector
+/// per node and the signed 6V determinant. `None` for zero volume.
+/// Works for either node ordering (signed determinant; consumers use
+/// the absolute volume). Shared by the C3D4 stiffness and the thermal
+/// conduction/expansion code.
+pub(crate) fn tet_gradients(coords: &[[f64; 3]; 4]) -> Option<([[f64; 3]; 4], f64)> {
     let sub = |i: usize| {
         [
             coords[i][0] - coords[3][0],
@@ -578,7 +577,6 @@ pub(crate) fn c3d4_stiffness(
     if det == 0.0 {
         return None;
     }
-    let inv = 1.0 / det;
     // grad L_i = (p_j x p_k) / det (cyclic), grad L_4 = -sum of the rest.
     let g1 = cross(p2, p3);
     let g2 = cross(p3, p1);
@@ -588,8 +586,20 @@ pub(crate) fn c3d4_stiffness(
         -(g1[1] + g2[1] + g3[1]),
         -(g1[2] + g2[2] + g3[2]),
     ];
+    Some(([g1, g2, g3, g4], det))
+}
+
+/// C3D4 stiffness, constant-strain tetrahedron. Returns `None` for zero
+/// volume. Works for either node ordering: shape-function gradients are
+/// built from the signed 6V determinant, the integral uses |V|.
+pub(crate) fn c3d4_stiffness(
+    coords: &[[f64; 3]; 4],
+    d: &[[f64; 6]; 6],
+) -> Option<([[f64; 12]; 12], CentroidB)> {
+    let (gs, det) = tet_gradients(coords)?;
+    let inv = 1.0 / det;
     let mut bm = [[0.0; 12]; 6];
-    for (i, gi) in [g1, g2, g3, g4].iter().enumerate() {
+    for (i, gi) in gs.iter().enumerate() {
         let c = 3 * i;
         bm[0][c] = gi[0] * inv;
         bm[1][c + 1] = gi[1] * inv;
