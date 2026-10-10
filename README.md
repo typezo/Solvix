@@ -36,6 +36,29 @@ Inspect a deck before spending time on a solve:
 $ ./target/release/solvix info examples/cantilever.inp --json
 ```
 
+## Screenshots
+
+The bundled web UI (`cargo run -p solvix-ui -- serve`) recreates the
+Abaqus/CAE working environment in a browser: a model database tree on the
+left, a canvas viewport in the center, and a JSON message console below.
+
+| Mesh view | Contour view | Deformed shape |
+|:---:|:---:|:---:|
+| ![Mesh view with the model tree populated](docs/screenshots/ui-mesh.png) | ![Von Mises contour with legend](docs/screenshots/ui-contour.png) | ![Deformed shape over the undeformed wireframe](docs/screenshots/ui-deformed.png) |
+
+- **Mesh view** — the `examples/cantilever.inp` deck loaded through the job
+  bar: the model tree (left, like the Abaqus CAE Model DB) lists nodes,
+  elements, sets, materials, BCs, and loads with live counts, while the
+  viewport shows the 40×4 CPS4 mesh with node numbers, element IDs, fixed-DOF
+  glyphs (orange squares), and the tip CLOAD arrow.
+- **Contour view** — after **Run** solves the job (`POST /api/run`), the
+  Results module shades elements by von Mises stress with a jet colormap
+  legend (MPa ticks) beside the viewport, like an Abaqus contour plot.
+- **Deformed shape** — the deformation slider exaggerates displacement (10%
+  of the bounding box here) and the dashed undeformed wireframe overlay shows
+  the original geometry, mirroring Abaqus's deformed-shape-vs-undeformed
+  overlay toggle.
+
 ## CLI contract for agents
 
 `--json` is the machine interface. JSON payloads go to stdout; progress and

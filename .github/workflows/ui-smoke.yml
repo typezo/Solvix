@@ -1,0 +1,38 @@
+name: UI smoke
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build -q -p solvix-ui
+      - name: Start solvix-ui server
+        run: |
+          ./target/debug/solvix-ui serve --port 8877 &
+          for i in $(seq 1 50); do
+            curl -sf -o /dev/null http://127.0.0.1:8877/ && break
+            sleep 0.2
+          done
+          curl -sf -o /dev/null http://127.0.0.1:8877/
+      - name: Assert index and assets
+        run: |
+          body=$(curl -sf http://127.0.0.1:8877/)
+          echo "$body" | grep -q 'id="viewport"'        # canvas element id
+          curl -sf -o /dev/null http://127.0.0.1:8877/static/app.js
+      - name: Assert model API
+        run: |
+          curl -sf 'http://127.0.0.1:8877/api/model?job=cantilever' | grep -q '"ok":true'
+      - name: Assert run API
+        run: |
+          curl -sf -X POST http://127.0.0.1:8877/api/run \
+            -H 'Content-Type: application/json' \
+            -d '{"path":"examples/cantilever.inp"}' | grep -q '"ok":true'
+      - name: Stop server
+        if: always()
+        run: pkill -f 'solvix-ui serve' || true

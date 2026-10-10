@@ -98,6 +98,12 @@ fn route(method: &str, raw_path: &str) -> Option<Route> {
             if let Some(rest) = path.strip_prefix("/static/") {
                 return safe_static_rel(rest).map(Route::Static);
             }
+            // Root-relative assets referenced by index.html (href="style.css").
+            if let Some(file) = path.strip_prefix('/') {
+                if matches!(file, "app.js" | "style.css" | "index.html" | "favicon.svg") {
+                    return Some(Route::Static(file.into()));
+                }
+            }
             if let Some(job) = path.strip_prefix("/api/results/") {
                 if valid_name(job) {
                     return Some(Route::Results(job.into()));
@@ -801,6 +807,14 @@ mod tests {
     #[test]
     fn router_dispatch_table() {
         assert_eq!(route("GET", "/"), Some(Route::Static("index.html".into())));
+        assert_eq!(
+            route("GET", "/style.css"),
+            Some(Route::Static("style.css".into()))
+        );
+        assert_eq!(
+            route("GET", "/app.js"),
+            Some(Route::Static("app.js".into()))
+        );
         assert_eq!(
             route("GET", "/static/mock/model.json"),
             Some(Route::Static("mock/model.json".into()))
