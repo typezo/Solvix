@@ -388,6 +388,9 @@ fn zero_solution(model: &Model) -> Solution {
 /// (or exhausts its budget) even after the allowed increment
 /// cutbacks.
 pub fn solve_nl(model: &Model, opts: &NlOptions) -> Result<Vec<NlFrame>, SolveError> {
+    if model.plasticity.is_some() {
+        return crate::plastic::solve_nl(model, opts);
+    }
     let loads = model.load_state();
     if loads.bcs.is_empty() {
         return Err(SolveError::NoConstraints);

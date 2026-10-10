@@ -1,8 +1,9 @@
 //! Abaqus `.inp` parser for the v0.1 keyword subset (issue #2), extended
 //! with multi-step, `*DLOAD` and `*DENSITY` (issue #26), the thermal
 //! keywords `*CONDUCTIVITY`, `*EXPANSION`, `*TEMPERATURE`, `*DFLUX`
-//! (issue #27), transient dynamics `*DYNAMIC` + `*DAMPING` (#28), and
-//! `*STEP, NLGEOM=YES` geometric nonlinearity (#29).
+//! (issue #27), transient dynamics `*DYNAMIC` + `*DAMPING` (#28),
+//! `*STEP, NLGEOM=YES` geometric nonlinearity (#29), and `*PLASTIC`
+//! J2 linear hardening (#30).
 //!
 //! Line model: `**…` comments and blank lines are dropped up front; every
 //! remaining line is either a keyword line (`*NAME, KEY=VALUE, …`, parsed
@@ -27,7 +28,7 @@ use std::str::FromStr;
 
 use solvix_core::{
     BoundaryCondition, ConcentratedLoad, DistributedLoad, DynamicsSpec, ElemKind, Element,
-    ElementSet, HeatFlux, Material, Model, Node, Step, TempBc,
+    ElementSet, HeatFlux, Material, Model, Node, PlasticitySpec, Step, TempBc,
 };
 
 use super::{ParseError, ParseReport};
@@ -121,7 +122,7 @@ pub(super) fn parse_inp(text: &str) -> Result<(Model, ParseReport), ParseError> 
         if let Some(name) = &pending_material {
             if !matches!(
                 kw.name.as_str(),
-                "elastic" | "density" | "conductivity" | "expansion" | "damping"
+                "elastic" | "density" | "conductivity" | "expansion" | "damping" | "plastic"
             ) {
                 report.warnings.push(format!(
                     "line {}: material '{name}' has no *ELASTIC block",
@@ -359,6 +360,81 @@ pub(super) fn parse_inp(text: &str) -> Result<(Model, ParseReport), ParseError> 
                     }
                     rows += 1;
                     j += 1;
+                }
+            }
+
+            "plastic" => {
+                j += 1;
+                let Some(Item::Data { .. }) = items.get(j) else {
+                    return err(
+                        kw.line,
+                        "*PLASTIC expects data rows 'sigma, eps_pl'".to_string(),
+                    );
+                };
+                let mut rows: Vec<(f64, f64)> = Vec::new();
+                while let Some(Item::Data { line: dno, text }) = items.get(j) {
+                    let f = fields(text);
+                    if f.len() < 2 {
+                        return err(
+                            *dno,
+                            format!("*PLASTIC expects sigma, eps_pl; got {} field(s)", f.len()),
+                        );
+                    }
+                    let sigma: f64 = num(f[0], *dno, "plastic yield stress")?;
+                    let eps_pl: f64 = num(f[1], *dno, "equivalent plastic strain")?;
+                    if !sigma.is_finite() || sigma <= 0.0 || !eps_pl.is_finite() || eps_pl < 0.0 {
+                        return err(
+                            *dno,
+                            "*PLASTIC needs positive finite sigma and non-negative finite eps_pl"
+                                .to_string(),
+                        );
+                    }
+                    if let Some(last) = rows.last() {
+                        if eps_pl < last.1 {
+                            return err(
+                                *dno,
+                                "*PLASTIC eps_pl rows must be non-decreasing".to_string(),
+                            );
+                        }
+                    }
+                    rows.push((sigma, eps_pl));
+                    if f.len() > 2 {
+                        report.warnings.push(format!(
+                            "line {dno}: extra *PLASTIC fields ignored (temperature dependence is not supported)"
+                        ));
+                    }
+                    j += 1;
+                }
+                if cur_material.is_none() {
+                    report.warnings.push(format!(
+                        "line {}: *PLASTIC outside *MATERIAL — ignored",
+                        kw.line
+                    ));
+                } else {
+                    if model.plasticity.is_some() {
+                        report.warnings.push(format!(
+                            "line {}: multiple *PLASTIC blocks overwrite one model-wide law (per-material plasticity is a later refinement)",
+                            kw.line
+                        ));
+                    }
+                    let first = rows[0];
+                    let last = rows[rows.len() - 1];
+                    let hardening = if rows.len() == 1 {
+                        0.0
+                    } else {
+                        if last.1 == first.1 {
+                            return err(
+                                kw.line,
+                                "*PLASTIC needs distinct first/last eps_pl values for hardening"
+                                    .to_string(),
+                            );
+                        }
+                        (last.0 - first.0) / (last.1 - first.1)
+                    };
+                    model.plasticity = Some(PlasticitySpec {
+                        yield_stress: first.0,
+                        hardening_modulus: hardening,
+                    });
                 }
             }
 
@@ -1727,6 +1803,28 @@ TIP, 2, -50.0
         assert_eq!(m.density, 2500.0);
         assert_eq!(m.materials.len(), 1);
         assert_eq!(m.materials[0].youngs_modulus, 210.0e9);
+    }
+
+    #[test]
+    fn plastic_multi_row_table_reduces_to_linear_hardening() {
+        let deck = plate_deck(
+            concat!(
+                "*PLASTIC\n",
+                "250.0E6, 0.0\n",
+                "280.0E6, 0.001\n",
+                "310.0E6, 0.002\n"
+            ),
+            "*STEP\n*STATIC\n*BOUNDARY\nBASE, 1, 2\n*END STEP\n",
+        );
+        let (m, report) = parse_inp(&deck).unwrap();
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        assert_eq!(
+            m.plasticity,
+            Some(solvix_core::PlasticitySpec {
+                yield_stress: 250.0e6,
+                hardening_modulus: 30.0e9,
+            })
+        );
     }
 
     fn single_step_deck(p: f64) -> String {

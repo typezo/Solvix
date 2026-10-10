@@ -29,6 +29,7 @@ mod heat;
 mod ldl;
 mod modal;
 mod nl;
+mod plastic;
 mod solver;
 mod stress;
 
@@ -185,6 +186,18 @@ pub struct DynamicsSpec {
     pub rayleigh_beta: f64,
 }
 
+/// Linear-hardening J2 plasticity parameters reduced from an Abaqus
+/// `*PLASTIC` table. `yield_stress` is the first-row von Mises yield
+/// stress and `hardening_modulus` is the slope between the first and last
+/// `(sigma_y, equivalent_plastic_strain)` rows.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlasticitySpec {
+    /// Initial von Mises yield stress in Pa.
+    pub yield_stress: f64,
+    /// Isotropic hardening modulus `d sigma_y / d eps_pl` in Pa.
+    pub hardening_modulus: f64,
+}
+
 /// One analysis step: its boundary conditions and loads. Steps built by
 /// the `solvix-io` parser carry the ACCUMULATED state at the end of that
 /// step (linear static = superposition): OP=NEW/MOD semantics are
@@ -245,6 +258,9 @@ pub struct Model {
     /// Coefficient of thermal expansion in 1/K (`*EXPANSION`). Default
     /// 1.2e-5 (steel); one value covers the whole model.
     pub thermal_expansion: f64,
+    /// Model-wide J2 plasticity (`*PLASTIC`). v0.5 supports one active
+    /// plastic law; per-material plasticity is a later refinement.
+    pub plasticity: Option<PlasticitySpec>,
     pub materials: Vec<Material>,
     pub elsets: Vec<ElementSet>,
     /// (elset name, material name) pairs from `*SOLID SECTION` and
@@ -269,6 +285,7 @@ impl Default for Model {
             density: 7850.0,
             conductivity: 45.0,
             thermal_expansion: 1.2e-5,
+            plasticity: None,
             materials: Vec::new(),
             elsets: Vec::new(),
             mat_assignments: Vec::new(),
@@ -370,6 +387,15 @@ impl Model {
                 }
             }
         }
+        if let Some(p) = &self.plasticity {
+            if !p.yield_stress.is_finite()
+                || p.yield_stress <= 0.0
+                || !p.hardening_modulus.is_finite()
+                || p.hardening_modulus < 0.0
+            {
+                return Err(ModelError::InvalidPlasticity);
+            }
+        }
         Ok(())
     }
 }
@@ -381,6 +407,7 @@ pub enum ModelError {
     NoBoundaryConditions,
     MalformedElement(u32),
     UnknownNode(u32),
+    InvalidPlasticity,
 }
 
 /// Reaction force at a constrained dof (Newtons).
@@ -454,9 +481,19 @@ pub use nl::{solve_nl, NlFrame, NlOptions};
 /// routes through [`solve_nl`] instead and returns the final frame's
 /// solution (total displacements under the full load). Models without
 /// steps, or whose last step is linear, take the linear path below.
+/// A model with [`Model::plasticity`] takes the small-strain J2 branch of
+/// that NL path first; NLGEOM is intentionally ignored for that material
+/// solve.
 ///
 /// Relative tolerance 1e-10, `max_iter = max(1000, 10 * ndof)`.
 pub fn solve(model: &Model) -> Result<Solution, SolveError> {
+    if model.plasticity.is_some() {
+        let frames = nl::solve_nl(model, &NlOptions::default())?;
+        return Ok(frames
+            .last()
+            .map(|f| f.solution.clone())
+            .unwrap_or_default());
+    }
     if model.steps.last().is_some_and(|s| s.nlgeom) {
         let frames = nl::solve_nl(model, &NlOptions::default())?;
         return Ok(frames
