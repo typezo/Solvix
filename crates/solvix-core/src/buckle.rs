@@ -136,10 +136,9 @@ fn assemble_ksigma(
                 e.id
             )));
         };
-        let n_per = e.kind.node_count();
-        for i in 0..n_per {
-            for j in 0..n_per {
-                let v = ks[i][j];
+        for (i, ksi) in ks.iter().enumerate() {
+            for (j, &ksv) in ksi.iter().enumerate() {
+                let v = ksv;
                 if v == 0.0 {
                     continue;
                 }
