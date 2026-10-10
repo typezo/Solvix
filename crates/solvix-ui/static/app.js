@@ -106,7 +106,7 @@
     "viewport-mode-label",
     "fit-button", "wireframe-button", "contour-u-button",
     "contour-vm-button", "undeformed-overlay-button", "deform-slider",
-    "deform-output", "result-chips", "console-output", "console-form",
+    "deform-output", "result-chips", "mode-list", "console-output", "console-form",
     "command-input", "command-hint", "status-job", "status-mesh",
     "status-cursor", "status-zoom", "status-message",
   ];
@@ -132,6 +132,7 @@
     resultsSource: "not loaded",
     resultsError: null,
     runResponse: null,
+    activeMode: null,
     jobs: ["cantilever3d", "cantilever"],
     is3D: false,
     modelBounds: null,
@@ -358,12 +359,36 @@
     const vonMises = (Array.isArray(raw.von_mises) ? raw.von_mises : [])
       .map((item) => number(item));
 
+    const frequenciesHz = (Array.isArray(raw.frequencies_hz) ? raw.frequencies_hz : [])
+      .map((item) => number(item));
+
+    const modes = (Array.isArray(raw.modes) ? raw.modes : [])
+      .map((mode) => (Array.isArray(mode) ? mode : [])
+        .map((item) => [number(item[0]), number(item[1]), number(item[2])]));
+
     return {
       job: String(raw.job || (model ? model.job : state.job)),
       displacements,
       vonMises,
+      frequenciesHz,
+      modes,
       raw,
     };
+  }
+
+  /* Pure mode-list helpers (issue #40; exposed for browser-less tests). */
+
+  function modeLabel(index, hz) {
+    return `mode ${index + 1}, ${fmt(hz, 3)} Hz`;
+  }
+
+  function buildModeList(frequenciesHz, vectorCount) {
+    const vectors = Math.max(0, Number(vectorCount) || 0);
+    return frequenciesHz.map((hz, index) => ({
+      index,
+      label: modeLabel(index, hz),
+      enabled: index < vectors,
+    }));
   }
 
   function boundsOf(nodes) {
@@ -396,11 +421,23 @@
     };
   }
 
+  /// Displacement array currently driving the viewport: the selected mode
+  /// shape (issue #40, already scaled to max |component| = 1 by the API) or
+  /// the static result.
+  function activeDisplacements() {
+    if (!state.results) return [];
+    if (state.activeMode !== null) {
+      const mode = state.results.modes[state.activeMode];
+      if (mode) return mode;
+    }
+    return state.results.displacements;
+  }
+
   function displayNodes() {
     if (!state.model) return new Map();
     const output = new Map();
     const factor = deformationFactor();
-    const displacement = state.results ? state.results.displacements : [];
+    const displacement = activeDisplacements();
     let index = 0;
     for (const node of state.model.nodes.values()) {
       const d = displacement[index] || [0, 0, 0];
@@ -417,7 +454,7 @@
 
   function maxDisplacementMagnitude() {
     if (!state.results) return 0;
-    return state.results.displacements.reduce((maximum, item) => {
+    return activeDisplacements().reduce((maximum, item) => {
       return Math.max(maximum, Math.hypot(item[0], item[1], item[2] || 0));
     }, 0);
   }
@@ -796,6 +833,7 @@
     state.model = normalizeModel(raw);
     state.modelSource = source;
     state.modelError = null;
+    state.activeMode = null;
     state.job = state.model.job;
     state.is3D = is3DModel(state.model.nodes, state.model.elements);
     state.modelBounds = boundsOf(state.model.nodes);
@@ -818,6 +856,7 @@
     state.results = normalizeResults(raw, state.model);
     state.resultsSource = source;
     state.resultsError = null;
+    state.activeMode = null;
     if (!state.jobs.includes(state.results.job)) {
       state.jobs.push(state.results.job);
     }
@@ -884,7 +923,45 @@
     renderSetList();
     renderSimpleLists();
     renderResultChips();
+    renderModeList();
     updateToolbarStates();
+  }
+
+  function renderModeList() {
+    const host = dom["mode-list"];
+    if (!state.results || !state.results.frequenciesHz.length) {
+      host.replaceChildren();
+      host.hidden = true;
+      return;
+    }
+    const items = buildModeList(state.results.frequenciesHz, state.results.modes.length);
+    const buttons = items.map((item) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = item.label;
+      button.disabled = !item.enabled;
+      button.classList.toggle("is-active", state.activeMode === item.index);
+      button.addEventListener("click", () => {
+        state.activeMode = state.activeMode === item.index ? null : item.index;
+        if (state.activeMode !== null && state.module !== "results") setModule("results", false);
+        fitView();
+        updateInterface();
+        render();
+      });
+      return button;
+    });
+    const reset = document.createElement("button");
+    reset.type = "button";
+    reset.textContent = "static";
+    reset.classList.toggle("is-active", state.activeMode === null);
+    reset.addEventListener("click", () => {
+      state.activeMode = null;
+      fitView();
+      updateInterface();
+      render();
+    });
+    host.replaceChildren(...buttons, reset);
+    host.hidden = false;
   }
 
   function renderSetList() {
@@ -1050,6 +1127,10 @@
     const contour = state.display.contourMode === "vm"
       ? "von Mises"
       : state.display.contourMode === "u" ? "|U|" : "no contour";
+    if (state.activeMode !== null && state.results.frequenciesHz.length) {
+      const mode = `${modeLabel(state.activeMode, state.results.frequenciesHz[state.activeMode])}`;
+      return `${projection}${mode} · ${contour}`;
+    }
     return `${projection}Deformed · ${contour}`;
   }
 
@@ -1160,6 +1241,10 @@
           display: Object.assign({}, state.display, {
             selectedSets: Object.fromEntries(state.selectedSets),
           }),
+          activeMode: state.activeMode,
+          modeLabel: state.activeMode !== null && state.results && state.results.frequenciesHz.length
+            ? modeLabel(state.activeMode, state.results.frequenciesHz[state.activeMode])
+            : null,
           renderer: state.is3D ? "3d-orthographic" : "2d",
           camera: Object.assign({}, state.camera),
           camera3D: Object.assign({}, state.camera3D),
@@ -1402,7 +1487,7 @@
       if (!values.length) return null;
       return { min: Math.min(...values), max: Math.max(...values), mode: "vm" };
     }
-    const values = state.results.displacements.map((item) => Math.hypot(item[0], item[1], item[2] || 0));
+    const values = activeDisplacements().map((item) => Math.hypot(item[0], item[1], item[2] || 0));
     if (!values.length) return null;
     return { min: Math.min(...values), max: Math.max(...values), mode: "u" };
   }
@@ -1556,7 +1641,7 @@
   function draw3DNodalContour(projected) {
     const domain = contourDomain();
     if (!domain || domain.mode !== "u" || !state.results) return;
-    const values = state.results.displacements.map((item) => Math.hypot(item[0], item[1], item[2] || 0));
+    const values = activeDisplacements().map((item) => Math.hypot(item[0], item[1], item[2] || 0));
     let index = 0;
     for (const point of Array.from(projected.values()).sort((a, b) => a.depth - b.depth)) {
       const value = values[index] || 0;
@@ -1634,7 +1719,7 @@
     if (!state.model) return;
     const domain = contourDomain();
     const displacementValues = state.results
-      ? state.results.displacements.map((item) => Math.hypot(item[0], item[1], item[2] || 0))
+      ? activeDisplacements().map((item) => Math.hypot(item[0], item[1], item[2] || 0))
       : [];
 
     ctx.lineJoin = "round";
@@ -2355,6 +2440,8 @@
       matrixMultiply,
       matrixTranspose,
       matrixVectorMultiply,
+      buildModeList,
+      modeLabel,
       painterSortEdges,
       panOrthographic,
       projectOrthographic,

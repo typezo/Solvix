@@ -1,5 +1,8 @@
-//! Element stiffness: CPS3/CPS4 plane stress (2 dofs/node) and
-//! C3D8/C3D4 linear solids (3 dofs/node), plus stress recovery helpers.
+//! Element stiffness: CPS3/CPS4/CPS8 plane stress, CPE4/CPE8 plane
+//! strain (2 dofs/node), C3D8/C3D4 linear solids and B31 Hermite
+//! beams (3 dofs/node), plus stress recovery helpers.
+
+use std::sync::OnceLock;
 
 use crate::SolveError;
 
@@ -10,6 +13,18 @@ pub(crate) fn d_matrix(e: f64, nu: f64) -> [[f64; 3]; 3] {
         [c, nu * c, 0.0],
         [nu * c, c, 0.0],
         [0.0, 0.0, c * (1.0 - nu) / 2.0],
+    ]
+}
+
+/// 3x3 plane-strain constitutive matrix (in-plane block; eps_zz = 0).
+/// Caller checks nu < 0.5. Entry [0][1] equals lambda, which the stress
+/// recovery uses for the non-zero sigma_zz = lambda*(eps_xx + eps_yy).
+pub(crate) fn dpe_matrix(e: f64, nu: f64) -> [[f64; 3]; 3] {
+    let c = e / ((1.0 + nu) * (1.0 - 2.0 * nu));
+    [
+        [c * (1.0 - nu), c * nu, 0.0],
+        [c * nu, c * (1.0 - nu), 0.0],
+        [0.0, 0.0, c * (1.0 - 2.0 * nu) / 2.0],
     ]
 }
 
@@ -32,20 +47,35 @@ pub(crate) fn d3_matrix(e: f64, nu: f64) -> [[f64; 6]; 6] {
 }
 
 /// Constitutive law stored per element, dispatched by element kind:
-/// plane elements get the plane-stress 3x3, solids the 3D 6x6.
+/// plane elements get the plane-stress/plane-strain 3x3, solids the 3D
+/// 6x6, beams carry their section constants (E from the material, A and
+/// I from `*BEAM SECTION`).
 pub(crate) enum Constitutive {
     Plane([[f64; 3]; 3]),
+    PlaneStrain([[f64; 3]; 3]),
     Solid(Box<[[f64; 6]; 6]>),
+    Beam { e: f64, a: f64, i: f64 },
 }
 
 /// Strain-displacement matrices kept per element for stress recovery:
 /// the centroid matrix, plus the Gauss-point matrices for quads and hexes
-/// (ordering matches the stiffness loops; see GP_SIGNS / GP3_SIGNS).
+/// (ordering matches the stiffness loops; see GP_SIGNS / GP9_SIGNS).
 pub(crate) enum CentroidB {
     Tri([[f64; 6]; 3]),
     Quad {
         center: [[f64; 8]; 3],
         gauss: Box<[[[f64; 8]; 3]; 4]>,
+    },
+    Quad8 {
+        center: [[f64; 16]; 3],
+        gauss: Box<[[[f64; 16]; 3]; 9]>,
+    },
+    /// B31: (axial-strain row, curvature row) in GLOBAL dofs, at
+    /// mid-span (centroid stress) and at both end nodes (nodal
+    /// recovery — Hermite strain varies along the axis, unlike quads).
+    Beam {
+        center: Box<([f64; 6], [f64; 6])>,
+        ends: [([f64; 6], [f64; 6]); 2],
     },
     Tet(Box<[[f64; 12]; 6]>),
     Hex {
@@ -169,6 +199,220 @@ pub(crate) fn cps4_stiffness(
             gauss: Box::new(gauss),
         },
     ))
+}
+
+/// CPS8 node natural coordinates, Abaqus serendipity ordering: corners
+/// 1-4 CCW, then midsides 5(1-2), 6(2-3), 7(3-4), 8(4-1).
+const QUAD8_NODES: [(f64, f64); 8] = [
+    (-1.0, -1.0),
+    (1.0, -1.0),
+    (1.0, 1.0),
+    (-1.0, 1.0),
+    (0.0, -1.0),
+    (1.0, 0.0),
+    (0.0, 1.0),
+    (-1.0, 0.0),
+];
+
+/// 8-node serendipity shape functions at (xi, eta), order matching
+/// [`QUAD8_NODES`]. Span: {1, xi, eta, xi^2, xi*eta, eta^2, xi^2*eta,
+/// xi*eta^2}.
+pub(crate) fn quad8_shapes(xi: f64, eta: f64) -> [f64; 8] {
+    let mut n = [0.0; 8];
+    for i in 0..4 {
+        let (xi_i, eta_i) = QUAD8_NODES[i];
+        n[i] = 0.25 * (1.0 + xi * xi_i) * (1.0 + eta * eta_i) * (xi * xi_i + eta * eta_i - 1.0);
+    }
+    n[4] = 0.5 * (1.0 - xi * xi) * (1.0 - eta);
+    n[5] = 0.5 * (1.0 + xi) * (1.0 - eta * eta);
+    n[6] = 0.5 * (1.0 - xi * xi) * (1.0 + eta);
+    n[7] = 0.5 * (1.0 - xi) * (1.0 - eta * eta);
+    n
+}
+
+/// Shape function derivatives at (xi, eta): (dN/dxi, dN/deta), each
+/// aligned with [`QUAD8_NODES`].
+fn quad8_shape_derivs(xi: f64, eta: f64) -> ([f64; 8], [f64; 8]) {
+    let mut dn_dxi = [0.0; 8];
+    let mut dn_deta = [0.0; 8];
+    for i in 0..4 {
+        let (xi_i, eta_i) = QUAD8_NODES[i];
+        dn_dxi[i] = 0.25 * xi_i * (1.0 + eta * eta_i) * (2.0 * xi * xi_i + eta * eta_i);
+        dn_deta[i] = 0.25 * eta_i * (1.0 + xi * xi_i) * (xi * xi_i + 2.0 * eta * eta_i);
+    }
+    dn_dxi[4] = -xi * (1.0 - eta);
+    dn_deta[4] = -0.5 * (1.0 - xi * xi);
+    dn_dxi[5] = 0.5 * (1.0 - eta * eta);
+    dn_deta[5] = -eta * (1.0 + xi);
+    dn_dxi[6] = -xi * (1.0 + eta);
+    dn_deta[6] = 0.5 * (1.0 - xi * xi);
+    dn_dxi[7] = -0.5 * (1.0 - eta * eta);
+    dn_deta[7] = -eta * (1.0 - xi);
+    (dn_dxi, dn_deta)
+}
+
+/// B matrix (3x16) at a natural point, or `None` if det(J) is not
+/// positive there. Also the det(J) source for the CPS8 consistent mass.
+pub(crate) fn quad8_b(coords: &[[f64; 2]; 8], xi: f64, eta: f64) -> Option<([[f64; 16]; 3], f64)> {
+    let (dn_dxi, dn_deta) = quad8_shape_derivs(xi, eta);
+    let mut j = [[0.0; 2]; 2];
+    for i in 0..8 {
+        j[0][0] += dn_dxi[i] * coords[i][0];
+        j[0][1] += dn_dxi[i] * coords[i][1];
+        j[1][0] += dn_deta[i] * coords[i][0];
+        j[1][1] += dn_deta[i] * coords[i][1];
+    }
+    let detj = j[0][0] * j[1][1] - j[0][1] * j[1][0];
+    if detj <= 0.0 {
+        return None;
+    }
+    let inv = 1.0 / detj;
+    let mut bm = [[0.0; 16]; 3];
+    for i in 0..8 {
+        let dnx = inv * (j[1][1] * dn_dxi[i] - j[0][1] * dn_deta[i]);
+        let dny = inv * (j[0][0] * dn_deta[i] - j[1][0] * dn_dxi[i]);
+        bm[0][2 * i] = dnx;
+        bm[1][2 * i + 1] = dny;
+        bm[2][2 * i] = dny;
+        bm[2][2 * i + 1] = dnx;
+    }
+    Some((bm, detj))
+}
+
+/// 3x3 Gauss abscissae in stiffness-loop order (xi-major, then eta),
+/// matching the `gauss` slot ordering of [`CentroidB::Quad8`].
+const GP9_SIGNS: [(f64, f64); 9] = [
+    (-1.0, -1.0),
+    (-1.0, 0.0),
+    (-1.0, 1.0),
+    (0.0, -1.0),
+    (0.0, 0.0),
+    (0.0, 1.0),
+    (1.0, -1.0),
+    (1.0, 0.0),
+    (1.0, 1.0),
+];
+
+pub(crate) const G3: f64 = 0.7745_9666_9241_4834; // sqrt(3/5)
+pub(crate) const W3: [f64; 3] = [5.0 / 9.0, 8.0 / 9.0, 5.0 / 9.0];
+
+/// CPS8/CPE8 stiffness with 3x3 Gauss (shared by both plane families —
+/// the geometry is identical, only D differs). Returns `None` if
+/// det(J) <= 0 at any Gauss point (distorted/inverted element).
+pub(crate) fn cps8_stiffness(
+    coords: &[[f64; 2]; 8],
+    d: &[[f64; 3]; 3],
+    t: f64,
+) -> Option<([[f64; 16]; 16], CentroidB)> {
+    let mut ke = [[0.0; 16]; 16];
+    let mut gauss = [[[0.0; 16]; 3]; 9];
+    let mut k = 0;
+    for (i, &xi) in [-G3, 0.0, G3].iter().enumerate() {
+        for (j, &eta) in [-G3, 0.0, G3].iter().enumerate() {
+            let (bm, detj) = quad8_b(coords, xi, eta)?;
+            btdb(&mut ke, &bm, d, t * detj * W3[i] * W3[j]);
+            gauss[k] = bm;
+            k += 1;
+        }
+    }
+    let (center, _) = quad8_b(coords, 0.0, 0.0)?; // centroid is interior if GPs are
+    Some((
+        ke,
+        CentroidB::Quad8 {
+            center,
+            gauss: Box::new(gauss),
+        },
+    ))
+}
+
+/// In-place Gaussian elimination with partial pivoting: solve
+/// `a * x = b` for square `a` (N x N) and row-major RHS `b` (N rows of
+/// M columns), std only. Used once per process for the CPS8
+/// extrapolation matrix.
+fn gauss_solve<const N: usize, const M: usize>(a: &mut [[f64; N]; N], b: &mut [[f64; M]; N]) {
+    for col in 0..N {
+        let piv = (col..N)
+            .max_by(|&r, &s| a[r][col].abs().total_cmp(&a[s][col].abs()))
+            .unwrap_or(col);
+        if piv != col {
+            a.swap(col, piv);
+            b.swap(col, piv);
+        }
+        let d = a[col][col];
+        let piv_row = b[col];
+        for r in col + 1..N {
+            let f = a[r][col] / d;
+            if f == 0.0 {
+                continue;
+            }
+            let piv_a = a[col];
+            for (c, av) in a[r].iter_mut().enumerate().take(N).skip(col) {
+                *av -= f * piv_a[c];
+            }
+            for (br, bcol) in b[r].iter_mut().zip(&piv_row) {
+                *br -= f * bcol;
+            }
+        }
+    }
+    // Back-substitution.
+    for r in (0..N).rev() {
+        for c in r + 1..N {
+            let f = a[r][c];
+            let row = b[c];
+            for (br, bcol) in b[r].iter_mut().zip(&row) {
+                *br -= f * bcol;
+            }
+        }
+        let d = a[r][r];
+        for br in b[r].iter_mut() {
+            *br /= d;
+        }
+    }
+}
+
+/// Extrapolation matrix W (8x9) mapping the 9 Gauss-point stress values
+/// to the 8 nodes, computed once: the 8 serendipity shape functions are
+/// least-squares fitted to the 9 GP values (normal equations
+/// (A^T A) W = A^T with A[k][j] = N_j(GP_k), both fixed in natural
+/// coordinates). Because the serendipity span contains all quadratics,
+/// the fit is exact for stress fields the element represents exactly —
+/// the patch-test guarantee. Nodal values equal the fitted coefficients
+/// (shape functions are cardinal at the nodes).
+fn cps8_extrapolation() -> &'static [[f64; 9]; 8] {
+    static W: OnceLock<[[f64; 9]; 8]> = OnceLock::new();
+    W.get_or_init(|| {
+        let mut a = [[0.0f64; 8]; 9]; // A[k][j] = N_j(GP_k)
+        for (k, &(sx, sy)) in GP9_SIGNS.iter().enumerate() {
+            a[k] = quad8_shapes(sx * G3, sy * G3); // sign 0 lands on 0
+        }
+        let mut ata = [[0.0f64; 8]; 8];
+        let mut at = [[0.0f64; 9]; 8]; // A^T, RHS of the normal equations
+        for r in 0..8 {
+            for c in 0..8 {
+                ata[r][c] = (0..9).map(|k| a[k][r] * a[k][c]).sum();
+            }
+            for k in 0..9 {
+                at[r][k] = a[k][r];
+            }
+        }
+        gauss_solve(&mut ata, &mut at);
+        at
+    })
+}
+
+/// Extrapolate 3x3 Gauss-point values to the 8 nodes (see
+/// [`cps8_extrapolation`]).
+fn extrapolate_to_nodes8<const M: usize>(gp: &[[f64; M]; 9]) -> [[f64; M]; 8] {
+    let w = cps8_extrapolation();
+    let mut out = [[0.0; M]; 8];
+    for i in 0..8 {
+        for (j, wv) in w[i].iter().enumerate() {
+            for (k, o) in out[i].iter_mut().enumerate() {
+                *o += wv * gp[j][k];
+            }
+        }
+    }
+    out
 }
 
 /// C3D8 corner signs in natural coordinates, Abaqus ordering: nodes 1-4
@@ -362,6 +606,168 @@ pub(crate) fn c3d4_stiffness(
     Some((ke, CentroidB::Tet(Box::new(bm))))
 }
 
+/// Rotate a 6x6 element matrix from local to global dofs:
+/// `K_g = T^T K_l T`, T block-diagonal with per-node
+/// [[c, s, 0], [-s, c, 0], [0, 0, 1]] (all 2x2 node-block pairs,
+/// including the coupling blocks).
+fn rotate_beam(kl: &[[f64; 6]; 6], c: f64, s: f64) -> [[f64; 6]; 6] {
+    let r = [[c, s, 0.0], [-s, c, 0.0], [0.0, 0.0, 1.0]];
+    let mut out = [[0.0; 6]; 6];
+    for bi in 0..2 {
+        for bj in 0..2 {
+            for i in 0..3 {
+                for j in 0..3 {
+                    out[3 * bi + i][3 * bj + j] = (0..3)
+                        .map(|m| {
+                            (0..3)
+                                .map(|n| r[m][i] * kl[3 * bi + m][3 * bj + n] * r[n][j])
+                                .sum::<f64>()
+                        })
+                        .sum::<f64>();
+                }
+            }
+        }
+    }
+    out
+}
+
+/// B31 stiffness: 2-node Euler-Bernoulli beam with cubic (Hermite)
+/// transverse interpolation, in-plane dofs [u1, v1, rotz1, u2, v2,
+/// rotz2]. Closed forms of EA*int(B_a^T B_a) + EI*int(B_b^T B_b) (the
+/// integral is exact for the Hermite basis). The local x-axis runs
+/// node 1 -> node 2.
+///
+/// ponytail: shear-free Euler-Bernoulli — exact for point-load linear
+/// static; Timoshenko (shear-flexible) upgrade needed once squat beams
+/// matter; add GA_s/L terms + reduced integration here.
+/// Returns `None` for a zero-length beam.
+pub(crate) fn b31_stiffness(
+    coords: &[[f64; 2]; 2],
+    e: f64,
+    area: f64,
+    inertia: f64,
+) -> Option<([[f64; 6]; 6], CentroidB)> {
+    let (dx, dy) = (coords[1][0] - coords[0][0], coords[1][1] - coords[0][1]);
+    let l = (dx * dx + dy * dy).sqrt();
+    if l == 0.0 {
+        return None;
+    }
+    let (c, s) = (dx / l, dy / l);
+    let ea_l = e * area / l;
+    let w = e * inertia / (l * l * l);
+    let mut kl = [[0.0; 6]; 6];
+    kl[0][0] = ea_l;
+    kl[0][3] = -ea_l;
+    kl[3][0] = -ea_l;
+    kl[3][3] = ea_l;
+    let her = [
+        [12.0, 6.0 * l, -12.0, 6.0 * l],
+        [6.0 * l, 4.0 * l * l, -6.0 * l, 2.0 * l * l],
+        [-12.0, -6.0 * l, 12.0, -6.0 * l],
+        [6.0 * l, 2.0 * l * l, -6.0 * l, 4.0 * l * l],
+    ];
+    // Bending dofs are (v1, th1, v2, th2) = dofs 1, 2, 4, 5 — not a
+    // contiguous block (dof 0/3 are axial).
+    const BDOF: [usize; 4] = [1, 2, 4, 5];
+    for (i, &di) in BDOF.iter().enumerate() {
+        for (j, &dj) in BDOF.iter().enumerate() {
+            kl[di][dj] = w * her[i][j];
+        }
+    }
+
+    // Strain-displacement rows at axial position x (local dofs),
+    // rotated into global dofs: row_global = row_local * T (T
+    // block-diagonal), so eps/chi come straight off global ue.
+    let rows = |x: f64| -> ([f64; 6], [f64; 6]) {
+        let ba_l = [-1.0 / l, 0.0, 0.0, 1.0 / l, 0.0, 0.0];
+        let t = x / l;
+        // Curvature row on the four bending dofs (v1, th1, v2, th2) =
+        // local dofs 1, 2, 4, 5.
+        let bb4 = [
+            (-6.0 + 12.0 * t) / (l * l),
+            (-4.0 + 6.0 * t) / l,
+            (6.0 - 12.0 * t) / (l * l),
+            (-2.0 + 6.0 * t) / l,
+        ];
+        let mut bb_l = [0.0; 6];
+        for (loc, &v) in [1usize, 2, 4, 5].iter().zip(&bb4) {
+            bb_l[*loc] = v;
+        }
+        let r = [[c, s, 0.0], [-s, c, 0.0], [0.0, 0.0, 1.0]];
+        let mut ba = [0.0; 6];
+        let mut bb = [0.0; 6];
+        for blk in 0..2 {
+            for j in 0..3 {
+                for m in 0..3 {
+                    ba[3 * blk + j] += ba_l[3 * blk + m] * r[m][j];
+                    bb[3 * blk + j] += bb_l[3 * blk + m] * r[m][j];
+                }
+            }
+        }
+        (ba, bb)
+    };
+    Some((
+        rotate_beam(&kl, c, s),
+        CentroidB::Beam {
+            center: Box::new(rows(l / 2.0)),
+            ends: [rows(0.0), rows(l)],
+        },
+    ))
+}
+
+/// B31 consistent mass: translational only (axial + Hermite bending,
+/// no rotary inertia — the Euler-Bernoulli-consistent choice), rotated
+/// into global dofs. `None` for a zero-length beam.
+pub(crate) fn b31_mass(coords: &[[f64; 2]; 2], rho: f64, area: f64) -> Option<[[f64; 6]; 6]> {
+    let (dx, dy) = (coords[1][0] - coords[0][0], coords[1][1] - coords[0][1]);
+    let l = (dx * dx + dy * dy).sqrt();
+    if l == 0.0 {
+        return None;
+    }
+    let (c, s) = (dx / l, dy / l);
+    let m = rho * area * l;
+    let mut ml = [[0.0; 6]; 6];
+    ml[0][0] = m / 3.0;
+    ml[0][3] = m / 6.0;
+    ml[3][0] = m / 6.0;
+    ml[3][3] = m / 3.0;
+    let w = m / 420.0;
+    let her = [
+        [156.0, 22.0 * l, 54.0, -13.0 * l],
+        [22.0 * l, 4.0 * l * l, 13.0 * l, -3.0 * l * l],
+        [54.0, 13.0 * l, 156.0, -22.0 * l],
+        [-13.0 * l, -3.0 * l * l, -22.0 * l, 4.0 * l * l],
+    ];
+    const BDOF: [usize; 4] = [1, 2, 4, 5];
+    for (i, &di) in BDOF.iter().enumerate() {
+        for (j, &dj) in BDOF.iter().enumerate() {
+            ml[di][dj] = w * her[i][j];
+        }
+    }
+    Some(rotate_beam(&ml, c, s))
+}
+
+/// B31 stress: uniaxial sigma = E*(eps_axial ± c*curvature), reported
+/// as the larger-magnitude fiber value (max at +-c).
+///
+/// ponytail: fiber distance c = sqrt(3I/A) assumes an equivalent
+/// rectangular section; an explicit c in `*BEAM SECTION` (v0.4) for
+/// non-rectangular shapes.
+fn beam_stress(
+    e: f64,
+    area: f64,
+    inertia: f64,
+    ba: &[f64; 6],
+    bb: &[f64; 6],
+    ue: &[f64],
+) -> [f64; 6] {
+    let eps = (0..6).map(|c| ba[c] * ue[c]).sum::<f64>();
+    let chi = (0..6).map(|c| bb[c] * ue[c]).sum::<f64>();
+    let c = (3.0 * inertia / area).sqrt();
+    let s = (e * (eps + c * chi)).abs().max((e * (eps - c * chi)).abs());
+    [s, 0.0, 0.0, 0.0, 0.0, 0.0]
+}
+
 /// ke += w * B^T D B for an SxN strain-displacement matrix (S = 3 or 6).
 fn btdb<const N: usize, const S: usize>(
     ke: &mut [[f64; N]; N],
@@ -415,6 +821,25 @@ pub(crate) fn plane_stress<const N: usize>(
     ]
 }
 
+/// Stress components from a plane-strain B/D pair: same in-plane
+/// machinery, but sigma_zz = lambda*(eps_xx + eps_yy) with lambda =
+/// d[0][1] (the plane-strain D carries it directly).
+pub(crate) fn plane_strain_stress<const N: usize>(
+    b: &[[f64; N]; 3],
+    d: &[[f64; 3]; 3],
+    ue: &[f64],
+) -> [f64; 6] {
+    let e = strain(b, ue);
+    [
+        d[0][0] * e[0] + d[0][1] * e[1],
+        d[1][0] * e[0] + d[1][1] * e[1],
+        d[0][1] * (e[0] + e[1]),
+        d[2][2] * e[2],
+        0.0,
+        0.0,
+    ]
+}
+
 /// Stress components (xx, yy, zz, xy, yz, xz) from a solid B/D pair.
 pub(crate) fn solid_stress<const N: usize>(
     b: &[[f64; N]; 6],
@@ -441,43 +866,72 @@ pub(crate) fn von_mises(s: &[f64; 6]) -> f64 {
 
 /// Centroid stress components for an element.
 pub(crate) fn centroid_stress(b: &CentroidB, d: &Constitutive, ue: &[f64]) -> [f64; 6] {
+    use Constitutive as C;
     match (b, d) {
-        (CentroidB::Tri(bm), Constitutive::Plane(dp)) => plane_stress(bm, dp, ue),
-        (CentroidB::Quad { center, .. }, Constitutive::Plane(dp)) => plane_stress(center, dp, ue),
-        (CentroidB::Tet(bm), Constitutive::Solid(ds)) => solid_stress(bm, ds, ue),
-        (CentroidB::Hex { center, .. }, Constitutive::Solid(ds)) => solid_stress(center, ds, ue),
-        (CentroidB::Tri(_) | CentroidB::Quad { .. }, Constitutive::Solid(_))
-        | (CentroidB::Tet(_) | CentroidB::Hex { .. }, Constitutive::Plane(_)) => {
-            unreachable!("element kind and constitutive law out of sync")
+        (CentroidB::Tri(bm), C::Plane(dp)) => plane_stress(bm, dp, ue),
+        (CentroidB::Quad { center, .. }, C::Plane(dp)) => plane_stress(center, dp, ue),
+        (CentroidB::Quad { center, .. }, C::PlaneStrain(dp)) => plane_strain_stress(center, dp, ue),
+        (CentroidB::Quad8 { center, .. }, C::Plane(dp)) => plane_stress(center, dp, ue),
+        (CentroidB::Quad8 { center, .. }, C::PlaneStrain(dp)) => {
+            plane_strain_stress(center, dp, ue)
         }
+        (CentroidB::Beam { center, .. }, C::Beam { e, a, i }) => {
+            beam_stress(*e, *a, *i, &center.0, &center.1, ue)
+        }
+        (CentroidB::Tet(bm), C::Solid(ds)) => solid_stress(bm, ds, ue),
+        (CentroidB::Hex { center, .. }, C::Solid(ds)) => solid_stress(center, ds, ue),
+        _ => unreachable!("element kind and constitutive law out of sync"),
     }
 }
 
 /// Stress components at each element node (extrapolated from the Gauss
-/// points for quads/hexes, constant for triangles/tets), parallel to the
-/// element's connectivity.
+/// points for quads/hexes, constant for triangles/tets, end-section
+/// values for beams), parallel to the element's connectivity.
 pub(crate) fn nodal_stresses(b: &CentroidB, d: &Constitutive, ue: &[f64]) -> Vec<[f64; 6]> {
+    use Constitutive as C;
     match (b, d) {
-        (CentroidB::Tri(bm), Constitutive::Plane(dp)) => vec![plane_stress(bm, dp, ue); 3],
-        (CentroidB::Quad { gauss, .. }, Constitutive::Plane(dp)) => {
+        (CentroidB::Tri(bm), C::Plane(dp)) => vec![plane_stress(bm, dp, ue); 3],
+        (CentroidB::Quad { gauss, .. }, C::Plane(dp)) => {
             let mut gp = [[0.0; 6]; 4];
             for (j, bm) in gauss.iter().enumerate() {
                 gp[j] = plane_stress(bm, dp, ue);
             }
             extrapolate_to_corners(&gp).into()
         }
-        (CentroidB::Tet(bm), Constitutive::Solid(ds)) => vec![solid_stress(bm, ds, ue); 4],
-        (CentroidB::Hex { gauss, .. }, Constitutive::Solid(ds)) => {
+        (CentroidB::Quad { gauss, .. }, C::PlaneStrain(dp)) => {
+            let mut gp = [[0.0; 6]; 4];
+            for (j, bm) in gauss.iter().enumerate() {
+                gp[j] = plane_strain_stress(bm, dp, ue);
+            }
+            extrapolate_to_corners(&gp).into()
+        }
+        (CentroidB::Quad8 { gauss, .. }, C::Plane(dp)) => {
+            let mut gp = [[0.0; 6]; 9];
+            for (j, bm) in gauss.iter().enumerate() {
+                gp[j] = plane_stress(bm, dp, ue);
+            }
+            extrapolate_to_nodes8(&gp).into()
+        }
+        (CentroidB::Quad8 { gauss, .. }, C::PlaneStrain(dp)) => {
+            let mut gp = [[0.0; 6]; 9];
+            for (j, bm) in gauss.iter().enumerate() {
+                gp[j] = plane_strain_stress(bm, dp, ue);
+            }
+            extrapolate_to_nodes8(&gp).into()
+        }
+        (CentroidB::Beam { ends, .. }, C::Beam { e, a, i }) => ends
+            .iter()
+            .map(|(ba, bb)| beam_stress(*e, *a, *i, ba, bb, ue))
+            .collect(),
+        (CentroidB::Tet(bm), C::Solid(ds)) => vec![solid_stress(bm, ds, ue); 4],
+        (CentroidB::Hex { gauss, .. }, C::Solid(ds)) => {
             let mut gp = [[0.0; 6]; 8];
             for (j, bm) in gauss.iter().enumerate() {
                 gp[j] = solid_stress(bm, ds, ue);
             }
             extrapolate_to_corners3(&gp).into()
         }
-        (CentroidB::Tri(_) | CentroidB::Quad { .. }, Constitutive::Solid(_))
-        | (CentroidB::Tet(_) | CentroidB::Hex { .. }, Constitutive::Plane(_)) => {
-            unreachable!("element kind and constitutive law out of sync")
-        }
+        _ => unreachable!("element kind and constitutive law out of sync"),
     }
 }
 
@@ -714,5 +1168,145 @@ mod tests {
             [1.0, 1.0, 0.0], // coplanar: zero volume
         ];
         assert!(c3d4_stiffness(&coords, &d).is_none());
+    }
+
+    fn unit_square8() -> [[f64; 2]; 8] {
+        [
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [1.0, 1.0],
+            [0.0, 1.0],
+            [0.5, 0.0],
+            [1.0, 0.5],
+            [0.5, 1.0],
+            [0.0, 0.5],
+        ]
+    }
+
+    #[test]
+    fn quad8_shapes_partition_unity_and_are_cardinal_at_nodes() {
+        for &(xi, eta) in &[(0.0, 0.0), (0.3, -0.7), (-0.9, 0.2), (G3, -G3)] {
+            let n = quad8_shapes(xi, eta);
+            assert!(
+                (n.iter().sum::<f64>() - 1.0).abs() < 1e-12,
+                "at ({xi},{eta})"
+            );
+        }
+        for (k, &(nx, ny)) in QUAD8_NODES.iter().enumerate() {
+            let n = quad8_shapes(nx, ny);
+            for (j, &nj) in n.iter().enumerate() {
+                let want = if j == k { 1.0 } else { 0.0 };
+                assert!((nj - want).abs() < 1e-12, "node {k}, shape {j}: {nj}");
+            }
+        }
+    }
+
+    #[test]
+    fn cps8_stiffness_is_symmetric_and_kills_rigid_translation() {
+        let d = d_matrix(1.0, 0.25);
+        let (ke, _) = cps8_stiffness(&unit_square8(), &d, 1.0).unwrap();
+        for (a, row) in ke.iter().enumerate() {
+            for (c, &v) in row.iter().enumerate() {
+                assert!((v - ke[c][a]).abs() < 1e-12, "K[{a},{c}] != K[{c},{a}]");
+            }
+        }
+        let mut u = [0.0; 16];
+        for i in 0..8 {
+            u[2 * i] = 0.7;
+            u[2 * i + 1] = -1.3;
+        }
+        for (a, row) in ke.iter().enumerate() {
+            let ku: f64 = row.iter().zip(u).map(|(k, ui)| k * ui).sum();
+            assert!(ku.abs() < 1e-12, "row {a} not translation-invariant");
+        }
+    }
+
+    #[test]
+    fn inverted_quad8_is_rejected() {
+        let d = d_matrix(1.0, 0.25);
+        let mut coords = unit_square8();
+        coords.swap(1, 3); // clockwise corners invert J
+        assert!(cps8_stiffness(&coords, &d, 1.0).is_none());
+    }
+
+    #[test]
+    fn cps8_extrapolation_is_exact_through_the_serendipity_span() {
+        // Constant + full quadratic: the serendipity span, so the
+        // least-squares fit recovers nodal values exactly.
+        let f = |xi: f64, eta: f64| 2.0 + 3.0 * xi - 5.0 * eta + 1.5 * xi * xi - 0.8 * eta * eta;
+        let mut gp = [[0.0f64; 1]; 9];
+        for (k, &(sx, sy)) in GP9_SIGNS.iter().enumerate() {
+            gp[k][0] = f(sx * G3, sy * G3);
+        }
+        let nodes = extrapolate_to_nodes8(&gp);
+        for (i, &(nx, ny)) in QUAD8_NODES.iter().enumerate() {
+            assert!(
+                (nodes[i][0] - f(nx, ny)).abs() < 1e-10,
+                "node {i}: {} != {}",
+                nodes[i][0],
+                f(nx, ny)
+            );
+        }
+        // Constant field: every row of the extrapolation matrix sums to 1.
+        let c = extrapolate_to_nodes8(&[[7.0; 1]; 9]);
+        assert!(c.iter().all(|&v| (v[0] - 7.0).abs() < 1e-12));
+    }
+
+    #[test]
+    fn gauss_solve_matches_known_2x2() {
+        let mut a = [[2.0, 1.0], [1.0, 3.0]];
+        let mut b = [[3.0, 1.0], [5.0, 0.0]];
+        gauss_solve(&mut a, &mut b);
+        // [2 1;1 3]^-1 = (1/5)[3 -1; -1 2]: x1 = (0.8, 1.4), x2 = (0.6, -0.2)
+        assert!((b[0][0] - 0.8).abs() < 1e-12);
+        assert!((b[1][0] - 1.4).abs() < 1e-12);
+        assert!((b[0][1] - 0.6).abs() < 1e-12);
+        assert!((b[1][1] - (-0.2)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn b31_stiffness_kills_rigid_translation_and_is_symmetric() {
+        let coords = [[0.0, 0.0], [2.0, 1.0]]; // angled beam
+        let (ke, _) = b31_stiffness(&coords, 1.0e6, 0.05, 1.0e-4).unwrap();
+        for (a, row) in ke.iter().enumerate() {
+            for (c, &v) in row.iter().enumerate() {
+                assert!((v - ke[c][a]).abs() < 1e-9 * ke[c][a].abs().max(1.0));
+            }
+        }
+        let u = [0.4, -0.7, 0.0, 0.4, -0.7, 0.0];
+        for (a, row) in ke.iter().enumerate() {
+            let ku: f64 = row.iter().zip(u).map(|(k, ui)| k * ui).sum();
+            assert!(ku.abs() < 1e-9, "row {a} not translation-invariant");
+        }
+    }
+
+    #[test]
+    fn b31_stiffness_kills_rigid_rotation_for_vertical_beam() {
+        // Beam along +y: a rigid rotation about the origin (ux = -y,
+        // uy = x, rotz = 1) must produce zero nodal forces.
+        let (ke, _) = b31_stiffness(&[[0.0, 0.0], [0.0, 3.0]], 1.0e6, 0.05, 1.0e-4).unwrap();
+        let u = [0.0, 0.0, 1.0, -3.0, 0.0, 1.0];
+        for (a, row) in ke.iter().enumerate() {
+            let ku: f64 = row.iter().zip(u).map(|(k, ui)| k * ui).sum();
+            assert!(ku.abs() < 1e-6, "row {a}: {ku}");
+        }
+    }
+
+    #[test]
+    fn b31_mass_axial_columns_carry_half_each() {
+        let m = b31_mass(&[[0.0, 0.0], [2.5, 0.0]], 7800.0, 0.02).unwrap();
+        let total = 7800.0 * 0.02 * 2.5;
+        // Axial columns: m/3 + m/6 each — together the full mass for a
+        // rigid axial velocity. (Transverse columns also carry Hermite
+        // coupling into rotz, so only the axial pair has the clean sum.)
+        for d in [0, 3] {
+            let col: f64 = (0..6).map(|r| m[r][d]).sum();
+            assert!((col - total / 2.0).abs() < 1e-9, "dof {d}: {col}");
+        }
+        for (a, row) in m.iter().enumerate() {
+            for (c, &v) in row.iter().enumerate() {
+                assert!((v - m[c][a]).abs() < 1e-9 * v.abs().max(1e-9));
+            }
+        }
     }
 }

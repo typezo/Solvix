@@ -99,7 +99,17 @@ fn assemble_ksigma(
     let mut trips: Vec<(usize, usize, f64)> = Vec::new();
     for (idx, e) in model.mesh.elements.iter().enumerate() {
         match e.kind {
-            ElemKind::Cps3 | ElemKind::Cps4 => {}
+            ElemKind::Cps3 | ElemKind::Cps4 | ElemKind::Cpe4 => {}
+            ElemKind::Cps8 | ElemKind::Cpe8 => {
+                return Err(SolveError::InvalidModel(
+                    "buckling not yet supported for quadratic quads (CPS8/CPE8)".into(),
+                ));
+            }
+            ElemKind::B31 => {
+                return Err(SolveError::InvalidModel(
+                    "beam buckling not yet supported (B31)".into(),
+                ));
+            }
             ElemKind::C3d8 => {
                 return Err(SolveError::InvalidModel(
                     "3D buckling not yet supported (C3D8)".into(),
@@ -448,6 +458,7 @@ mod tests {
                 element_ids: (1..=(nx * ny) as u32).collect(),
             }],
             mat_assignments: vec![("all".into(), "steel".into())],
+            beam_sections: Vec::new(),
             boundary_conditions: bcs,
             cloads: load_nodes
                 .iter()

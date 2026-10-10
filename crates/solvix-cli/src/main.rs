@@ -24,7 +24,10 @@ solvix 0.1.0 — the agent-era FEA CLI
 solvix is designed for AI agents: all subcommands accept --json and exit 0/1/2/3.
 
 Usage:
-  solvix run <job.inp> [-o outdir] [--json]   parse, solve, write <jobname>.vtu
+  solvix run <job.inp> [-o outdir] [--modes N] [--json]
+                                              parse, solve, write <jobname>.vtu;
+                                              --modes N also extracts the N lowest
+                                              natural frequencies (modal analysis)
   solvix info <job.inp> [--json]              parse-only model report, never solves
   solvix bench [--json]                       built-in verification suite (all-pass exit 0, else 3)
   solvix mcp                                  MCP server on stdio (JSON-RPC 2.0, one object per line)
@@ -67,6 +70,7 @@ enum Command {
     Run {
         inp: String,
         outdir: String,
+        modes: Option<usize>,
         json: bool,
     },
     Info {
@@ -91,6 +95,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
             let run = first == "run";
             let mut inp: Option<String> = None;
             let mut outdir = ".".to_string();
+            let mut modes: Option<usize> = None;
             let mut json = false;
             let rest: Vec<&String> = it.collect();
             let mut i = 0;
@@ -98,6 +103,16 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                 let a = rest[i].as_str();
                 match a {
                     "--json" => json = true,
+                    "--modes" if run => {
+                        i += 1;
+                        let Some(v) = rest.get(i) else {
+                            return Err("--modes requires a value".into());
+                        };
+                        modes = Some(
+                            v.parse()
+                                .map_err(|_| format!("invalid --modes value: {v}"))?,
+                        );
+                    }
                     "-o" if run => {
                         i += 1;
                         let Some(v) = rest.get(i) else {
@@ -115,14 +130,19 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                 return Err(format!(
                     "usage: solvix {first} <job.inp>{}",
                     if run {
-                        " [-o outdir] [--json]"
+                        " [-o outdir] [--modes N] [--json]"
                     } else {
                         " [--json]"
                     }
                 ));
             };
             if run {
-                Ok(Command::Run { inp, outdir, json })
+                Ok(Command::Run {
+                    inp,
+                    outdir,
+                    modes,
+                    json,
+                })
             } else {
                 Ok(Command::Info { inp, json })
             }
@@ -218,6 +238,9 @@ struct RunSummary {
     max_disp_m: f64,
     max_von_mises_pa: f64,
     outputs: Vec<String>,
+    /// Natural frequencies (Hz) when `--modes N` ran a modal pass; empty
+    /// otherwise.
+    frequencies_hz: Vec<f64>,
 }
 
 fn run_summary(
@@ -226,6 +249,7 @@ fn run_summary(
     job: &str,
     solve_ms: u64,
     outputs: Vec<String>,
+    frequencies_hz: Vec<f64>,
 ) -> RunSummary {
     let max_disp_m = sol
         .displacements
@@ -245,12 +269,32 @@ fn run_summary(
         max_disp_m,
         max_von_mises_pa,
         outputs,
+        frequencies_hz,
     }
 }
 
+fn fmt_hz(x: f64) -> String {
+    format!("{:.3}", fin(x))
+}
+
 fn success_json(s: &RunSummary) -> String {
-    format!(
-        "{{\"ok\":true,\"job\":\"{}\",\"nodes\":{},\"elements\":{},\"iterations\":{},\"solver_method\":\"{}\",\"cond_estimate\":{},\"residual\":{},\"solve_ms\":{},\"max_disp_mm\":{},\"max_von_mises_mpa\":{},\"outputs\":[{}]}}",
+    let modal = if s.frequencies_hz.is_empty() {
+        String::new()
+    } else {
+        let freqs = s
+            .frequencies_hz
+            .iter()
+            .map(|f| fmt_hz(*f))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            ",\"modes\":{},\"frequencies_hz\":[{}]",
+            s.frequencies_hz.len(),
+            freqs
+        )
+    };
+    let mut j = format!(
+        "{{\"ok\":true,\"job\":\"{}\",\"nodes\":{},\"elements\":{},\"iterations\":{},\"solver_method\":\"{}\",\"cond_estimate\":{},\"residual\":{},\"solve_ms\":{},\"max_disp_mm\":{},\"max_von_mises_mpa\":{},\"outputs\":[{}]",
         json_escape(&s.job),
         s.nodes,
         s.elements,
@@ -262,7 +306,10 @@ fn success_json(s: &RunSummary) -> String {
         fmt_mm(s.max_disp_m),
         fmt_mpa(s.max_von_mises_pa),
         names_json(&s.outputs),
-    )
+    );
+    j.push_str(&modal);
+    j.push('}');
+    j
 }
 
 fn row(label: &str, value: &str) -> String {
@@ -287,6 +334,15 @@ fn run_human(s: &RunSummary) -> String {
     for o in &s.outputs {
         out.push_str(&row("output", o));
     }
+    if !s.frequencies_hz.is_empty() {
+        out.push_str(&row("modes", &s.frequencies_hz.len().to_string()));
+        for (i, f) in s.frequencies_hz.iter().enumerate() {
+            out.push_str(&row(
+                &format!("mode {}", i + 1),
+                &format!("{} Hz", fmt_hz(*f)),
+            ));
+        }
+    }
     out
 }
 
@@ -306,8 +362,12 @@ fn kind_name(k: ElemKind) -> &'static str {
     match k {
         ElemKind::Cps3 => "cps3",
         ElemKind::Cps4 => "cps4",
+        ElemKind::Cps8 => "cps8",
+        ElemKind::Cpe4 => "cpe4",
+        ElemKind::Cpe8 => "cpe8",
         ElemKind::C3d8 => "c3d8",
         ElemKind::C3d4 => "c3d4",
+        ElemKind::B31 => "b31",
     }
 }
 
@@ -462,13 +522,29 @@ fn solve_error_message(e: SolveError) -> String {
     }
 }
 
-fn do_run(inp: &str, outdir: &str, json: bool) -> Result<(), (Stage, String)> {
+fn do_run(
+    inp: &str,
+    outdir: &str,
+    modes: Option<usize>,
+    json: bool,
+) -> Result<(), (Stage, String)> {
     let text = read_deck(inp)?;
     let (model, report) = parse_deck(&text)?;
     emit_warnings(&report);
     let t0 = Instant::now();
     let sol = solvix_core::solve(&model).map_err(|e| (Stage::Solve, solve_error_message(e)))?;
     let solve_ms = t0.elapsed().as_millis() as u64;
+    // Modal pass (issue #40): after the static solve, extract the N lowest
+    // natural frequencies. VTU mode-shape output is deferred: solvix-io is
+    // owned by issue #25 (write_vtu extension is a #25-followup item).
+    let frequencies_hz = match modes {
+        Some(n) => {
+            solvix_core::solve_modal(&model, &solvix_core::ModalOptions { num_modes: n })
+                .map_err(|e| (Stage::Solve, solve_error_message(e)))?
+                .frequencies_hz
+        }
+        None => Vec::new(),
+    };
     let job = job_name(inp);
     std::fs::create_dir_all(outdir)
         .map_err(|e| (Stage::Io, format!("cannot create directory {outdir}: {e}")))?;
@@ -481,6 +557,7 @@ fn do_run(inp: &str, outdir: &str, json: bool) -> Result<(), (Stage, String)> {
         &job,
         solve_ms,
         vec![vtu.display().to_string()],
+        frequencies_hz,
     );
     if json {
         println!("{}", success_json(&s));
@@ -537,7 +614,12 @@ fn cli(args: &[String]) -> i32 {
             0
         }
         Command::Info { inp, json } => finish(do_info(&inp, json), json),
-        Command::Run { inp, outdir, json } => finish(do_run(&inp, &outdir, json), json),
+        Command::Run {
+            inp,
+            outdir,
+            modes,
+            json,
+        } => finish(do_run(&inp, &outdir, modes, json), json),
         Command::Bench { json } => bench::run(json),
         Command::Mcp => mcp::serve(),
     }
@@ -599,7 +681,7 @@ mod tests {
                 dof: 2,
                 value: 1000.0,
             }],
-            steps: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -647,6 +729,7 @@ mod tests {
             Ok(Command::Run {
                 inp: "job.inp".into(),
                 outdir: ".".into(),
+                modes: None,
                 json: false
             })
         );
@@ -655,6 +738,7 @@ mod tests {
             Ok(Command::Run {
                 inp: "job.inp".into(),
                 outdir: "out".into(),
+                modes: None,
                 json: true
             })
         );
@@ -663,9 +747,39 @@ mod tests {
             Ok(Command::Run {
                 inp: "a.inp".into(),
                 outdir: "b".into(),
+                modes: None,
                 json: true
             })
         );
+        assert_eq!(
+            parse_args(&sv(&["run", "job.inp", "--modes", "3", "--json"])),
+            Ok(Command::Run {
+                inp: "job.inp".into(),
+                outdir: ".".into(),
+                modes: Some(3),
+                json: true
+            })
+        );
+        assert_eq!(
+            parse_args(&sv(&["run", "--modes", "6", "job.inp"])),
+            Ok(Command::Run {
+                inp: "job.inp".into(),
+                outdir: ".".into(),
+                modes: Some(6),
+                json: false
+            })
+        );
+    }
+
+    #[test]
+    fn args_modes_errors() {
+        assert!(parse_args(&sv(&["run", "a.inp", "--modes"])).is_err());
+        let err = parse_args(&sv(&["run", "a.inp", "--modes", "x"])).unwrap_err();
+        assert!(err.contains("invalid --modes value"), "{err}");
+        let err = parse_args(&sv(&["run", "a.inp", "--modes", "-1"])).unwrap_err();
+        assert!(err.contains("invalid --modes value"), "{err}");
+        let err = parse_args(&sv(&["info", "a.inp", "--modes", "3"])).unwrap_err();
+        assert!(err.contains("unknown flag"), "{err}");
     }
 
     #[test]
@@ -724,11 +838,58 @@ mod tests {
             "demo",
             7,
             vec!["demo.vtu".into()],
+            Vec::new(),
         );
         assert_eq!(
             success_json(&s),
             r#"{"ok":true,"job":"demo","nodes":2,"elements":1,"iterations":42,"solver_method":"pcg","cond_estimate":1.250e1,"residual":1.500e-12,"solve_ms":7,"max_disp_mm":4.762,"max_von_mises_mpa":38.200,"outputs":["demo.vtu"]}"#
         );
+    }
+
+    #[test]
+    fn success_json_with_modes_exact() {
+        let s = run_summary(
+            &fake_model(),
+            &fake_solution(),
+            "demo",
+            7,
+            vec!["demo.vtu".into()],
+            vec![12.5, 73.21, 198.0],
+        );
+        assert_eq!(
+            success_json(&s),
+            r#"{"ok":true,"job":"demo","nodes":2,"elements":1,"iterations":42,"solver_method":"pcg","cond_estimate":1.250e1,"residual":1.500e-12,"solve_ms":7,"max_disp_mm":4.762,"max_von_mises_mpa":38.200,"outputs":["demo.vtu"],"modes":3,"frequencies_hz":[12.500,73.210,198.000]}"#
+        );
+    }
+
+    #[test]
+    fn run_human_modal_table() {
+        let s = run_summary(
+            &fake_model(),
+            &fake_solution(),
+            "demo",
+            7,
+            vec!["demo.vtu".into()],
+            vec![12.5, 73.21],
+        );
+        let h = run_human(&s);
+        assert!(h.contains("modes         2"), "{h}");
+        assert!(h.contains("mode 1        12.500 Hz"), "{h}");
+        assert!(h.contains("mode 2        73.210 Hz"), "{h}");
+    }
+
+    #[test]
+    fn run_human_static_has_no_mode_rows() {
+        let s = run_summary(
+            &fake_model(),
+            &fake_solution(),
+            "demo",
+            7,
+            vec!["demo.vtu".into()],
+            Vec::new(),
+        );
+        let h = run_human(&s);
+        assert!(!h.contains("mode 1"), "{h}");
     }
 
     #[test]
@@ -739,6 +900,7 @@ mod tests {
             "my \"job\"",
             0,
             vec!["a b.vtu".into()],
+            Vec::new(),
         );
         let j = success_json(&s);
         assert!(j.starts_with(r#"{"ok":true,"job":"my \"job\"""#), "{j}");
@@ -823,6 +985,7 @@ mod tests {
             "demo",
             7,
             vec!["demo.vtu".into()],
+            Vec::new(),
         );
         let h = run_human(&s);
         assert!(h.contains("4.762 mm"), "{h}");

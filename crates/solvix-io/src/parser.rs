@@ -144,8 +144,12 @@ pub(super) fn parse_inp(text: &str) -> Result<(Model, ParseReport), ParseError> 
                 let kind = match ty.as_deref() {
                     Some("CPS4") => Some(ElemKind::Cps4),
                     Some("CPS3") => Some(ElemKind::Cps3),
+                    Some("CPS8") => Some(ElemKind::Cps8),
+                    Some("CPE4") => Some(ElemKind::Cpe4),
+                    Some("CPE8") => Some(ElemKind::Cpe8),
                     Some("C3D8") => Some(ElemKind::C3d8),
                     Some("C3D4") => Some(ElemKind::C3d4),
+                    Some("B31") => Some(ElemKind::B31),
                     _ => None,
                 };
                 let Some(kind) = kind else {
@@ -154,7 +158,7 @@ pub(super) fn parse_inp(text: &str) -> Result<(Model, ParseReport), ParseError> 
                         |t| format!("element TYPE={t}"),
                     );
                     report.warnings.push(format!(
-                        "line {}: unsupported {what} — block skipped (supported: CPS4/CPS3/C3D8/C3D4)",
+                        "line {}: unsupported {what} — block skipped (supported: CPS3/CPS4/CPS8/CPE4/CPE8/C3D8/C3D4/B31)",
                         kw.line
                     ));
                     j += 1;
@@ -419,6 +423,61 @@ pub(super) fn parse_inp(text: &str) -> Result<(Model, ParseReport), ParseError> 
                 }
             }
 
+            "beam section" => {
+                let elset = kw.params.get("elset").map(|s| s.to_uppercase());
+                let material = kw.params.get("material").map(|s| s.to_uppercase());
+                j += 1;
+                match (elset, material) {
+                    (Some(elset), Some(material)) => {
+                        if !model.elsets.iter().any(|s| s.name == elset) {
+                            return err(
+                                kw.line,
+                                format!("*BEAM SECTION references unknown ELSET '{elset}'"),
+                            );
+                        }
+                        if !model.materials.iter().any(|m| m.name == material) {
+                            return err(
+                                kw.line,
+                                format!("*BEAM SECTION references unknown MATERIAL '{material}'"),
+                            );
+                        }
+                        let Some(Item::Data { line: dno, text }) = items.get(j) else {
+                            return err(
+                                kw.line,
+                                "*BEAM SECTION expects a data line 'A, I'".to_string(),
+                            );
+                        };
+                        let f = fields(text);
+                        if f.len() != 2 {
+                            return err(
+                                *dno,
+                                format!(
+                                    "*BEAM SECTION data expects area A, second moment I; got {} field(s)",
+                                    f.len()
+                                ),
+                            );
+                        }
+                        let a = num(f[0], *dno, "beam section area")?;
+                        let i = num(f[1], *dno, "beam section second moment")?;
+                        model.mat_assignments.push((elset.clone(), material));
+                        model.beam_sections.push((elset, a, i));
+                        j += 1;
+                        while matches!(items.get(j), Some(Item::Data { .. })) {
+                            j += 1;
+                        }
+                    }
+                    _ => {
+                        report.warnings.push(format!(
+                            "line {}: *BEAM SECTION needs ELSET and MATERIAL — block skipped",
+                            kw.line
+                        ));
+                        while matches!(items.get(j), Some(Item::Data { .. })) {
+                            j += 1;
+                        }
+                    }
+                }
+            }
+
             "boundary" => {
                 let mut op_new = op_is_new(kw, &mut report);
                 let in_step = cur.is_some();
@@ -601,7 +660,7 @@ pub(super) fn parse_inp(text: &str) -> Result<(Model, ParseReport), ParseError> 
                                         Some(e) => {
                                             let faces = match e.kind {
                                                 ElemKind::Cps3 => 3,
-                                                ElemKind::Cps4 => 4,
+                                                ElemKind::Cps4 | ElemKind::Cpe4 => 4,
                                                 _ => 0,
                                             };
                                             if face > faces {
@@ -828,8 +887,12 @@ fn kind_name(k: ElemKind) -> &'static str {
     match k {
         ElemKind::Cps3 => "cps3",
         ElemKind::Cps4 => "cps4",
+        ElemKind::Cps8 => "cps8",
+        ElemKind::Cpe4 => "cpe4",
+        ElemKind::Cpe8 => "cpe8",
         ElemKind::C3d8 => "c3d8",
         ElemKind::C3d4 => "c3d4",
+        ElemKind::B31 => "b31",
     }
 }
 
@@ -1038,6 +1101,83 @@ TIP, 2, -50.0
         assert_eq!(m.mesh.elements[0].kind, ElemKind::C3d8);
         assert_eq!(m.mesh.elements[0].connectivity.len(), 8);
         assert_eq!(m.mesh.elements[1].kind, ElemKind::C3d4);
+    }
+
+    #[test]
+    fn v03_element_types_and_beam_section_parse() {
+        // Plane family deck: CPS8 + CPE4/CPE8 share the plane layout.
+        let plane_deck = concat!(
+            "*NODE\n",
+            "1, 0.0, 0.0\n2, 0.5, 0.0\n3, 1.0, 0.0\n",
+            "4, 0.0, 0.5\n5, 0.5, 0.5\n6, 1.0, 0.5\n",
+            "7, 0.0, 1.0\n8, 0.5, 1.0\n9, 1.0, 1.0\n",
+            "*ELEMENT, TYPE=CPS8, ELSET=QUAD8\n",
+            "1, 1, 3, 9, 7, 2, 6, 8, 4\n",
+            "*ELEMENT, TYPE=CPE4\n",
+            "2, 1, 3, 9, 7\n",
+            "*ELEMENT, TYPE=CPE8\n",
+            "3, 1, 3, 9, 7, 2, 6, 8, 4\n",
+            "*MATERIAL, NAME=STEEL\n*ELASTIC\n210.0E9, 0.3\n",
+            "*SOLID SECTION, ELSET=QUAD8, MATERIAL=STEEL\n0.01\n",
+        );
+        let (m, r) = parse_inp(plane_deck).unwrap();
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert_eq!(m.mesh.elements[0].kind, ElemKind::Cps8);
+        assert_eq!(m.mesh.elements[0].connectivity.len(), 8);
+        assert_eq!(m.mesh.elements[1].kind, ElemKind::Cpe4);
+        assert_eq!(m.mesh.elements[2].kind, ElemKind::Cpe8);
+
+        // Beam deck: B31 chain + *BEAM SECTION (A, I), solved to the
+        // exact Hermite cantilever tip deflection.
+        let beam_deck = concat!(
+            "*NODE\n1, 0.0, 0.0\n2, 1.0, 0.0\n3, 2.0, 0.0\n",
+            "*ELEMENT, TYPE=B31, ELSET=BEAMS\n1, 1, 2\n2, 2, 3\n",
+            "*MATERIAL, NAME=STEEL\n*ELASTIC\n210.0E9, 0.3\n",
+            "*BEAM SECTION, ELSET=BEAMS, MATERIAL=STEEL\n0.01, 8.333333E-7\n",
+            "*BOUNDARY\n1, 1, 3\n",
+            "*STEP\n*STATIC\n*CLOAD\n3, 2, -1.0E4\n*END STEP\n",
+        );
+        let (m, r) = parse_inp(beam_deck).unwrap();
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert_eq!(m.mesh.elements[0].kind, ElemKind::B31);
+        assert_eq!(m.mesh.elements[0].connectivity, vec![1, 2]);
+        assert_eq!(
+            m.beam_sections,
+            vec![("BEAMS".to_string(), 0.01, 8.333333e-7)]
+        );
+        assert!(m
+            .mat_assignments
+            .contains(&("BEAMS".to_string(), "STEEL".to_string())));
+        let sol = solvix_core::solve(&m).unwrap();
+        let (e, l, i) = (210.0e9, 2.0, 8.333333e-7);
+        let beam = -1.0e4 * l * l * l / (3.0 * e * i);
+        assert!(
+            ((sol.displacements[2][1] - beam) / beam).abs() < 1e-6,
+            "tip={:.6e} beam={beam:.6e}",
+            sol.displacements[2][1]
+        );
+    }
+
+    #[test]
+    fn beam_section_errors_carry_line_numbers() {
+        let e = parse_inp(concat!(
+            "*NODE\n1,0,0\n2,1,0\n",
+            "*ELEMENT, TYPE=B31, ELSET=B\n1, 1, 2\n",
+            "*MATERIAL, NAME=M\n*ELASTIC\n1.0E9, 0.3\n",
+            "*BEAM SECTION, ELSET=NOPE, MATERIAL=M\n0.01, 1e-6\n"
+        ))
+        .unwrap_err();
+        assert!(e.message.contains("unknown ELSET 'NOPE'"));
+
+        let e = parse_inp(concat!(
+            "*NODE\n1,0,0\n2,1,0\n",
+            "*ELEMENT, TYPE=B31, ELSET=B\n1, 1, 2\n",
+            "*MATERIAL, NAME=M\n*ELASTIC\n1.0E9, 0.3\n",
+            "*BEAM SECTION, ELSET=B, MATERIAL=M\n0.01\n"
+        ))
+        .unwrap_err();
+        assert_eq!(e.line, 10);
+        assert!(e.message.contains("area A, second moment I"));
     }
 
     #[test]

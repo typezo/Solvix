@@ -22,11 +22,14 @@
 //! constrained dofs.
 //!
 //! Consistent (not lumped) mass matrices: CPS3 and C3D4 in closed form,
-//! CPS4 with 2x2 and C3D8 with 2x2x2 Gauss quadrature of
-//! `rho * N^T N`.
+//! CPS4/CPE4 with 2x2, CPS8/CPE8 with 3x3 and C3D8 with 2x2x2 Gauss
+//! quadrature of `rho * N^T N`, B31 in closed form (translational
+//! Hermite + axial, no rotary inertia).
 
 use crate::assembly::{self, coords2, scatter, Csr};
-use crate::element::{hex_b, hex_shapes, invalid, quad_b, quad_shapes};
+use crate::element::{
+    b31_mass, hex_b, hex_shapes, invalid, quad8_b, quad8_shapes, quad_b, quad_shapes, G3, W3,
+};
 use crate::ldl::Ldlt;
 use crate::solver;
 use crate::{Model, SolveError};
@@ -127,6 +130,28 @@ fn c3d8_mass(coords: &[[f64; 3]; 8], rho: f64) -> Option<[[f64; 24]; 24]> {
     Some(m)
 }
 
+/// CPS8/CPE8 consistent mass: `rho*t*detJ*N^T N` under 3x3 Gauss
+/// (weights 5/9, 8/9). `None` if det(J) <= 0 at a Gauss point (same
+/// trigger as the stiffness).
+fn cps8_mass(coords: &[[f64; 2]; 8], rho: f64, t: f64) -> Option<[[f64; 16]; 16]> {
+    let mut m = [[0.0; 16]; 16];
+    for (a, &xi) in [-G3, 0.0, G3].iter().enumerate() {
+        for (b, &eta) in [-G3, 0.0, G3].iter().enumerate() {
+            let (_, detj) = quad8_b(coords, xi, eta)?;
+            let n = quad8_shapes(xi, eta);
+            for i in 0..8 {
+                for j in 0..8 {
+                    let v = rho * t * detj * W3[a] * W3[b] * n[i] * n[j];
+                    for d in 0..2 {
+                        m[2 * i + d][2 * j + d] += v;
+                    }
+                }
+            }
+        }
+    }
+    Some(m)
+}
+
 /// C3D4 consistent mass, closed form: `rho*V/20` times the
 /// [[2,1,1,1],...] pattern per dof block. `None` for zero volume.
 fn c3d4_mass(coords: &[[f64; 3]; 4], rho: f64) -> Option<[[f64; 12]; 12]> {
@@ -167,7 +192,7 @@ pub(crate) fn assemble_mass(model: &Model, ndof: usize) -> Result<Csr, SolveErro
     for i in 0..n {
         trips.push((i, i, 0.0)); // ensure diagonal entries exist
     }
-    for e in &model.mesh.elements {
+    for (ei, e) in model.mesh.elements.iter().enumerate() {
         let node_idx: Vec<usize> = e
             .connectivity
             .iter()
@@ -184,7 +209,7 @@ pub(crate) fn assemble_mass(model: &Model, ndof: usize) -> Result<Csr, SolveErro
                     .ok_or_else(|| invalid(e.id, "degenerate (zero-area) triangle"))?;
                 scatter(&mut trips, &node_idx, &me, ndof);
             }
-            crate::ElemKind::Cps4 => {
+            crate::ElemKind::Cps4 | crate::ElemKind::Cpe4 => {
                 let coords = [
                     coords2(model, &node_idx, 0),
                     coords2(model, &node_idx, 1),
@@ -194,6 +219,22 @@ pub(crate) fn assemble_mass(model: &Model, ndof: usize) -> Result<Csr, SolveErro
                 let me = cps4_mass(&coords, model.density, model.thickness).ok_or_else(|| {
                     invalid(e.id, "non-positive Jacobian determinant at a Gauss point")
                 })?;
+                scatter(&mut trips, &node_idx, &me, ndof);
+            }
+            crate::ElemKind::Cps8 | crate::ElemKind::Cpe8 => {
+                let coords: [[f64; 2]; 8] = core::array::from_fn(|k| coords2(model, &node_idx, k));
+                let me = cps8_mass(&coords, model.density, model.thickness).ok_or_else(|| {
+                    invalid(e.id, "non-positive Jacobian determinant at a Gauss point")
+                })?;
+                scatter(&mut trips, &node_idx, &me, ndof);
+            }
+            crate::ElemKind::B31 => {
+                let coords = [coords2(model, &node_idx, 0), coords2(model, &node_idx, 1)];
+                let (a, _) = model
+                    .beam_section_for_element(ei)
+                    .ok_or_else(|| invalid(e.id, "no beam section assigned (*BEAM SECTION)"))?;
+                let me = b31_mass(&coords, model.density, a)
+                    .ok_or_else(|| invalid(e.id, "zero-length beam"))?;
                 scatter(&mut trips, &node_idx, &me, ndof);
             }
             crate::ElemKind::C3d8 => {
@@ -612,7 +653,7 @@ pub fn solve_modal(model: &Model, opts: &ModalOptions) -> Result<ModalSolution, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::assembly::tests::{hex_mesh, quad_mesh};
+    use crate::assembly::tests::{beam_mesh, hex_mesh, quad_mesh};
     use crate::tests::solid_model;
     use crate::{BoundaryCondition, ElementSet, Material, Mesh};
 
@@ -687,6 +728,39 @@ mod tests {
             exact
         );
         assert!(sol.iterations <= 100);
+    }
+
+    #[test]
+    fn b31_cantilever_first_bending_frequency() {
+        // 8 Hermite elements, L = 2, 0.1 x 0.1 section: Euler-Bernoulli
+        // f1 = (1.875^2/2pi) sqrt(EI/(rho A L^4)); consistent Hermite
+        // mass converges from above, well inside 2% at 8 elements.
+        let (n, l) = (8, 2.0);
+        let (a, inertia) = (0.01, 1.0e-4 / 12.0);
+        let mut model = steel_model(beam_mesh(n, l), 1.0);
+        model.beam_sections = vec![("all".into(), a, inertia)];
+        model.boundary_conditions = vec![BoundaryCondition {
+            node_ids: vec![1],
+            dofs: vec![1, 2, 3],
+        }];
+        let sol = modes(&model, 3);
+        let exact = 1.875f64 * 1.875 / (2.0 * std::f64::consts::PI)
+            * (E * inertia / (RHO * a * l * l * l * l)).sqrt();
+        let rel = (sol.frequencies_hz[0] - exact) / exact;
+        eprintln!(
+            "b31 cantilever f1: fem={:.4} Hz, analytical={:.4} Hz ({:+.2}%), iters={}",
+            sol.frequencies_hz[0],
+            exact,
+            100.0 * rel,
+            sol.iterations
+        );
+        assert!(
+            rel.abs() <= 0.02,
+            "f1 off by {:.2}% (fem={}, exact={})",
+            100.0 * rel,
+            sol.frequencies_hz[0],
+            exact
+        );
     }
 
     #[test]

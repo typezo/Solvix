@@ -3,8 +3,9 @@
 //! models, 3 once any solid element is present.
 
 use crate::element::{
-    c3d4_stiffness, c3d8_stiffness, cps3_stiffness, cps4_stiffness, d3_matrix, d_matrix, invalid,
-    CentroidB, Constitutive,
+    b31_stiffness, c3d4_stiffness, c3d8_stiffness, cps3_stiffness, cps4_stiffness, cps8_stiffness,
+    d3_matrix, d_matrix, dpe_matrix, invalid, quad8_b, quad8_shapes, CentroidB, Constitutive, G3,
+    W3,
 };
 use crate::{DistributedLoad, ElemKind, LoadState, Model, SolveError};
 
@@ -109,10 +110,14 @@ pub(crate) fn assemble(
             return Err(invalid(e.id, "invalid material constants"));
         }
         let solid = matches!(e.kind, ElemKind::C3d8 | ElemKind::C3d4);
-        if solid && mat.poisson_ratio >= 0.5 {
+        let plane_strain = matches!(e.kind, ElemKind::Cpe4 | ElemKind::Cpe8);
+        if (solid || plane_strain) && mat.poisson_ratio >= 0.5 {
             // 1-2*nu hits the incompressible limit; the plane check above
             // already rejects |nu| >= 1.
-            return Err(invalid(e.id, "poisson ratio must be < 0.5 for solids"));
+            return Err(invalid(
+                e.id,
+                "poisson ratio must be < 0.5 for solids and plane strain",
+            ));
         }
         let node_idx: Vec<usize> = e
             .connectivity
@@ -132,19 +137,74 @@ pub(crate) fn assemble(
                 scatter(&mut trips, &node_idx, &ke, ndof);
                 (b, Constitutive::Plane(d))
             }
-            ElemKind::Cps4 => {
+            ElemKind::Cps4 | ElemKind::Cpe4 => {
                 let coords = [
                     coords2(model, &node_idx, 0),
                     coords2(model, &node_idx, 1),
                     coords2(model, &node_idx, 2),
                     coords2(model, &node_idx, 3),
                 ];
-                let d = d_matrix(mat.youngs_modulus, mat.poisson_ratio);
+                // Same geometry/stiffness code; only the constitutive
+                // matrix switches between the plane families.
+                let strain = e.kind == ElemKind::Cpe4;
+                let d = if strain {
+                    dpe_matrix(mat.youngs_modulus, mat.poisson_ratio)
+                } else {
+                    d_matrix(mat.youngs_modulus, mat.poisson_ratio)
+                };
                 let (ke, b) = cps4_stiffness(&coords, &d, model.thickness).ok_or_else(|| {
                     invalid(e.id, "non-positive Jacobian determinant at a Gauss point")
                 })?;
                 scatter(&mut trips, &node_idx, &ke, ndof);
-                (b, Constitutive::Plane(d))
+                (
+                    b,
+                    if strain {
+                        Constitutive::PlaneStrain(d)
+                    } else {
+                        Constitutive::Plane(d)
+                    },
+                )
+            }
+            ElemKind::Cps8 | ElemKind::Cpe8 => {
+                let coords: [[f64; 2]; 8] = core::array::from_fn(|k| coords2(model, &node_idx, k));
+                let strain = e.kind == ElemKind::Cpe8;
+                let d = if strain {
+                    dpe_matrix(mat.youngs_modulus, mat.poisson_ratio)
+                } else {
+                    d_matrix(mat.youngs_modulus, mat.poisson_ratio)
+                };
+                let (ke, b) = cps8_stiffness(&coords, &d, model.thickness).ok_or_else(|| {
+                    invalid(e.id, "non-positive Jacobian determinant at a Gauss point")
+                })?;
+                scatter(&mut trips, &node_idx, &ke, ndof);
+                (
+                    b,
+                    if strain {
+                        Constitutive::PlaneStrain(d)
+                    } else {
+                        Constitutive::Plane(d)
+                    },
+                )
+            }
+            ElemKind::B31 => {
+                let coords = [coords2(model, &node_idx, 0), coords2(model, &node_idx, 1)];
+                let (a, inertia) = model
+                    .beam_section_for_element(ei)
+                    .ok_or_else(|| invalid(e.id, "no beam section assigned (*BEAM SECTION)"))?;
+                if a <= 0.0 || inertia <= 0.0 {
+                    return Err(invalid(e.id, "beam section needs positive A and I"));
+                }
+                let (ke, b) = b31_stiffness(&coords, mat.youngs_modulus, a, inertia)
+                    .ok_or_else(|| invalid(e.id, "zero-length beam"))?;
+                scatter(&mut trips, &node_idx, &ke, ndof);
+                (
+                    b,
+                    Constitutive::Beam {
+                        e: mat.youngs_modulus,
+                        a,
+                        i: inertia,
+                    },
+                )
             }
             ElemKind::C3d8 => {
                 let coords: [[f64; 3]; 8] =
@@ -217,10 +277,10 @@ fn edge_pressure_forces(
             })?;
         let max_face = match e.kind {
             ElemKind::Cps3 => 3,
-            ElemKind::Cps4 => 4,
+            ElemKind::Cps4 | ElemKind::Cpe4 => 4,
             _ => {
                 return Err(SolveError::InvalidModel(format!(
-                    "edge pressure on element {} ({:?}) unsupported (v0.3: CPS3/CPS4)",
+                    "edge pressure on element {} ({:?}) unsupported (linear quad/tri edges only)",
                     e.id, e.kind
                 )))
             }
@@ -259,8 +319,9 @@ fn edge_pressure_forces(
 }
 
 /// Gravity body force: per element `f = rho * t * A * g * dir`, lumped by
-/// the shape-function integral (equal quarters for CPS4, thirds for
-/// CPS3). Plane elements only in v0.3.
+/// the shape-function integral (equal quarters for the linear quads,
+/// thirds for CPS3, 3x3 Gauss weights for the quadratic quads, equal
+/// halves for beams). Plane elements and B31 beams only.
 fn gravity_forces(
     model: &Model,
     gravity: Option<(f64, [f64; 3])>,
@@ -276,13 +337,14 @@ fn gravity_forces(
             "gravity direction has no in-plane component".into(),
         ));
     }
-    for e in &model.mesh.elements {
+    for (ei, e) in model.mesh.elements.iter().enumerate() {
         let idx: Vec<usize> = e
             .connectivity
             .iter()
             .map(|&nid| model.mesh.node_index(nid).unwrap())
             .collect();
-        let per = match e.kind {
+        // Nodal force magnitudes (before the direction split).
+        let per: Vec<f64> = match e.kind {
             ElemKind::Cps3 => {
                 let p = [
                     coords2(model, &idx, 0),
@@ -291,9 +353,9 @@ fn gravity_forces(
                 ];
                 let cross = (p[1][0] - p[0][0]) * (p[2][1] - p[0][1])
                     - (p[1][1] - p[0][1]) * (p[2][0] - p[0][0]);
-                model.density * model.thickness * cross.abs() / 2.0 * g / 3.0
+                vec![model.density * model.thickness * cross.abs() / 2.0 * g / 3.0; 3]
             }
-            ElemKind::Cps4 => {
+            ElemKind::Cps4 | ElemKind::Cpe4 => {
                 let p: Vec<[f64; 2]> = (0..4).map(|k| coords2(model, &idx, k)).collect();
                 let mut shoelace = 0.0;
                 for k in 0..4 {
@@ -301,17 +363,43 @@ fn gravity_forces(
                     let b = p[(k + 1) % 4];
                     shoelace += a[0] * b[1] - b[0] * a[1];
                 }
-                model.density * model.thickness * shoelace.abs() / 2.0 * g / 4.0
+                vec![model.density * model.thickness * shoelace.abs() / 2.0 * g / 4.0; 4]
+            }
+            ElemKind::Cps8 | ElemKind::Cpe8 => {
+                // Consistent lumping: rho*t*g*sum(w*detJ*N_i) over 3x3.
+                let coords: [[f64; 2]; 8] = core::array::from_fn(|k| coords2(model, &idx, k));
+                let mut w_i = [0.0; 8];
+                for (a, &xi) in [-G3, 0.0, G3].iter().enumerate() {
+                    for (b, &eta) in [-G3, 0.0, G3].iter().enumerate() {
+                        let (_, detj) = quad8_b(&coords, xi, eta).ok_or_else(|| {
+                            invalid(e.id, "non-positive Jacobian determinant at a Gauss point")
+                        })?;
+                        let wgt = W3[a] * W3[b] * model.density * model.thickness * g;
+                        for (wi, &ni) in w_i.iter_mut().zip(&quad8_shapes(xi, eta)) {
+                            *wi += wgt * detj * ni;
+                        }
+                    }
+                }
+                w_i.to_vec()
+            }
+            ElemKind::B31 => {
+                let (a, _) = model
+                    .beam_section_for_element(ei)
+                    .ok_or_else(|| invalid(e.id, "no beam section assigned (*BEAM SECTION)"))?;
+                let p0 = model.mesh.nodes[idx[0]].coords;
+                let p1 = model.mesh.nodes[idx[1]].coords;
+                let l = ((p1[0] - p0[0]).powi(2) + (p1[1] - p0[1]).powi(2)).sqrt();
+                vec![model.density * a * l * g / 2.0; 2]
             }
             _ => {
                 return Err(SolveError::InvalidModel(
-                    "gravity on solid elements unsupported (v0.3: plane only)".into(),
+                    "gravity on solid elements unsupported (plane and beam only)".into(),
                 ))
             }
         };
-        for &i in &idx {
-            f[i * ndof] += per * dir2[0];
-            f[i * ndof + 1] += per * dir2[1];
+        for (&i, &p) in idx.iter().zip(&per) {
+            f[i * ndof] += p * dir2[0];
+            f[i * ndof + 1] += p * dir2[1];
         }
     }
     Ok(())
@@ -402,6 +490,77 @@ pub(crate) mod tests {
         Mesh { nodes, elements }
     }
 
+    // Structured nx*ny quad8 mesh of a width x height rectangle over a
+    // (2nx+1)x(2ny+1) grid, SKIPPING the (odd, odd) points — those are
+    // element centers, not serendipity nodes, and would sit unreferenced
+    // (zero stiffness rows). Ids are sequential in row-major order of the
+    // kept nodes; connectivity is corners CCW, then midsides 1-2, 2-3,
+    // 3-4, 4-1.
+    pub(crate) fn quad8_mesh(nx: usize, ny: usize, width: f64, height: f64) -> Mesh {
+        let (gnx, gny) = (2 * nx + 1, 2 * ny + 1);
+        let mut id_of = vec![0u32; gnx * gny];
+        let mut nodes = Vec::new();
+        let mut next = 0u32;
+        for j in 0..gny {
+            for i in 0..gnx {
+                if i % 2 == 1 && j % 2 == 1 {
+                    continue;
+                }
+                next += 1;
+                id_of[j * gnx + i] = next;
+                nodes.push(Node {
+                    id: next,
+                    coords: [
+                        width * i as f64 / (2 * nx) as f64,
+                        height * j as f64 / (2 * ny) as f64,
+                        0.0,
+                    ],
+                });
+            }
+        }
+        let nid = |i: usize, j: usize| id_of[j * gnx + i];
+        let mut elements = Vec::with_capacity(nx * ny);
+        for j in 0..ny {
+            for i in 0..nx {
+                let c = (2 * i, 2 * j);
+                elements.push(Element {
+                    id: (j * nx + i + 1) as u32,
+                    kind: ElemKind::Cps8,
+                    connectivity: vec![
+                        nid(c.0, c.1),
+                        nid(c.0 + 2, c.1),
+                        nid(c.0 + 2, c.1 + 2),
+                        nid(c.0, c.1 + 2),
+                        nid(c.0 + 1, c.1),
+                        nid(c.0 + 2, c.1 + 1),
+                        nid(c.0 + 1, c.1 + 2),
+                        nid(c.0, c.1 + 1),
+                    ],
+                });
+            }
+        }
+        Mesh { nodes, elements }
+    }
+
+    // n-element B31 chain along x over [0, l], node/element ids from 1.
+    pub(crate) fn beam_mesh(n: usize, l: f64) -> Mesh {
+        Mesh {
+            nodes: (0..=n)
+                .map(|i| Node {
+                    id: (i + 1) as u32,
+                    coords: [l * i as f64 / n as f64, 0.0, 0.0],
+                })
+                .collect(),
+            elements: (1..=n)
+                .map(|i| Element {
+                    id: i as u32,
+                    kind: ElemKind::B31,
+                    connectivity: vec![i as u32, i as u32 + 1],
+                })
+                .collect(),
+        }
+    }
+
     pub(crate) fn model_with_mesh(mesh: Mesh) -> Model {
         let n_elem = mesh.elements.len();
         Model {
@@ -418,6 +577,7 @@ pub(crate) mod tests {
                 element_ids: (1..=n_elem as u32).collect(),
             }],
             mat_assignments: vec![("all".into(), "mat".into())],
+            beam_sections: Vec::new(),
             density: 1.0,
             boundary_conditions: vec![BoundaryCondition {
                 node_ids: vec![1],

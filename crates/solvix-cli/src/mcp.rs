@@ -345,7 +345,7 @@ impl Default for McpState {
 }
 
 const TOOL_INFO: &str = r#"{"name":"solvix_info","description":"Parse a Solvix .inp deck and report mesh, BC and load statistics without solving. Units: SI in (m, N, Pa).","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Path to the .inp deck (SI units: m, N, Pa)"}},"required":["path"]}}"#;
-const TOOL_RUN: &str = r#"{"name":"solvix_run","description":"Parse, solve and write <jobname>.vtu for a .inp deck; returns the run summary with solver_method (pcg or ldlt) and cond_estimate (a diagonal conditioning indicator). Units: SI in (m, N, Pa); mm and MPa out.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Path to the .inp deck (SI units: m, N, Pa)"},"outdir":{"type":"string","description":"Output directory for the .vtu file (default: working directory)"}},"required":["path"]}}"#;
+const TOOL_RUN: &str = r#"{"name":"solvix_run","description":"Parse, solve and write <jobname>.vtu for a .inp deck; returns the run summary with solver_method (pcg or ldlt) and cond_estimate (a diagonal conditioning indicator). Optional \"modes\": N also extracts the N lowest natural frequencies (modal analysis; JSON gains modes and frequencies_hz). Units: SI in (m, N, Pa); mm and MPa out.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Path to the .inp deck (SI units: m, N, Pa)"},"outdir":{"type":"string","description":"Output directory for the .vtu file (default: working directory)"},"modes":{"type":"integer","minimum":1,"description":"Also extract the N lowest natural frequencies (modal analysis)"}},"required":["path"]}}"#;
 const TOOL_RESULTS: &str = r#"{"name":"solvix_results","description":"Solve a .inp deck (reuses a cached solution per path) and return per-node displacements plus nodal and element von Mises arrays. Units: SI in (m, N, Pa); mm and MPa out.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Path to the .inp deck (SI units: m, N, Pa)"}},"required":["path"]}}"#;
 const TOOL_BENCH: &str = r#"{"name":"solvix_bench","description":"Run the built-in verification suite (cantilever40x4, kirsch, patch_cps4) and report values vs analytical references with pass/fail gates. Metrics in mm / MPa.","inputSchema":{"type":"object","properties":{},"required":[]}}"#;
 
@@ -387,6 +387,21 @@ fn tool_info(args: &Json) -> Result<String, (Stage, String)> {
     Ok(info_json(&info_report(&model, &job_name(path), &report)))
 }
 
+/// Optional non-negative integer argument (validated further by
+/// `solve_modal`, which rejects `num_modes` outside `1..free_dof_count`);
+/// `None` when absent or not a JSON number — the run stays static-only.
+fn arg_modes(args: &Json) -> Option<usize> {
+    let n = match args.get("modes") {
+        Some(Json::Num(n)) => *n,
+        _ => return None,
+    };
+    if n.fract() == 0.0 && n >= 0.0 && n <= u32::MAX as f64 {
+        Some(n as usize)
+    } else {
+        None
+    }
+}
+
 fn tool_run(args: &Json) -> Result<String, (Stage, String)> {
     let path = arg_str(args, "path")?;
     let outdir = args
@@ -398,6 +413,14 @@ fn tool_run(args: &Json) -> Result<String, (Stage, String)> {
     let (model, _) = parse_deck(&text)?;
     let t0 = std::time::Instant::now();
     let sol = solvix_core::solve(&model).map_err(|e| (Stage::Solve, solve_error_message(e)))?;
+    let frequencies_hz = match arg_modes(args) {
+        Some(n) => {
+            solvix_core::solve_modal(&model, &solvix_core::ModalOptions { num_modes: n })
+                .map_err(|e| (Stage::Solve, solve_error_message(e)))?
+                .frequencies_hz
+        }
+        None => Vec::new(),
+    };
     let solve_ms = t0.elapsed().as_millis() as u64;
     std::fs::create_dir_all(&outdir)
         .map_err(|e| (Stage::Io, format!("cannot create directory {outdir}: {e}")))?;
@@ -410,6 +433,7 @@ fn tool_run(args: &Json) -> Result<String, (Stage, String)> {
         &job_name(path),
         solve_ms,
         vec![vtu.display().to_string()],
+        frequencies_hz,
     );
     Ok(success_json(&s))
 }
@@ -853,6 +877,69 @@ mod tests {
         );
         std::fs::remove_file(p).ok();
         std::fs::remove_dir_all(outdir).ok();
+    }
+
+    #[test]
+    fn call_run_with_modes_returns_frequencies() {
+        let mut s = McpState::new();
+        let p = tmp_deck("runmodes");
+        let outdir = std::env::temp_dir()
+            .join(format!("solvix-mcp-test-{}-runmodes", std::process::id()))
+            .display()
+            .to_string();
+        let resp = call_tool(
+            &mut s,
+            "solvix_run",
+            &format!(r#"{{"path":"{p}","outdir":"{outdir}","modes":2}}"#),
+        );
+        assert!(resp.contains(r#""isError":false"#), "{resp}");
+        let payload = text_of(&resp);
+        assert!(payload.contains(r#""modes":2,"#), "{payload}");
+        let start = payload
+            .find(r#""frequencies_hz":["#)
+            .expect("frequencies present");
+        let freq_json = &payload[start..];
+        let freqs = freq_json
+            .trim_start_matches(r#""frequencies_hz":["#)
+            .split([',', ']'])
+            .filter_map(|t| t.parse::<f64>().ok())
+            .collect::<Vec<_>>();
+        assert_eq!(freqs.len(), 2, "{payload}");
+        assert!(freqs[0] > 0.0 && freqs[1] > freqs[0], "{payload}");
+        assert!(payload.ends_with(r#"}"#), "{payload}");
+        std::fs::remove_file(p).ok();
+        std::fs::remove_dir_all(outdir).ok();
+    }
+
+    #[test]
+    fn call_run_modes_garbage_is_static_only() {
+        let mut s = McpState::new();
+        let p = tmp_deck("runmodes2");
+        let resp = call_tool(
+            &mut s,
+            "solvix_run",
+            &format!(r#"{{"path":"{p}","outdir":".","modes":"many"}}"#),
+        );
+        assert!(resp.contains(r#""isError":false"#), "{resp}");
+        let payload = text_of(&resp);
+        assert!(!payload.contains("frequencies_hz"), "{payload}");
+        std::fs::remove_file(&p).ok();
+        std::fs::remove_file(format!("{}.vtu", p.trim_end_matches(".inp"))).ok();
+    }
+
+    #[test]
+    fn call_run_modes_zero_is_solve_error() {
+        let mut s = McpState::new();
+        let p = tmp_deck("runmodes3");
+        let resp = call_tool(
+            &mut s,
+            "solvix_run",
+            &format!(r#"{{"path":"{p}","outdir":".","modes":0}}"#),
+        );
+        assert!(resp.contains(r#""isError":true"#), "{resp}");
+        let payload = text_of(&resp);
+        assert!(payload.contains("num_modes"), "{payload}");
+        std::fs::remove_file(p).ok();
     }
 
     #[test]

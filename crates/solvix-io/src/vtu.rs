@@ -51,10 +51,13 @@ pub(super) fn write_vtu(path: &Path, model: &Model, solution: &Solution) -> std:
     s.push_str("        <DataArray type=\"Int64\" Name=\"types\" format=\"ascii\">\n          ");
     for e in elements {
         let vtk_type = match e.kind {
-            ElemKind::Cps3 => 5,  // VTK_TRIANGLE
-            ElemKind::Cps4 => 9,  // VTK_QUAD
-            ElemKind::C3d8 => 12, // VTK_HEXAHEDRON
-            ElemKind::C3d4 => 10, // VTK_TETRA
+            ElemKind::Cps3 => 5,                   // VTK_TRIANGLE
+            ElemKind::Cps4 => 9,                   // VTK_QUAD
+            ElemKind::Cps8 | ElemKind::Cpe8 => 23, // VTK_QUADRATIC_QUAD
+            ElemKind::Cpe4 => 9,                   // VTK_QUAD
+            ElemKind::C3d8 => 12,                  // VTK_HEXAHEDRON
+            ElemKind::C3d4 => 10,                  // VTK_TETRA
+            ElemKind::B31 => 3,                    // VTK_LINE
         };
         s.push_str(&format!("{vtk_type} "));
     }
@@ -161,5 +164,50 @@ mod tests {
         assert!(xml.contains("42.5"));
         assert!(xml.contains("7.25"));
         assert!(xml.trim_end().ends_with("</VTKFile>"));
+    }
+
+    #[test]
+    fn vtu_types_for_new_kinds() {
+        // CPS8/CPE8 -> VTK_QUADRATIC_QUAD (23), B31 -> VTK_LINE (3).
+        let model = Model {
+            mesh: Mesh {
+                nodes: (1..=11)
+                    .map(|i| Node {
+                        id: i,
+                        coords: [i as f64, 0.0, 0.0],
+                    })
+                    .collect(),
+                elements: vec![
+                    Element {
+                        id: 1,
+                        kind: ElemKind::Cps8,
+                        connectivity: vec![1, 2, 3, 4, 5, 6, 7, 8],
+                    },
+                    Element {
+                        id: 2,
+                        kind: ElemKind::Cpe8,
+                        connectivity: vec![1, 2, 3, 4, 5, 6, 7, 8],
+                    },
+                    Element {
+                        id: 3,
+                        kind: ElemKind::Cpe4,
+                        connectivity: vec![1, 2, 3, 4],
+                    },
+                    Element {
+                        id: 4,
+                        kind: ElemKind::B31,
+                        connectivity: vec![9, 10],
+                    },
+                ],
+            },
+            thickness: 1.0,
+            ..Model::default()
+        };
+        let path =
+            std::env::temp_dir().join(format!("solvix_io_vtu_kinds_{}.vtu", std::process::id()));
+        write_vtu(&path, &model, &Solution::default()).unwrap();
+        let xml = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(xml.contains("23 23 9 3"), "types line: {xml}");
     }
 }

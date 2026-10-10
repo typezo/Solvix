@@ -29,19 +29,31 @@ pub struct Node {
     pub coords: [f64; 3],
 }
 
-/// Supported element kinds: 2D plane stress (2 dofs/node) and 3D linear
-/// solids (3 dofs/node). Plane and solid kinds cannot be mixed in one
-/// model (rejected with `InvalidModel("mixed dimensionality")`).
+/// Supported element kinds: plane stress/strain (2 dofs/node), 3D
+/// linear solids and 2D beams (3 dofs/node). Plane and solid kinds
+/// cannot be mixed in one model (rejected with
+/// `InvalidModel("mixed dimensionality")`); beams cannot be mixed with
+/// any continuum kind (v1: B31-only models — their third dof is rotz,
+/// which no continuum kind shares).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ElemKind {
     /// 3-node linear triangle, plane stress.
     Cps3,
     /// 4-node bilinear quadrilateral, plane stress.
     Cps4,
+    /// 8-node serendipity quadrilateral, plane stress, 3x3 Gauss.
+    Cps8,
+    /// 4-node bilinear quadrilateral, plane strain.
+    Cpe4,
+    /// 8-node serendipity quadrilateral, plane strain, 3x3 Gauss.
+    Cpe8,
     /// 8-node trilinear hexahedron, 2x2x2 Gauss.
     C3d8,
     /// 4-node constant-strain tetrahedron.
     C3d4,
+    /// 2-node Euler-Bernoulli beam in the xy-plane (ux, uy, rotz);
+    /// section A and I from [`Model::beam_sections`].
+    B31,
 }
 
 impl ElemKind {
@@ -49,9 +61,10 @@ impl ElemKind {
     pub fn node_count(&self) -> usize {
         match self {
             ElemKind::Cps3 => 3,
-            ElemKind::Cps4 => 4,
-            ElemKind::C3d8 => 8,
+            ElemKind::Cps4 | ElemKind::Cpe4 => 4,
+            ElemKind::Cps8 | ElemKind::Cpe8 | ElemKind::C3d8 => 8,
             ElemKind::C3d4 => 4,
+            ElemKind::B31 => 2,
         }
     }
 }
@@ -164,8 +177,12 @@ pub struct Model {
     pub density: f64,
     pub materials: Vec<Material>,
     pub elsets: Vec<ElementSet>,
-    /// (elset name, material name) pairs from `*SOLID SECTION`.
+    /// (elset name, material name) pairs from `*SOLID SECTION` and
+    /// `*BEAM SECTION`.
     pub mat_assignments: Vec<(String, String)>,
+    /// (elset name, area A, second moment I) pairs from `*BEAM SECTION`
+    /// (B31 elements).
+    pub beam_sections: Vec<(String, f64, f64)>,
     pub boundary_conditions: Vec<BoundaryCondition>,
     pub cloads: Vec<ConcentratedLoad>,
     pub steps: Vec<Step>,
@@ -182,6 +199,7 @@ impl Default for Model {
             materials: Vec::new(),
             elsets: Vec::new(),
             mat_assignments: Vec::new(),
+            beam_sections: Vec::new(),
             boundary_conditions: Vec::new(),
             cloads: Vec::new(),
             steps: Vec::new(),
@@ -207,6 +225,21 @@ impl Model {
             if let Some(set) = self.elsets.iter().find(|s| &s.name == elset) {
                 if set.element_ids.contains(&elem.id) {
                     return self.materials.iter().find(|m| &m.name == mat);
+                }
+            }
+        }
+        None
+    }
+
+    /// Beam section (area, second moment) assigned to the element at
+    /// `elem_index`, if any. Same elset resolution as
+    /// [`Model::material_for_element`].
+    pub fn beam_section_for_element(&self, elem_index: usize) -> Option<(f64, f64)> {
+        let elem = self.mesh.elements.get(elem_index)?;
+        for (elset, a, i) in &self.beam_sections {
+            if let Some(set) = self.elsets.iter().find(|s| &s.name == elset) {
+                if set.element_ids.contains(&elem.id) {
+                    return Some((*a, *i));
                 }
             }
         }
@@ -454,17 +487,32 @@ pub fn solve_with_method(model: &Model, method: Method) -> Result<Solution, Solv
 }
 
 /// Dofs per node for the model: 2 while every element is a plane kind,
-/// 3 once any C3D8/C3D4 solid is present. Mixing plane and solid kinds
-/// in one model is rejected: there is no formulation that shares a
-/// stiffness matrix between them.
+/// 3 once any C3D8/C3D4 solid or B31 beam is present. Mixing plane and
+/// solid kinds in one model is rejected: there is no formulation that
+/// shares a stiffness matrix between them. Beams must likewise live in
+/// B31-only models: their third dof is rotz, not a translation, so
+/// sharing the 3-dof layout with solids or the 2-dof one with plane
+/// elements is meaningless.
 pub(crate) fn ndof_per_node(model: &Model) -> Result<usize, SolveError> {
     let mut plane = false;
     let mut solid = false;
+    let mut beam = false;
     for e in &model.mesh.elements {
         match e.kind {
-            ElemKind::Cps3 | ElemKind::Cps4 => plane = true,
+            ElemKind::Cps3 | ElemKind::Cps4 | ElemKind::Cps8 | ElemKind::Cpe4 | ElemKind::Cpe8 => {
+                plane = true
+            }
             ElemKind::C3d8 | ElemKind::C3d4 => solid = true,
+            ElemKind::B31 => beam = true,
         }
+    }
+    if beam && (plane || solid) {
+        return Err(SolveError::InvalidModel(
+            "mixed beam and continuum elements (v1: B31-only models)".into(),
+        ));
+    }
+    if beam {
+        return Ok(3);
     }
     match (plane, solid) {
         (true, true) => Err(SolveError::InvalidModel("mixed dimensionality".into())),
@@ -762,6 +810,7 @@ mod tests {
                 element_ids: vec![1, 2],
             }],
             mat_assignments: vec![("all".into(), "steel".into())],
+            beam_sections: Vec::new(),
             boundary_conditions: vec![
                 BoundaryCondition {
                     node_ids: vec![1, 4],
@@ -954,6 +1003,334 @@ mod tests {
                 peak > 2.4e6,
                 "{method:?}: max nodal von Mises {peak:.4e} Pa, want > 2.4 MPa (Kirsch 3.0 MPa)"
             );
+        }
+    }
+
+    fn quad8_model(nx: usize, ny: usize, width: f64, height: f64) -> Model {
+        let n_elem = (nx * ny) as u32;
+        Model {
+            mesh: assembly::tests::quad8_mesh(nx, ny, width, height),
+            thickness: 1.0,
+            materials: vec![steel()],
+            elsets: vec![ElementSet {
+                name: "all".into(),
+                element_ids: (1..=n_elem).collect(),
+            }],
+            mat_assignments: vec![("all".into(), "steel".into())],
+            ..Default::default()
+        }
+    }
+
+    /// 0.1 x 0.1 square section: A = 0.01, I = b*h^3/12 = 1e-4/12.
+    const BEAM_A: f64 = 0.01;
+    const BEAM_I: f64 = 1.0e-4 / 12.0;
+
+    fn beam_model(n: usize, l: f64) -> Model {
+        Model {
+            mesh: assembly::tests::beam_mesh(n, l),
+            thickness: 1.0, // unused by beams
+            density: 7850.0,
+            materials: vec![steel()],
+            elsets: vec![ElementSet {
+                name: "all".into(),
+                element_ids: (1..=n as u32).collect(),
+            }],
+            mat_assignments: vec![("all".into(), "steel".into())],
+            beam_sections: vec![("all".into(), BEAM_A, BEAM_I)],
+            ..Default::default()
+        }
+    }
+
+    /// Node id at (x, y) — patch tests address nodes by coordinate, not
+    /// by the quad8 mesh's renumbered ids.
+    fn node_at(model: &Model, x: f64, y: f64) -> u32 {
+        model
+            .mesh
+            .nodes
+            .iter()
+            .find(|n| (n.coords[0] - x).abs() < 1e-12 && (n.coords[1] - y).abs() < 1e-12)
+            .map(|n| n.id)
+            .unwrap_or_else(|| panic!("no node at ({x}, {y})"))
+    }
+
+    #[test]
+    fn cps8_patch_2x2() {
+        // 2x2 quad8 mesh: every emitted node is referenced (element
+        // centers are skipped by the mesh helper). Uniform x-traction
+        // via consistent quadratic-edge loads on the right edge.
+        let mut model = quad8_model(2, 2, 1.0, 1.0);
+        let left: Vec<u32> = (0..=4)
+            .map(|j| node_at(&model, 0.0, j as f64 * 0.25))
+            .collect();
+        model.boundary_conditions = vec![
+            BoundaryCondition {
+                node_ids: left,
+                dofs: vec![1],
+            },
+            BoundaryCondition {
+                node_ids: vec![1],
+                dofs: vec![2],
+            },
+        ];
+        // Two quadratic edges of length 1/2: edge corners sigma*t*L/6,
+        // midsides 2*sigma*t*L/3; the shared middle corner takes two
+        // corner shares.
+        let sigma = 1e6;
+        let (c, m) = (sigma / 12.0, sigma / 3.0);
+        let loads = [
+            (1.0f64, 0.0, c),
+            (1.0, 0.25, m),
+            (1.0, 0.5, 2.0 * c),
+            (1.0, 0.75, m),
+            (1.0, 1.0, c),
+        ];
+        model.cloads = loads
+            .iter()
+            .map(|&(x, y, v)| ConcentratedLoad {
+                node_id: node_at(&model, x, y),
+                dof: 1,
+                value: v,
+            })
+            .collect();
+        for method in BOTH_METHODS {
+            let sol = solve_with_method(&model, method).unwrap();
+            // Quadratic serendipity reproduces constant strain exactly
+            // in every element.
+            for (i, &vm) in sol.von_mises.iter().enumerate() {
+                assert!((vm - sigma).abs() / sigma < 1e-8, "element {i}: vM={vm}");
+            }
+            // Constant stress field: nodal extrapolation exact at every
+            // referenced node.
+            assert_eq!(sol.nodal_von_mises.len(), model.mesh.nodes.len());
+            for (i, &nvm) in sol.nodal_von_mises.iter().enumerate() {
+                assert!((nvm - sigma).abs() / sigma < 1e-8, "node {i}: vM={nvm}");
+            }
+            let ux_right = sigma / E;
+            for j in 0..=4 {
+                let nid = node_at(&model, 1.0, j as f64 * 0.25);
+                let i = model.mesh.node_index(nid).unwrap();
+                assert!(
+                    (sol.displacements[i][0] - ux_right).abs() / ux_right < 1e-8,
+                    "node {nid}: ux={}",
+                    sol.displacements[i][0]
+                );
+            }
+            let rx: f64 = sol
+                .reactions
+                .iter()
+                .filter(|r| r.dof == 1)
+                .map(|r| r.value)
+                .sum();
+            assert!((rx + sigma).abs() < 1e-6 * sigma);
+        }
+    }
+
+    #[test]
+    fn cps8_cantilever_beats_cps4() {
+        // Same L=2, h=0.1, t=0.1 cantilever, P = 1e4 at the tip:
+        // Euler-Bernoulli 15.238 mm. 20x2 CPS8 (40 nodes-worth of dofs)
+        // must beat 40x4 CPS4 (41 nodes) — quadratics do not shear-lock.
+        let (l, h) = (2.0, 0.1);
+        let p = -1.0e4;
+        let inertia = 0.1 * h * h * h / 12.0;
+        let beam = p * l * l * l / (3.0 * E * inertia);
+        let tip_deflection = |model: &Model, tip: u32| {
+            let sol = solve(model).unwrap();
+            let i = model.mesh.node_index(tip).unwrap();
+            (sol.displacements[i][1] - beam) / beam
+        };
+        // CPS8 20x2.
+        let mut m8 = quad8_model(20, 2, l, h);
+        m8.thickness = 0.1;
+        let root8: Vec<u32> = (0..=4)
+            .map(|j| node_at(&m8, 0.0, j as f64 * h / 4.0))
+            .collect();
+        m8.boundary_conditions = vec![BoundaryCondition {
+            node_ids: root8,
+            dofs: vec![1, 2],
+        }];
+        let tip8 = node_at(&m8, l, h / 2.0);
+        m8.cloads = vec![ConcentratedLoad {
+            node_id: tip8,
+            dof: 2,
+            value: p,
+        }];
+        let rel8 = tip_deflection(&m8, tip8);
+        // CPS4 40x4 (the c3d8-test geometry, plane stress).
+        let mut m4 = quad_model(40, 4, l, h);
+        m4.thickness = 0.1;
+        let root4: Vec<u32> = (0..=4)
+            .map(|j| node_at(&m4, 0.0, j as f64 * h / 4.0))
+            .collect();
+        m4.boundary_conditions = vec![BoundaryCondition {
+            node_ids: root4,
+            dofs: vec![1, 2],
+        }];
+        let tip4 = node_at(&m4, l, h / 2.0);
+        m4.cloads = vec![ConcentratedLoad {
+            node_id: tip4,
+            dof: 2,
+            value: p,
+        }];
+        let rel4 = tip_deflection(&m4, tip4);
+        eprintln!(
+            "cantilever L=2: cps8 20x2 rel={rel8:+.3}%  cps4 40x4 rel={rel4:+.3}% (beam {beam:.6e} m)"
+        );
+        assert!(
+            rel8.abs() < rel4.abs(),
+            "CPS8 20x2 ({rel8:.3}%) must beat CPS4 40x4 ({rel4:.3}%)"
+        );
+        assert!(rel8.abs() < 0.03, "CPS8 error {rel8:.3}% not < 3%");
+    }
+
+    #[test]
+    fn cpe4_patch_matches_plane_strain_theory() {
+        // Traction-controlled uniaxial stress: sigma_xx = sigma in both
+        // plane stress and plane strain, but the stiffness differs.
+        let sigma = 1e6;
+        let mut cpe = quad_model(1, 1, 1.0, 1.0);
+        for e in &mut cpe.mesh.elements {
+            e.kind = ElemKind::Cpe4;
+        }
+        fix_left_edge_x(&mut cpe, 1, 1);
+        cpe.cloads = vec![
+            ConcentratedLoad {
+                node_id: 2,
+                dof: 1,
+                value: sigma / 2.0,
+            },
+            ConcentratedLoad {
+                node_id: 4,
+                dof: 1,
+                value: sigma / 2.0,
+            },
+        ];
+        // ... and the plane-stress twin for contrast.
+        let mut cps = quad_model(1, 1, 1.0, 1.0);
+        fix_left_edge_x(&mut cps, 1, 1);
+        cps.cloads = cpe.cloads.clone();
+        for method in BOTH_METHODS {
+            let spe = solve_with_method(&cpe, method).unwrap();
+            // sigma_zz = nu*sigma -> vM = sigma*sqrt(1 - nu + nu^2).
+            let vm_exact = sigma * (1.0 - NU + NU * NU).sqrt();
+            assert!(
+                (spe.von_mises[0] - vm_exact).abs() / vm_exact < 1e-6,
+                "vM={} vs {}",
+                spe.von_mises[0],
+                vm_exact
+            );
+            // Stiffer in-plane: uniaxial STRESS compliance from the
+            // plane-strain D inverse: eps_x = sigma(1-nu^2)/E,
+            // eps_y = -nu(1+nu) sigma/E.
+            let ux = sigma * (1.0 - NU * NU) / E;
+            for &nid in &[2u32, 4] {
+                let i = cpe.mesh.node_index(nid).unwrap();
+                assert!(
+                    (spe.displacements[i][0] - ux).abs() / ux < 1e-6,
+                    "node {nid}: ux={}",
+                    spe.displacements[i][0]
+                );
+            }
+            // eps_y = -nu(1+nu)*sigma/E (vs -nu*sigma/E for plane stress).
+            let uy = -NU * (1.0 + NU) * sigma / E;
+            let top = cpe.mesh.node_index(4).unwrap();
+            assert!((spe.displacements[top][1] - uy).abs() / uy.abs() < 1e-6);
+            let sps = solve_with_method(&cps, method).unwrap();
+            assert!((sps.von_mises[0] - sigma).abs() / sigma < 1e-6);
+            assert!((sps.von_mises[0] - spe.von_mises[0]).abs() / sigma > 1e-3);
+        }
+    }
+
+    #[test]
+    fn b31_cantilever_tip_deflection_exact() {
+        // One Hermite element: exact for a tip point load.
+        let l = 2.0;
+        let p = -1.0e4;
+        let mut model = beam_model(1, l);
+        model.boundary_conditions = vec![BoundaryCondition {
+            node_ids: vec![1],
+            dofs: vec![1, 2, 3],
+        }];
+        model.cloads = vec![ConcentratedLoad {
+            node_id: 2,
+            dof: 2,
+            value: p,
+        }];
+        for method in BOTH_METHODS {
+            let sol = solve_with_method(&model, method).unwrap();
+            let beam = p * l * l * l / (3.0 * E * BEAM_I);
+            let delta = sol.displacements[1][1];
+            assert!(
+                ((delta - beam) / beam).abs() < 1e-6,
+                "{method:?}: tip={delta:.6e}, beam={beam:.6e}"
+            );
+            // Rotations match v' = PL^2/2EI at the tip; the nodal fiber
+            // stress at the clamp is M*c/I = PL*(h/2)/I = 120 MPa (the
+            // element centroid value is the mid-span one, PL/2 -> half).
+            let rot = p * l * l / (2.0 * E * BEAM_I);
+            assert!((sol.displacements[1][2] - rot).abs() / rot.abs() < 1e-6);
+            let sigma = p.abs() * l * 0.05 / BEAM_I;
+            assert!(
+                (sol.nodal_von_mises[0] - sigma).abs() / sigma < 1e-6,
+                "clamp vM={} vs {sigma}",
+                sol.nodal_von_mises[0]
+            );
+            assert!((sol.von_mises[0] - sigma / 2.0).abs() / sigma < 1e-6);
+            // Reactions balance: R_y = -P, M = PL.
+            let ry: f64 = sol
+                .reactions
+                .iter()
+                .filter(|r| r.dof == 2)
+                .map(|r| r.value)
+                .sum();
+            assert!((ry + p).abs() < 1e-6 * p.abs());
+            let rm: f64 = sol
+                .reactions
+                .iter()
+                .filter(|r| r.dof == 3)
+                .map(|r| r.value)
+                .sum();
+            assert!((rm - p.abs() * l).abs() < 1e-6 * p.abs() * l);
+        }
+    }
+
+    #[test]
+    fn mixed_beam_and_plane_is_invalid() {
+        let mut model = beam_model(1, 1.0);
+        model.mesh.nodes.push(Node {
+            id: 3,
+            coords: [1.0, 1.0, 0.0],
+        });
+        model.mesh.nodes.push(Node {
+            id: 4,
+            coords: [0.0, 1.0, 0.0],
+        });
+        model.mesh.elements.push(Element {
+            id: 2,
+            kind: ElemKind::Cps4,
+            connectivity: vec![1, 2, 3, 4],
+        });
+        model.boundary_conditions = vec![BoundaryCondition {
+            node_ids: vec![1],
+            dofs: vec![1, 2, 3],
+        }];
+        match solve(&model) {
+            Err(SolveError::InvalidModel(m)) => assert!(m.contains("B31-only")),
+            other => panic!("expected InvalidModel(B31-only), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inverted_quad8_is_invalid_model() {
+        let mut model = quad8_model(1, 1, 1.0, 1.0);
+        model.mesh.elements[0].connectivity.swap(1, 3); // clockwise corners
+        model.boundary_conditions = vec![BoundaryCondition {
+            node_ids: vec![1],
+            dofs: vec![1, 2],
+        }];
+        match solve(&model) {
+            Err(SolveError::InvalidModel(m)) => assert!(m.contains("Jacobian")),
+            other => panic!("expected InvalidModel(Jacobian), got {other:?}"),
         }
     }
 

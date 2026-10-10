@@ -514,6 +514,42 @@ input[type="checkbox"] {
   font-size: 11px;
 }
 
+.mode-list {
+  position: absolute;
+  bottom: 40px;
+  left: 9px;
+  display: flex;
+  gap: 5px;
+  flex-wrap: wrap;
+  max-width: calc(100% - 80px);
+}
+
+.mode-list button {
+  padding: 2px 7px;
+  border: 1px solid rgba(122, 162, 244, 0.45);
+  border-radius: 3px;
+  background: rgba(16, 17, 30, 0.82);
+  color: #b9c8f2;
+  font-size: 11px;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.mode-list button:hover {
+  border-color: rgba(122, 162, 244, 0.9);
+}
+
+.mode-list button.is-active {
+  background: rgba(44, 66, 132, 0.9);
+  color: #e8edfb;
+  border-color: #7aa2f4;
+}
+
+.mode-list button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
 /* Console */
 .console-panel {
   display: grid;

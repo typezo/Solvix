@@ -6,9 +6,13 @@
 //!
 //! API v1 contract:
 //! - `GET  /api/model?job=NAME` → mesh+model JSON (see issue #13)
-//! - `POST /api/run` body `{"path": "examples/cantilever.inp"}` → run
-//!   summary JSON (CLI schema)
-//! - `GET  /api/results/{job}` → displacements + von Mises arrays
+//! - `POST /api/run` body `{"path": "examples/cantilever.inp"}` (optional
+//!   `"modes": N` also extracts the N lowest natural frequencies, issue #40)
+//!   → run summary JSON (CLI schema; gains `modes`/`frequencies_hz` when run
+//!   with modes)
+//! - `GET  /api/results/{job}` → displacements + von Mises arrays; after a
+//!   modal run also `frequencies_hz` and the first 3 `modes` as per-node
+//!   vectors scaled to max |component| = 1.0
 //! - `GET  /api/agent` → machine-readable API description
 //!
 //! std-only: TcpListener + thread per connection, Connection: close.
@@ -20,7 +24,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use solvix_core::{ElemKind, Model, Solution, SolveError};
+use solvix_core::{
+    solve_modal, ElemKind, ModalOptions, ModalSolution, Model, Solution, SolveError,
+};
 
 const USAGE: &str = "\
 solvix-ui 0.1.0 — Abaqus-CAE-style web interface for Solvix
@@ -246,8 +252,12 @@ fn kind_name(k: ElemKind) -> &'static str {
     match k {
         ElemKind::Cps3 => "cps3",
         ElemKind::Cps4 => "cps4",
+        ElemKind::Cps8 => "cps8",
+        ElemKind::Cpe4 => "cpe4",
+        ElemKind::Cpe8 => "cpe8",
         ElemKind::C3d8 => "c3d8",
         ElemKind::C3d4 => "c3d4",
+        ElemKind::B31 => "b31",
     }
 }
 
@@ -282,6 +292,25 @@ fn json_string_field(body: &[u8], key: &str) -> Option<String> {
     None
 }
 
+/// Pull one non-negative integer field out of a small JSON object body
+/// (`{"modes": 3}`). `None` when absent or not a plain integer — a
+/// non-integer `modes` value keeps the run static-only (the modal count
+/// itself is validated by `solve_modal`).
+fn json_uint_field(body: &[u8], key: &str) -> Option<usize> {
+    let s = std::str::from_utf8(body).ok()?;
+    let pat = format!("\"{key}\"");
+    let mut from = 0usize;
+    while let Some(pos) = s[from..].find(&pat) {
+        let rest = s[from + pos + pat.len()..].trim_start();
+        if let Some(rest) = rest.strip_prefix(':').map(str::trim_start) {
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            return digits.parse().ok();
+        }
+        from += pos + pat.len();
+    }
+    None
+}
+
 /// Value of `name` in the query string of a request target (no URL decoding).
 fn query_param(target: &str, name: &str) -> Option<String> {
     let q = target.split_once('?')?.1;
@@ -297,13 +326,16 @@ fn query_param(target: &str, name: &str) -> Option<String> {
 
 // --------------------------------------------------------------- app state
 
+/// One cached solved job: model, static solution, modal run if requested.
+type CachedResult = (Model, Solution, Option<ModalSolution>);
+
 struct AppState {
     /// Workspace root: `examples/` decks resolve under it, `/api/run` paths
     /// resolve relative to it.
     root: PathBuf,
     static_dir: PathBuf,
-    /// job name → last solved (model, solution).
-    results: Mutex<HashMap<String, (Model, Solution)>>,
+    /// job name → last solved (model, solution, modal run if any).
+    results: Mutex<HashMap<String, CachedResult>>,
 }
 
 /// `<root>/crates/solvix-ui/static` when run from the workspace root,
@@ -398,13 +430,15 @@ fn model_json(model: &Model, job: &str) -> String {
     )
 }
 
-/// Run summary JSON — same schema as `solvix run --json` (issue #3).
+/// Run summary JSON — same schema as `solvix run --json` (issue #3); a
+/// non-empty `frequencies_hz` appends the modal fields (issue #40).
 fn run_summary_json(
     model: &Model,
     sol: &Solution,
     job: &str,
     solve_ms: u64,
     outputs: &[String],
+    frequencies_hz: &[f64],
 ) -> String {
     let max_disp_m = sol
         .displacements
@@ -417,8 +451,22 @@ fn run_summary_json(
         .map(|o| format!("\"{}\"", json_escape(o)))
         .collect::<Vec<_>>()
         .join(",");
-    format!(
-        "{{\"ok\":true,\"job\":\"{}\",\"nodes\":{},\"elements\":{},\"iterations\":{},\"residual\":{},\"solve_ms\":{},\"max_disp_mm\":{},\"max_von_mises_mpa\":{},\"outputs\":[{}]}}",
+    let modal = if frequencies_hz.is_empty() {
+        String::new()
+    } else {
+        let freqs = frequencies_hz
+            .iter()
+            .map(|f| fixed3(*f))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            ",\"modes\":{},\"frequencies_hz\":[{}]",
+            frequencies_hz.len(),
+            freqs
+        )
+    };
+    let mut j = format!(
+        "{{\"ok\":true,\"job\":\"{}\",\"nodes\":{},\"elements\":{},\"iterations\":{},\"residual\":{},\"solve_ms\":{},\"max_disp_mm\":{},\"max_von_mises_mpa\":{},\"outputs\":[{}]",
         json_escape(job),
         model.mesh.nodes.len(),
         model.mesh.elements.len(),
@@ -428,11 +476,61 @@ fn run_summary_json(
         fixed3(max_disp_m * 1000.0),
         fixed3(max_mises / 1e6),
         outs,
-    )
+    );
+    j.push_str(&modal);
+    j.push('}');
+    j
 }
 
-/// Results JSON — exact shape of `static/mock/results.json`.
-fn results_json(job: &str, sol: &Solution) -> String {
+/// Dofs per node for an already-validated model: 3 when any solid or beam
+/// element is present, else 2 (mixing is rejected by `solve` before we get
+/// here). ponytail: for B31 the third dof is rotz, rendered as z — a
+/// display-only approximation.
+fn ndof_for_display(model: &Model) -> usize {
+    if model
+        .mesh
+        .elements
+        .iter()
+        .any(|e| matches!(e.kind, ElemKind::C3d8 | ElemKind::C3d4 | ElemKind::B31))
+    {
+        3
+    } else {
+        2
+    }
+}
+
+/// First [`MAX_DISPLAY_MODES`] mode shapes as per-node `[x,y,z]` triples,
+/// each scaled to max |component| = 1.0 for viewport display (issue #40).
+fn mode_display_triples(model: &Model, modal: &ModalSolution) -> Vec<Vec<[f64; 3]>> {
+    const MAX_DISPLAY_MODES: usize = 3;
+    let ndof = ndof_for_display(model);
+    let nodes = model.mesh.nodes.len();
+    modal
+        .modes
+        .iter()
+        .take(MAX_DISPLAY_MODES)
+        .map(|flat| {
+            let scale = flat.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+            let s = if scale > 0.0 { scale } else { 1.0 };
+            (0..nodes)
+                .map(|n| {
+                    let dx = flat.get(n * ndof).copied().unwrap_or(0.0) / s;
+                    let dy = flat.get(n * ndof + 1).copied().unwrap_or(0.0) / s;
+                    let dz = if ndof == 3 {
+                        flat.get(n * ndof + 2).copied().unwrap_or(0.0) / s
+                    } else {
+                        0.0
+                    };
+                    [dx, dy, dz]
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Results JSON — exact shape of `static/mock/results.json`; after a modal
+/// run also `frequencies_hz` plus display-scaled `modes` triples (issue #40).
+fn results_json(job: &str, sol: &Solution, modal: Option<(&Model, &ModalSolution)>) -> String {
     let disp = sol
         .displacements
         .iter()
@@ -457,8 +555,30 @@ fn results_json(job: &str, sol: &Solution) -> String {
         .map(|d| (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt())
         .fold(0.0, f64::max);
     let max_mises = sol.von_mises.iter().copied().fold(0.0, f64::max);
-    format!(
-        "{{\"ok\":true,\"job\":\"{}\",\"displacements\":[{}],\"von_mises\":[{}],\"nodal_von_mises\":[{}],\"max_disp_mm\":{},\"max_von_mises_mpa\":{},\"iterations\":{},\"residual\":{}}}",
+    let modal_json = match modal {
+        Some((model, m)) => {
+            let freqs = m
+                .frequencies_hz
+                .iter()
+                .map(|f| fixed3(*f))
+                .collect::<Vec<_>>()
+                .join(",");
+            let modes = mode_display_triples(model, m)
+                .iter()
+                .map(|mode| {
+                    mode.iter()
+                        .map(|d| format!("[{},{},{}]", num(d[0]), num(d[1]), num(d[2])))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .collect::<Vec<_>>()
+                .join("],[");
+            format!(",\"frequencies_hz\":[{}],\"modes\":[[{}]]", freqs, modes)
+        }
+        None => String::new(),
+    };
+    let mut j = format!(
+        "{{\"ok\":true,\"job\":\"{}\",\"displacements\":[{}],\"von_mises\":[{}],\"nodal_von_mises\":[{}],\"max_disp_mm\":{},\"max_von_mises_mpa\":{},\"iterations\":{},\"residual\":{}",
         json_escape(job),
         disp,
         mises,
@@ -467,7 +587,10 @@ fn results_json(job: &str, sol: &Solution) -> String {
         fixed3(max_mises / 1e6),
         sol.iterations,
         exp3(sol.final_residual),
-    )
+    );
+    j.push_str(&modal_json);
+    j.push('}');
+    j
 }
 
 /// Self-describing API index for humans and AI agents (issue #15).
@@ -483,9 +606,9 @@ fn agent_json() -> String {
         (
             "POST",
             "/api/run",
-            "{\"path\": \"examples/NAME.inp\"}",
-            "{\"ok\":true,\"job\":..,\"nodes\":..,\"elements\":..,\"iterations\":..,\"residual\":..,\"solve_ms\":..,\"max_disp_mm\":..,\"max_von_mises_mpa\":..,\"outputs\":[\"NAME.vtu\"]} (CLI run --json schema)",
-            "parse, solve and write NAME.vtu next to the deck; caches results for /api/results/{job}",
+            "{\"path\": \"examples/NAME.inp\"} (+ optional \"modes\": N for modal analysis)",
+            "{\"ok\":true,\"job\":..,\"nodes\":..,\"elements\":..,\"iterations\":..,\"residual\":..,\"solve_ms\":..,\"max_disp_mm\":..,\"max_von_mises_mpa\":..,\"outputs\":[\"NAME.vtu\"]} (CLI run --json schema; with modes also \"modes\":N,\"frequencies_hz\":[Hz])",
+            "parse, solve and write NAME.vtu next to the deck; caches results for /api/results/{job}; \"modes\": N also extracts natural frequencies (cached for the mode viewer)",
         ),
         (
             "GET",
@@ -599,6 +722,14 @@ fn api_run(state: &AppState, body: &[u8]) -> Response {
         Ok(s) => s,
         Err(e) => return Response::error(400, "solve", &solve_error_message(e)),
     };
+    // Optional modal pass (issue #40); count validated by solve_modal.
+    let modal = match json_uint_field(body, "modes") {
+        Some(n) => match solve_modal(&model, &ModalOptions { num_modes: n }) {
+            Ok(m) => Some(m),
+            Err(e) => return Response::error(400, "solve", &solve_error_message(e)),
+        },
+        None => None,
+    };
     let solve_ms = t0.elapsed().as_millis() as u64;
     let job = deck
         .file_stem()
@@ -609,9 +740,20 @@ fn api_run(state: &AppState, body: &[u8]) -> Response {
     if let Err(e) = solvix_io::write_vtu(&vtu, &model, &sol) {
         return Response::error(500, "io", &format!("cannot write {}: {e}", vtu.display()));
     }
-    let summary = run_summary_json(&model, &sol, &job, solve_ms, &[vtu.display().to_string()]);
+    let freqs = modal
+        .as_ref()
+        .map(|m| m.frequencies_hz.clone())
+        .unwrap_or_default();
+    let summary = run_summary_json(
+        &model,
+        &sol,
+        &job,
+        solve_ms,
+        &[vtu.display().to_string()],
+        &freqs,
+    );
     if let Ok(mut cache) = state.results.lock() {
-        cache.insert(job, (model, sol));
+        cache.insert(job, (model, sol, modal));
     }
     Response::json(200, summary)
 }
@@ -619,7 +761,10 @@ fn api_run(state: &AppState, body: &[u8]) -> Response {
 fn api_results(state: &AppState, job: &str) -> Response {
     let cache = state.results.lock().unwrap_or_else(|p| p.into_inner());
     match cache.get(job) {
-        Some((_, sol)) => Response::json(200, results_json(job, sol)),
+        Some((model, sol, modal)) => Response::json(
+            200,
+            results_json(job, sol, modal.as_ref().map(|m| (model, m))),
+        ),
         None => Response::error(
             404,
             "io",
@@ -794,12 +939,43 @@ mod tests {
         list.iter().map(|s| s.to_string()).collect()
     }
 
+    /// Two-triangle square, left edge clamped: 4 free dofs, stable, so the
+    /// modal pencil is SPD (the single pinned triangle of TINY_DECK is a
+    /// rotational mechanism and legitimately fails the modal factorization).
+    const TINY_MODAL_DECK: &str = "\
+*HEADING
+    modal fixture
+*NODE
+1, 0.0, 0.0
+2, 1.0, 0.0
+3, 1.0, 1.0
+4, 0.0, 1.0
+*ELEMENT, TYPE=CPS3, ELSET=ALL
+1, 1, 2, 3
+2, 1, 3, 4
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210e9, 0.3
+*SOLID SECTION, ELSET=ALL, MATERIAL=STEEL
+1.0
+*STEP
+*STATIC
+*BOUNDARY
+1, 1, 2
+4, 1, 2
+*CLOAD
+2, 2, -100.0
+3, 2, -100.0
+*END STEP
+";
+
     fn fixture_root(tag: &str) -> PathBuf {
         let root =
             std::env::temp_dir().join(format!("solvix-ui-test-{}-{tag}", std::process::id()));
         let ex = root.join("examples");
         std::fs::create_dir_all(&ex).unwrap();
         std::fs::write(ex.join("tiny.inp"), TINY_DECK).unwrap();
+        std::fs::write(ex.join("tiny_modal.inp"), TINY_MODAL_DECK).unwrap();
         root
     }
 
@@ -1055,9 +1231,149 @@ mod tests {
             ..Solution::default()
         };
         assert_eq!(
-            results_json("cantilever", &sol),
+            results_json("cantilever", &sol, None),
             r#"{"ok":true,"job":"cantilever","displacements":[[0.0,0.0,0.0],[4e-6,-8e-6,0.0]],"von_mises":[120000000.0,119000000.0],"nodal_von_mises":[120000000.0,119000000.0],"max_disp_mm":0.009,"max_von_mises_mpa":120.000,"iterations":390,"residual":6.933e-11}"#
         );
+    }
+
+    #[test]
+    fn run_summary_json_appends_modal_fields() {
+        let (model, _) = solvix_io::parse_inp(TINY_DECK).unwrap();
+        let sol = solvix_core::solve(&model).unwrap();
+        let j = run_summary_json(
+            &model,
+            &sol,
+            "tiny",
+            3,
+            &["tiny.vtu".into()],
+            &[41.5, 260.25],
+        );
+        assert!(
+            j.ends_with(r#""outputs":["tiny.vtu"],"modes":2,"frequencies_hz":[41.500,260.250]}"#),
+            "{j}"
+        );
+        let static_only = run_summary_json(&model, &sol, "tiny", 3, &["tiny.vtu".into()], &[]);
+        assert!(
+            static_only.ends_with(r#""outputs":["tiny.vtu"]}"#),
+            "{static_only}"
+        );
+    }
+
+    #[test]
+    fn mode_display_triples_scale_and_cap() {
+        let (model, _) = solvix_io::parse_inp(TINY_DECK).unwrap();
+        // 3 nodes x 2 dofs; 4 modes asked, only 3 may come back for display.
+        let modal = ModalSolution {
+            frequencies_hz: vec![10.0, 40.0, 90.0, 160.0],
+            modes: vec![
+                vec![0.0, 0.0, 2.0, 0.0, 0.0, 0.0],
+                vec![0.0, 0.0, 0.0, 0.0, 0.5, -0.5],
+                vec![1.0, 0.0, 1.0, 0.0, 1.0, 0.0],
+                vec![9.0, 9.0, 9.0, 9.0, 9.0, 9.0],
+            ],
+            iterations: 7,
+        };
+        let triples = mode_display_triples(&model, &modal);
+        assert_eq!(triples.len(), 3, "first 3 modes only");
+        for mode in &triples {
+            let max = mode
+                .iter()
+                .flat_map(|d| [d[0].abs(), d[1].abs(), d[2].abs()])
+                .fold(0.0f64, f64::max);
+            assert!((max - 1.0).abs() < 1e-12, "max {max}");
+        }
+        assert_eq!(triples[0][0], [0.0, 0.0, 0.0]); // node 1 constrained
+        assert_eq!(triples[0][1], [1.0, 0.0, 0.0]); // 2.0 / 2.0
+        assert_eq!(triples[1][2], [1.0, -1.0, 0.0]); // 0.5 / 0.5, -0.5 / 0.5
+    }
+
+    #[test]
+    fn results_json_with_modal_exact_tail() {
+        let (model, _) = solvix_io::parse_inp(TINY_DECK).unwrap();
+        let sol = solvix_core::solve(&model).unwrap();
+        let modal = ModalSolution {
+            frequencies_hz: vec![12.5, 99.125],
+            modes: vec![
+                vec![0.0, 0.0, 2.0, 0.0, 0.0, 0.0],
+                vec![0.0, 0.0, 0.0, 0.0, 0.25, 0.0],
+            ],
+            iterations: 5,
+        };
+        let j = results_json("tiny", &sol, Some((&model, &modal)));
+        assert!(
+            j.ends_with(
+                r#""frequencies_hz":[12.500,99.125],"modes":[[[0.0,0.0,0.0],[1.0,0.0,0.0],[0.0,0.0,0.0]],[[0.0,0.0,0.0],[0.0,0.0,0.0],[1.0,0.0,0.0]]]}"#
+            ),
+            "{j}"
+        );
+    }
+
+    #[test]
+    fn json_uint_field_parses() {
+        assert_eq!(
+            json_uint_field(br#"{"path":"a.inp","modes":3}"#, "modes"),
+            Some(3)
+        );
+        assert_eq!(
+            json_uint_field(br#"  { "modes" : 12 , "x":1}"#, "modes"),
+            Some(12)
+        );
+        assert_eq!(json_uint_field(br#"{"path":"a.inp"}"#, "modes"), None);
+        assert_eq!(json_uint_field(br#"{"modes":"many"}"#, "modes"), None);
+        assert_eq!(json_uint_field(br#"{"modes":-2}"#, "modes"), None);
+    }
+
+    #[test]
+    fn run_with_modes_end_to_end() {
+        let root = fixture_root("modes");
+        let state = test_state(&root);
+        let resp = handle(
+            &state,
+            "POST",
+            "/api/run",
+            br#"{"path":"examples/tiny_modal.inp","modes":2}"#,
+        );
+        assert_eq!(resp.status, 200, "{}", String::from_utf8_lossy(&resp.body));
+        let body = String::from_utf8(resp.body).unwrap();
+        assert!(body.contains(r#""modes":2,"frequencies_hz":["#), "{body}");
+        assert!(body.ends_with("]}"), "{body}");
+
+        let resp = handle(&state, "GET", "/api/results/tiny_modal", b"");
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8(resp.body).unwrap();
+        assert!(body.contains(r#""frequencies_hz":["#), "{body}");
+        assert!(body.contains(r#""modes":[[["#), "{body}");
+        assert!(body.ends_with("]]}"), "{body}");
+
+        // static-only run for the same job drops the modal fields again
+        let resp = handle(
+            &state,
+            "POST",
+            "/api/run",
+            br#"{"path":"examples/tiny_modal.inp"}"#,
+        );
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8(resp.body).unwrap();
+        assert!(!body.contains("frequencies_hz"), "{body}");
+        let resp = handle(&state, "GET", "/api/results/tiny_modal", b"");
+        let body = String::from_utf8(resp.body).unwrap();
+        assert!(!body.contains("frequencies_hz"), "{body}");
+    }
+
+    #[test]
+    fn run_with_invalid_modes_count_is_solve_error() {
+        let root = fixture_root("modes0");
+        let state = test_state(&root);
+        let resp = handle(
+            &state,
+            "POST",
+            "/api/run",
+            br#"{"path":"examples/tiny.inp","modes":0}"#,
+        );
+        assert_eq!(resp.status, 400);
+        let body = String::from_utf8(resp.body).unwrap();
+        assert!(body.contains(r#""stage":"solve""#), "{body}");
+        assert!(body.contains("num_modes"), "{body}");
     }
 
     // -- /api/agent ------------------------------------------------------------

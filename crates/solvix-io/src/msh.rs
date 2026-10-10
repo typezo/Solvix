@@ -919,8 +919,9 @@ fn supported_kind(element_type: u32) -> Option<ElemKind> {
 
 fn element_dimension(kind: ElemKind) -> usize {
     match kind {
-        ElemKind::Cps3 | ElemKind::Cps4 => 2,
+        ElemKind::Cps3 | ElemKind::Cps4 | ElemKind::Cps8 | ElemKind::Cpe4 | ElemKind::Cpe8 => 2,
         ElemKind::C3d4 | ElemKind::C3d8 => 3,
+        ElemKind::B31 => 1,
     }
 }
 
