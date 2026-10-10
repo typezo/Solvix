@@ -595,6 +595,7 @@ mod tests {
             reactions: vec![],
             iterations: 42,
             final_residual: 1.5e-12,
+            ..Solution::default()
         }
     }
 

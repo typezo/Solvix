@@ -8,10 +8,13 @@
 //!
 //! Implementation modules: [`element`] (CPS3/CPS4/C3D8/C3D4 stiffness),
 //! [`assembly`] (CSR assembly), [`solver`] (Dirichlet + preconditioned
-//! CG), [`stress`] (von Mises + reactions).
+//! CG), [`stress`] (von Mises + reactions). [`solve`] tries PCG first
+//! and falls back to the RCM-ordered sparse LDLT in `ldl` when the
+//! iteration budget runs out; [`solve_with_method`] pins the method.
 
 mod assembly;
 mod element;
+mod ldl;
 mod solver;
 mod stress;
 
@@ -195,6 +198,17 @@ pub struct Solution {
     pub reactions: Vec<Reaction>,
     pub iterations: usize,
     pub final_residual: f64,
+    /// Which linear solver produced the displacements: "pcg" or "ldlt".
+    /// `Auto` (the [`solve`] default) reports the method that actually
+    /// delivered the answer — "ldlt" means PCG missed its budget and
+    /// the direct fallback took over.
+    pub solver_method: String,
+    /// Diagonal-based conditioning indicator, NOT a true condition
+    /// number: on the LDLT path the ratio of largest to smallest
+    /// |D_ii| pivot; on the PCG path the ratio of extreme Jacobi
+    /// diagonal entries of K. Treat it as a coarse ill-conditioning
+    /// warning scale, not as ||K|| * ||K^-1||.
+    pub cond_estimate: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -205,13 +219,32 @@ pub enum SolveError {
     NotConverged { iterations: usize, residual: f64 },
 }
 
+/// Linear solver selection for [`solve_with_method`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Method {
+    /// PCG first; on `NotConverged` (or a PCG breakdown) fall back to
+    /// the sparse LDLT. The default behavior of [`solve`].
+    Auto,
+    /// Jacobi-PCG only — surface the iteration failure, no fallback.
+    Pcg,
+    /// RCM-ordered sparse LDLT only.
+    Ldlt,
+}
+
 /// Solve the linear-static problem `K u = f` with homogeneous Dirichlet
-/// constraints. Conjugate gradient on CSR with Jacobi preconditioning.
-/// Plane-only models solve with 2 dofs/node, models containing solid
-/// elements with 3 (see [`ndof_per_node`]).
+/// constraints. [`Method::Auto`]: conjugate gradient on CSR with Jacobi
+/// preconditioning, falling back to a direct sparse LDLT (RCM ordering)
+/// when PCG exceeds its iteration budget. Plane-only models solve with
+/// 2 dofs/node, models containing solid elements with 3 (see
+/// [`ndof_per_node`]).
 ///
 /// Relative tolerance 1e-10, `max_iter = max(1000, 10 * ndof)`.
 pub fn solve(model: &Model) -> Result<Solution, SolveError> {
+    solve_with_method(model, Method::Auto)
+}
+
+/// [`solve`] with the linear solver pinned; see [`Method`].
+pub fn solve_with_method(model: &Model, method: Method) -> Result<Solution, SolveError> {
     // Free-body check first: validate() reports NoBoundaryConditions as a
     // ModelError, but the contract wants SolveError::NoConstraints.
     if model.boundary_conditions.is_empty() {
@@ -241,7 +274,61 @@ pub fn solve(model: &Model) -> Result<Solution, SolveError> {
     solver::apply_dirichlet(&mut k, &mut f, &constrained);
     let ndof_total = f.len();
     let max_iter = 1000.max(10 * ndof_total);
-    let (u, iterations, final_residual) = solver::pcg(&k, &f, 1e-10, max_iter)?;
+
+    let jacobi_cond = || {
+        (0..ndof_total)
+            .filter_map(|i| {
+                (k.row_ptr[i]..k.row_ptr[i + 1])
+                    .find(|&idx| k.col_idx[idx] == i)
+                    .map(|idx| k.vals[idx].abs())
+            })
+            .fold((0.0f64, f64::INFINITY), |(hi, lo), m| {
+                (hi.max(m), lo.min(m))
+            })
+    };
+    let direct = || -> Result<(Vec<f64>, f64, f64), SolveError> {
+        let fact = ldl::Ldlt::factorize(&k)?;
+        let u = fact.solve(&f);
+        let b_norm = f.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let res = if b_norm == 0.0 {
+            0.0
+        } else {
+            let r = k.mat_vec(&u);
+            f.iter()
+                .zip(&r)
+                .map(|(a, c)| a - c)
+                .map(|v| v * v)
+                .sum::<f64>()
+                .sqrt()
+                / b_norm
+        };
+        Ok((u, res, fact.cond_estimate()))
+    };
+
+    let (u, iterations, final_residual, solver_method, cond_estimate) = match method {
+        Method::Pcg => {
+            let (u, iterations, final_residual) = solver::pcg(&k, &f, 1e-10, max_iter)?;
+            let (hi, lo) = jacobi_cond();
+            (u, iterations, final_residual, "pcg".to_string(), hi / lo)
+        }
+        Method::Ldlt => {
+            let (u, final_residual, cond) = direct()?;
+            (u, 0, final_residual, "ldlt".to_string(), cond)
+        }
+        Method::Auto => match solver::pcg(&k, &f, 1e-10, max_iter) {
+            Ok((u, iterations, final_residual)) => {
+                let (hi, lo) = jacobi_cond();
+                (u, iterations, final_residual, "pcg".to_string(), hi / lo)
+            }
+            Err(_) => {
+                // PCG missed its budget (or broke down); try the direct
+                // path and let a real factorization failure (singular
+                // matrix) surface with the sharper diagnostic.
+                let (u, final_residual, cond) = direct()?;
+                (u, 0, final_residual, "ldlt".to_string(), cond)
+            }
+        },
+    };
 
     let displacements = model
         .mesh
@@ -264,6 +351,8 @@ pub fn solve(model: &Model) -> Result<Solution, SolveError> {
         reactions,
         iterations,
         final_residual,
+        solver_method,
+        cond_estimate,
     })
 }
 
@@ -353,7 +442,7 @@ mod tests {
         }
     }
 
-    fn solid_model(mesh: Mesh) -> Model {
+    pub(crate) fn solid_model(mesh: Mesh) -> Model {
         let n_elem = mesh.elements.len() as u32;
         Model {
             mesh,
@@ -439,6 +528,10 @@ mod tests {
         });
     }
 
+    /// Every solve-path assertion in this suite runs through both the
+    /// default (PCG with LDLT fallback) and the direct LDLT path.
+    const BOTH_METHODS: [Method; 2] = [Method::Auto, Method::Ldlt];
+
     #[test]
     fn cps4_patch_single_quad() {
         let mut model = quad_model(1, 1, 1.0, 1.0);
@@ -456,28 +549,30 @@ mod tests {
                 value: sigma / 2.0,
             },
         ];
-        let sol = solve(&model).unwrap();
-        // Bilinear quad reproduces constant strain exactly.
-        assert!((sol.von_mises[0] - sigma).abs() / sigma < 1e-6);
-        // Uniform field: nodal recovery is exact at every node and agrees
-        // with the centroid value (extrapolation patch test).
-        assert_eq!(sol.nodal_von_mises.len(), model.mesh.nodes.len());
-        for (i, &nvm) in sol.nodal_von_mises.iter().enumerate() {
-            assert!((nvm - sigma).abs() / sigma < 1e-6, "node {i}: vM={nvm}");
-            assert!((nvm - sol.von_mises[0]).abs() / sigma < 1e-6);
+        for method in BOTH_METHODS {
+            let sol = solve_with_method(&model, method).unwrap();
+            // Bilinear quad reproduces constant strain exactly.
+            assert!((sol.von_mises[0] - sigma).abs() / sigma < 1e-6);
+            // Uniform field: nodal recovery is exact at every node and agrees
+            // with the centroid value (extrapolation patch test).
+            assert_eq!(sol.nodal_von_mises.len(), model.mesh.nodes.len());
+            for (i, &nvm) in sol.nodal_von_mises.iter().enumerate() {
+                assert!((nvm - sigma).abs() / sigma < 1e-6, "node {i}: vM={nvm}");
+                assert!((nvm - sol.von_mises[0]).abs() / sigma < 1e-6);
+            }
+            let ux_right = sigma / E;
+            assert!((sol.displacements[1][0] - ux_right).abs() / ux_right < 1e-6);
+            assert!((sol.displacements[3][0] - ux_right).abs() / ux_right < 1e-6);
+            // Total reaction balances the applied load.
+            let rx: f64 = sol
+                .reactions
+                .iter()
+                .filter(|r| r.dof == 1)
+                .map(|r| r.value)
+                .sum();
+            assert!((rx + sigma).abs() < 1e-6 * sigma);
+            assert!(sol.final_residual <= 1e-10);
         }
-        let ux_right = sigma / E;
-        assert!((sol.displacements[1][0] - ux_right).abs() / ux_right < 1e-6);
-        assert!((sol.displacements[3][0] - ux_right).abs() / ux_right < 1e-6);
-        // Total reaction balances the applied load.
-        let rx: f64 = sol
-            .reactions
-            .iter()
-            .filter(|r| r.dof == 1)
-            .map(|r| r.value)
-            .sum();
-        assert!((rx + sigma).abs() < 1e-6 * sigma);
-        assert!(sol.final_residual <= 1e-10);
     }
 
     #[test]
@@ -504,23 +599,25 @@ mod tests {
                 value: s,
             },
         ];
-        let sol = solve(&model).unwrap();
-        for (i, &vm) in sol.von_mises.iter().enumerate() {
-            assert!((vm - sigma).abs() / sigma < 2e-2, "element {i}: vM={vm}");
+        for method in BOTH_METHODS {
+            let sol = solve_with_method(&model, method).unwrap();
+            for (i, &vm) in sol.von_mises.iter().enumerate() {
+                assert!((vm - sigma).abs() / sigma < 2e-2, "element {i}: vM={vm}");
+            }
+            // Shared (interior) nodes average several contributions and stay
+            // uniform: nodal == centroid == exact within the same tolerance.
+            assert_eq!(sol.nodal_von_mises.len(), model.mesh.nodes.len());
+            for (i, &nvm) in sol.nodal_von_mises.iter().enumerate() {
+                assert!((nvm - sigma).abs() / sigma < 2e-2, "node {i}: vM={nvm}");
+            }
+            let rx: f64 = sol
+                .reactions
+                .iter()
+                .filter(|r| r.dof == 1)
+                .map(|r| r.value)
+                .sum();
+            assert!((rx + sigma).abs() < 2e-2 * sigma);
         }
-        // Shared (interior) nodes average several contributions and stay
-        // uniform: nodal == centroid == exact within the same tolerance.
-        assert_eq!(sol.nodal_von_mises.len(), model.mesh.nodes.len());
-        for (i, &nvm) in sol.nodal_von_mises.iter().enumerate() {
-            assert!((nvm - sigma).abs() / sigma < 2e-2, "node {i}: vM={nvm}");
-        }
-        let rx: f64 = sol
-            .reactions
-            .iter()
-            .filter(|r| r.dof == 1)
-            .map(|r| r.value)
-            .sum();
-        assert!((rx + sigma).abs() < 2e-2 * sigma);
     }
 
     #[test]
@@ -590,20 +687,22 @@ mod tests {
             ],
         };
         let sigma = 1e6;
-        let sol = solve(&model).unwrap();
-        for (i, &vm) in sol.von_mises.iter().enumerate() {
-            assert!((vm - sigma).abs() / sigma < 1e-6, "element {i}: vM={vm}");
+        for method in BOTH_METHODS {
+            let sol = solve_with_method(&model, method).unwrap();
+            for (i, &vm) in sol.von_mises.iter().enumerate() {
+                assert!((vm - sigma).abs() / sigma < 1e-6, "element {i}: vM={vm}");
+            }
+            // Constant-stress triangle: nodal value equals the exact stress.
+            for (i, &nvm) in sol.nodal_von_mises.iter().enumerate() {
+                assert!((nvm - sigma).abs() / sigma < 1e-6, "node {i}: vM={nvm}");
+            }
+            let ux_right = sigma / E;
+            assert!((sol.displacements[1][0] - ux_right).abs() / ux_right < 1e-6);
+            let uy_top = -NU * sigma / E;
+            assert!((sol.displacements[2][1] - uy_top).abs() / uy_top.abs() < 1e-6);
+            assert!(sol.iterations > 0 || method == Method::Ldlt);
+            assert!(sol.final_residual <= 1e-10);
         }
-        // Constant-stress triangle: nodal value equals the exact stress.
-        for (i, &nvm) in sol.nodal_von_mises.iter().enumerate() {
-            assert!((nvm - sigma).abs() / sigma < 1e-6, "node {i}: vM={nvm}");
-        }
-        let ux_right = sigma / E;
-        assert!((sol.displacements[1][0] - ux_right).abs() / ux_right < 1e-6);
-        let uy_top = -NU * sigma / E;
-        assert!((sol.displacements[2][1] - uy_top).abs() / uy_top.abs() < 1e-6);
-        assert!(sol.iterations > 0);
-        assert!(sol.final_residual <= 1e-10);
     }
 
     #[test]
@@ -627,27 +726,29 @@ mod tests {
             dof: 2,
             value: p,
         }];
-        let sol = solve(&model).unwrap();
-        assert!(sol.final_residual <= 1e-10);
-        assert!(sol.iterations < 1000.max(10 * sol.displacements.len() * 2));
-        let i = model.mesh.node_index(tip).unwrap();
-        let delta = sol.displacements[i][1];
-        let inertia = h * h * h / 12.0;
-        let beam = p * l * l * l / (3.0 * E * inertia);
-        let rel = (delta - beam) / beam;
-        assert!(
-            rel.abs() <= 0.15,
-            "tip deflection off by {:.1}% (fem={delta:.3e}, beam={beam:.3e})",
-            100.0 * rel
-        );
-        // Vertical reactions balance the applied load (sum R_y = -P).
-        let ry: f64 = sol
-            .reactions
-            .iter()
-            .filter(|r| r.dof == 2)
-            .map(|r| r.value)
-            .sum();
-        assert!((ry + p).abs() < 1e-6 * p.abs());
+        for method in BOTH_METHODS {
+            let sol = solve_with_method(&model, method).unwrap();
+            assert!(sol.final_residual <= 1e-10);
+            assert!(sol.iterations < 1000.max(10 * sol.displacements.len() * 2));
+            let i = model.mesh.node_index(tip).unwrap();
+            let delta = sol.displacements[i][1];
+            let inertia = h * h * h / 12.0;
+            let beam = p * l * l * l / (3.0 * E * inertia);
+            let rel = (delta - beam) / beam;
+            assert!(
+                rel.abs() <= 0.15,
+                "{method:?}: tip deflection off by {:.1}% (fem={delta:.3e}, beam={beam:.3e})",
+                100.0 * rel
+            );
+            // Vertical reactions balance the applied load (sum R_y = -P).
+            let ry: f64 = sol
+                .reactions
+                .iter()
+                .filter(|r| r.dof == 2)
+                .map(|r| r.value)
+                .sum();
+            assert!((ry + p).abs() < 1e-6 * p.abs());
+        }
     }
 
     #[test]
@@ -671,13 +772,15 @@ mod tests {
             dof: 2,
             value: -p,
         }];
-        let sol = solve(&model).unwrap();
-        assert_eq!(sol.nodal_von_mises.len(), model.mesh.nodes.len());
-        let peak = sol.nodal_von_mises.iter().cloned().fold(0.0, f64::max);
-        assert!(
-            peak > 100e6,
-            "max nodal von Mises {peak:.3e} Pa, want > 100 MPa (beam peak 120 MPa)"
-        );
+        for method in BOTH_METHODS {
+            let sol = solve_with_method(&model, method).unwrap();
+            assert_eq!(sol.nodal_von_mises.len(), model.mesh.nodes.len());
+            let peak = sol.nodal_von_mises.iter().cloned().fold(0.0, f64::max);
+            assert!(
+                peak > 100e6,
+                "{method:?}: max nodal von Mises {peak:.3e} Pa, want > 100 MPa (beam peak 120 MPa)"
+            );
+        }
     }
 
     #[test]
@@ -744,13 +847,15 @@ mod tests {
                 })
             })
             .collect();
-        let sol = solve(&model).unwrap();
-        assert_eq!(sol.nodal_von_mises.len(), model.mesh.nodes.len());
-        let peak = sol.nodal_von_mises.iter().cloned().fold(0.0, f64::max);
-        assert!(
-            peak > 2.4e6,
-            "max nodal von Mises {peak:.4e} Pa, want > 2.4 MPa (Kirsch 3.0 MPa)"
-        );
+        for method in BOTH_METHODS {
+            let sol = solve_with_method(&model, method).unwrap();
+            assert_eq!(sol.nodal_von_mises.len(), model.mesh.nodes.len());
+            let peak = sol.nodal_von_mises.iter().cloned().fold(0.0, f64::max);
+            assert!(
+                peak > 2.4e6,
+                "{method:?}: max nodal von Mises {peak:.4e} Pa, want > 2.4 MPa (Kirsch 3.0 MPa)"
+            );
+        }
     }
 
     #[test]
@@ -768,9 +873,11 @@ mod tests {
     fn c3d8_patch_single_cube() {
         let mut model = solid_model(assembly::tests::hex_mesh(1, 1, 1, 1.0, 1.0, 1.0));
         cube_tension_bcs(&mut model);
-        let sol = solve(&model).unwrap();
-        assert!(sol.final_residual <= 1e-10);
-        assert_uniform_tension(&model, &sol);
+        for method in BOTH_METHODS {
+            let sol = solve_with_method(&model, method).unwrap();
+            assert!(sol.final_residual <= 1e-10);
+            assert_uniform_tension(&model, &sol);
+        }
     }
 
     #[test]
@@ -843,9 +950,11 @@ mod tests {
                 value: sigma * w / 6.0,
             })
             .collect();
-        let sol = solve(&model).unwrap();
-        assert!(sol.final_residual <= 1e-10);
-        assert_uniform_tension(&model, &sol);
+        for method in BOTH_METHODS {
+            let sol = solve_with_method(&model, method).unwrap();
+            assert!(sol.final_residual <= 1e-10);
+            assert_uniform_tension(&model, &sol);
+        }
     }
 
     #[test]
@@ -874,25 +983,116 @@ mod tests {
             dof: 2,
             value: p,
         }];
-        let sol = solve(&model).unwrap();
-        assert!(sol.final_residual <= 1e-10);
-        let i = model.mesh.node_index(tip).unwrap();
-        let delta = sol.displacements[i][1];
-        let inertia = b * h * h * h / 12.0;
-        let beam = p * l * l * l / (3.0 * E * inertia);
-        let rel = (delta - beam) / beam;
-        assert!(
-            rel.abs() <= 0.15,
-            "tip deflection off by {:.1}% (fem={delta:.3e}, beam={beam:.3e})",
-            100.0 * rel
-        );
-        let ry: f64 = sol
-            .reactions
-            .iter()
-            .filter(|r| r.dof == 2)
-            .map(|r| r.value)
-            .sum();
-        assert!((ry + p).abs() < 1e-6 * p.abs());
+        for method in BOTH_METHODS {
+            let sol = solve_with_method(&model, method).unwrap();
+            // eps*cond(K) ~ 1e-10 for this mesh: the direct path rides
+            // that floor, give it one extra decade.
+            let tol = if method == Method::Ldlt { 1e-8 } else { 1e-10 };
+            assert!(sol.final_residual <= tol);
+            let i = model.mesh.node_index(tip).unwrap();
+            let delta = sol.displacements[i][1];
+            let inertia = b * h * h * h / 12.0;
+            let beam = p * l * l * l / (3.0 * E * inertia);
+            let rel = (delta - beam) / beam;
+            assert!(
+                rel.abs() <= 0.15,
+                "{method:?}: tip deflection off by {:.1}% (fem={delta:.3e}, beam={beam:.3e})",
+                100.0 * rel
+            );
+            let ry: f64 = sol
+                .reactions
+                .iter()
+                .filter(|r| r.dof == 2)
+                .map(|r| r.value)
+                .sum();
+            assert!((ry + p).abs() < 1e-6 * p.abs());
+        }
+    }
+
+    #[test]
+    fn slender_column_pcg_budget_exhaustion_falls_back_to_ldlt() {
+        // 1x40 quad column of aspect 1000 (w = 1e-3, L = 1):
+        // bending-dominated and ill-conditioned enough that Jacobi-PCG
+        // burns its whole iteration budget (10 * ndof) without
+        // reaching 1e-10. The Auto path must fall back to LDLT and
+        // still nail the analytical axial stretch PL/(EA). (A 2-element
+        // column needs element aspect ~1e8 to stall PCG, and there the
+        // element stiffness itself is numerically rank-deficient in
+        // f64; the tall column hits the same failure mode with
+        // well-conditioned elements.)
+        let (nx, ny) = (1, 40);
+        let (w, l) = (1e-3, 1.0);
+        let mut model = quad_model(nx, ny, w, l);
+        // Pin uy on the base (y=0) and ux on the left base node only,
+        // so the Poisson contraction stays free: the uniform-stress
+        // solution remains exact for CPS4.
+        model.boundary_conditions = vec![
+            BoundaryCondition {
+                node_ids: vec![1, 2],
+                dofs: vec![2],
+            },
+            BoundaryCondition {
+                node_ids: vec![1],
+                dofs: vec![1],
+            },
+        ];
+        let top_left = (ny * (nx + 1) + 1) as u32;
+        let top_right = ((ny + 1) * (nx + 1)) as u32;
+        let p = 1000.0;
+        model.cloads = vec![
+            ConcentratedLoad {
+                node_id: top_left,
+                dof: 2,
+                value: p / 2.0,
+            },
+            ConcentratedLoad {
+                node_id: top_right,
+                dof: 2,
+                value: p / 2.0,
+            },
+        ];
+        // PCG alone must fail: that is what triggers the fallback.
+        match solve_with_method(&model, Method::Pcg) {
+            Err(SolveError::NotConverged {
+                iterations,
+                residual,
+            }) => {
+                eprintln!("pcg stalled: it={iterations} res={residual:.3e}");
+            }
+            Ok(sol) => panic!(
+                "pcg converged (it={}, res={:.3e}); column not ill-conditioned enough",
+                sol.iterations, sol.final_residual
+            ),
+            Err(other) => panic!("unexpected {other:?}"),
+        }
+        for method in [Method::Auto, Method::Ldlt] {
+            let sol = solve_with_method(&model, method).unwrap();
+            assert_eq!(
+                sol.solver_method, "ldlt",
+                "{method:?}: expected the direct path"
+            );
+            let stretch = p * l / (E * w); // A = w * t, t = 1
+            for &nid in &[top_left, top_right] {
+                let i = model.mesh.node_index(nid).unwrap();
+                let uy = sol.displacements[i][1];
+                assert!(
+                    (uy - stretch).abs() / stretch < 1e-6,
+                    "{method:?}: node {nid} uy={uy:.6e}, exact {stretch:.6e}"
+                );
+            }
+            let ry: f64 = sol
+                .reactions
+                .iter()
+                .filter(|r| r.dof == 2)
+                .map(|r| r.value)
+                .sum();
+            assert!((ry + p).abs() < 1e-6 * p);
+            assert!(
+                sol.cond_estimate > 1e4,
+                "{method:?}: cond estimate {}",
+                sol.cond_estimate
+            );
+        }
     }
 
     #[test]

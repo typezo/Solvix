@@ -269,7 +269,7 @@ pub(crate) mod tests {
         Mesh { nodes, elements }
     }
 
-    fn model_with_mesh(mesh: Mesh) -> Model {
+    pub(crate) fn model_with_mesh(mesh: Mesh) -> Model {
         let n_elem = mesh.elements.len();
         Model {
             mesh,

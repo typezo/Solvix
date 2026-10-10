@@ -1045,6 +1045,7 @@ mod tests {
             reactions: vec![],
             iterations: 390,
             final_residual: 6.933e-11,
+            ..Solution::default()
         };
         assert_eq!(
             results_json("cantilever", &sol),
