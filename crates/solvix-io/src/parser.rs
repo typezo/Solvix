@@ -1,7 +1,7 @@
 //! Abaqus `.inp` parser for the v0.1 keyword subset (issue #2), extended
-//! with multi-step, `*DLOAD` and `*DENSITY` (issue #26), and the thermal
+//! with multi-step, `*DLOAD` and `*DENSITY` (issue #26), the thermal
 //! keywords `*CONDUCTIVITY`, `*EXPANSION`, `*TEMPERATURE`, `*DFLUX`
-//! (issue #27).
+//! (issue #27), and transient dynamics `*DYNAMIC` + `*DAMPING` (#28).
 //!
 //! Line model: `**…` comments and blank lines are dropped up front; every
 //! remaining line is either a keyword line (`*NAME, KEY=VALUE, …`, parsed
@@ -14,14 +14,19 @@
 //! A single-step deck mirrors its BCs/loads into the legacy top-level
 //! Model fields so v0.1 consumers see exactly the old picture.
 //! Thermal BCs/fluxes (#27) accumulate the same way but live on steps
-//! only (no legacy top-level counterpart).
+//! only (no legacy top-level counterpart). Dynamics (#28) likewise:
+//! `*DYNAMIC` in a step records its time integration parameters; v1
+//! treats `*DAMPING` as ONE Rayleigh pair covering the whole model
+//! (Abaqus nests it per-material under `*MATERIAL`; the parser accepts
+//! it there with `ALPHA=`/`BETA=` parameters or a `alpha, beta` data
+//! line, or directly inside the owning step).
 
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 use solvix_core::{
-    BoundaryCondition, ConcentratedLoad, DistributedLoad, ElemKind, Element, ElementSet, HeatFlux,
-    Material, Model, Node, Step, TempBc,
+    BoundaryCondition, ConcentratedLoad, DistributedLoad, DynamicsSpec, ElemKind, Element,
+    ElementSet, HeatFlux, Material, Model, Node, Step, TempBc,
 };
 
 use super::{ParseError, ParseReport};
@@ -48,6 +53,10 @@ struct StepAcc {
     temp_bcs: Vec<TempBc>,
     heat_fluxes: Vec<HeatFlux>,
     heat_source: Option<f64>,
+    /// *DYNAMIC time integration: (dt, duration).
+    dyn_dt: Option<(f64, f64)>,
+    /// *DAMPING Rayleigh pair (alpha, beta) set inside this step.
+    damping: Option<(f64, f64)>,
 }
 
 /// OP=NEW/MOD of a keyword line: `true` when OP=NEW, warning on anything
@@ -87,6 +96,9 @@ pub(super) fn parse_inp(text: &str) -> Result<(Model, ParseReport), ParseError> 
     let mut steps_done: Vec<StepAcc> = Vec::new();
     let mut cur: Option<StepAcc> = None;
     let mut step_no = 0usize;
+    // Model-wide Rayleigh damping from *DAMPING outside any step
+    // (Abaqus puts it under *MATERIAL); applied to every *DYNAMIC step.
+    let mut model_damping: Option<(f64, f64)> = None;
 
     let mut j = 0usize;
     while j < items.len() {
@@ -104,7 +116,7 @@ pub(super) fn parse_inp(text: &str) -> Result<(Model, ParseReport), ParseError> 
         if let Some(name) = &pending_material {
             if !matches!(
                 kw.name.as_str(),
-                "elastic" | "density" | "conductivity" | "expansion"
+                "elastic" | "density" | "conductivity" | "expansion" | "damping"
             ) {
                 report.warnings.push(format!(
                     "line {}: material '{name}' has no *ELASTIC block",
@@ -950,6 +962,123 @@ pub(super) fn parse_inp(text: &str) -> Result<(Model, ParseReport), ParseError> 
                 }
             }
 
+            "dynamic" => {
+                let Some(acc) = cur.as_mut() else {
+                    report.warnings.push(format!(
+                        "line {}: *DYNAMIC outside *STEP — ignored (dynamics live in steps)",
+                        kw.line
+                    ));
+                    j += 1;
+                    while matches!(items.get(j), Some(Item::Data { .. })) {
+                        j += 1;
+                    }
+                    continue;
+                };
+                for key in kw.params.keys() {
+                    report.warnings.push(format!(
+                        "line {}: *DYNAMIC parameter '{key}' ignored (v1: implicit Newmark, constant dt only)",
+                        kw.line
+                    ));
+                }
+                j += 1;
+                let mut rows = 0usize;
+                let mut damping_row: Option<(f64, f64)> = None;
+                while let Some(Item::Data { line: dno, text }) = items.get(j) {
+                    let f = fields(text);
+                    if rows == 0 {
+                        if f.len() != 2 {
+                            return err(
+                                *dno,
+                                format!(
+                                    "*DYNAMIC expects dt, duration; got {} field(s) (automatic incrementation is v0.5)",
+                                    f.len()
+                                ),
+                            );
+                        }
+                        acc.dyn_dt = Some((
+                            num(f[0], *dno, "time increment")?,
+                            num(f[1], *dno, "time duration")?,
+                        ));
+                    } else if rows == 1 {
+                        // v1: optional second line carries the Rayleigh
+                        // pair (alpha, beta) — *DAMPING semantics inline.
+                        if f.len() != 2 {
+                            return err(
+                                *dno,
+                                format!(
+                                    "*DYNAMIC damping line expects alpha, beta; got {} field(s)",
+                                    f.len()
+                                ),
+                            );
+                        }
+                        damping_row = Some((num(f[0], *dno, "alpha")?, num(f[1], *dno, "beta")?));
+                    } else {
+                        report
+                            .warnings
+                            .push(format!("line {dno}: extra *DYNAMIC row ignored"));
+                    }
+                    rows += 1;
+                    j += 1;
+                }
+                if let Some(pair) = damping_row {
+                    acc.damping = Some(pair);
+                }
+            }
+
+            "damping" => {
+                // v1: one Rayleigh pair for the whole model — from
+                // ALPHA=/BETA= parameters or a 'alpha, beta' data line,
+                // wherever the keyword appears (in *MATERIAL or a step).
+                let from_params = match (kw.params.get("alpha"), kw.params.get("beta")) {
+                    (Some(a), Some(b)) => {
+                        Some((num(a, kw.line, "alpha")?, num(b, kw.line, "beta")?))
+                    }
+                    (None, None) => None,
+                    _ => return err(kw.line, "*DAMPING needs both ALPHA= and BETA=".to_string()),
+                };
+                for key in kw.params.keys() {
+                    if key != "alpha" && key != "beta" {
+                        report.warnings.push(format!(
+                            "line {}: *DAMPING parameter '{key}' ignored (v1: ALPHA/BETA only)",
+                            kw.line
+                        ));
+                    }
+                }
+                j += 1;
+                let mut got = from_params;
+                if got.is_none() {
+                    if let Some(Item::Data { line: dno, text }) = items.get(j) {
+                        let f = fields(text);
+                        if f.len() != 2 {
+                            return err(
+                                *dno,
+                                format!(
+                                    "*DAMPING data expects alpha, beta; got {} field(s)",
+                                    f.len()
+                                ),
+                            );
+                        }
+                        got = Some((num(f[0], *dno, "alpha")?, num(f[1], *dno, "beta")?));
+                        j += 1;
+                    }
+                }
+                while matches!(items.get(j), Some(Item::Data { .. })) {
+                    j += 1;
+                }
+                match got {
+                    Some(pair) => match cur.as_mut() {
+                        Some(acc) => acc.damping = Some(pair),
+                        None => model_damping = Some(pair),
+                    },
+                    None => {
+                        return err(
+                            kw.line,
+                            "*DAMPING needs ALPHA=/BETA= or a data line 'alpha, beta'".to_string(),
+                        )
+                    }
+                }
+            }
+
             "static" => {
                 if !kw.params.is_empty() {
                     report.warnings.push(format!(
@@ -1008,9 +1137,25 @@ pub(super) fn parse_inp(text: &str) -> Result<(Model, ParseReport), ParseError> 
             model.boundary_conditions = steps_done[0].bcs.clone();
             model.cloads = steps_done[0].cloads.clone();
         }
-        model.steps = steps_done
-            .into_iter()
-            .map(|a| Step {
+        let mut steps_out = Vec::with_capacity(steps_done.len());
+        for a in steps_done {
+            if a.damping.is_some() && a.dyn_dt.is_none() {
+                report.warnings.push(format!(
+                    "*DAMPING in step '{}' without *DYNAMIC — ignored",
+                    a.name
+                ));
+            }
+            let dynamics = a.dyn_dt.map(|(dt, duration)| {
+                let (rayleigh_alpha, rayleigh_beta) =
+                    a.damping.or(model_damping).unwrap_or((0.0, 0.0));
+                DynamicsSpec {
+                    dt,
+                    duration,
+                    rayleigh_alpha,
+                    rayleigh_beta,
+                }
+            });
+            steps_out.push(Step {
                 name: a.name,
                 boundary_conditions: a.bcs,
                 cloads: a.cloads,
@@ -1019,8 +1164,10 @@ pub(super) fn parse_inp(text: &str) -> Result<(Model, ParseReport), ParseError> 
                 temp_bcs: a.temp_bcs,
                 heat_fluxes: a.heat_fluxes,
                 heat_source: a.heat_source,
-            })
-            .collect();
+                dynamics,
+            });
+        }
+        model.steps = steps_out;
     }
     Ok((model, report))
 }
@@ -1770,5 +1917,152 @@ TIP, 2, -50.0
             let got = sol.temperatures[m.mesh.node_index(node.id).unwrap()];
             assert!((got - exact).abs() < 1e-8, "node: {got} vs {exact}");
         }
+    }
+
+    // ---- issue #28: *DYNAMIC + *DAMPING ----
+
+    #[test]
+    fn dynamic_step_and_material_damping_parse() {
+        // *DAMPING with ALPHA=/BETA= under *MATERIAL (Abaqus placement),
+        // picked up by the step's *DYNAMIC.
+        let deck = plate_deck(
+            "*DAMPING, ALPHA=2.0, BETA=1.0E-5\n",
+            concat!(
+                "*STEP, NAME=SHOCK\n*DYNAMIC\n1.0E-4, 0.25\n",
+                "*DLOAD\nALL, P1, 1.0e3\n",
+                "*BOUNDARY\nBASE, 1, 2\n*END STEP\n"
+            ),
+        );
+        let (m, r) = parse_inp(&deck).unwrap();
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert_eq!(m.steps.len(), 1);
+        assert_eq!(
+            m.steps[0].dynamics,
+            Some(DynamicsSpec {
+                dt: 1.0e-4,
+                duration: 0.25,
+                rayleigh_alpha: 2.0,
+                rayleigh_beta: 1.0e-5,
+            })
+        );
+        assert_eq!(m.steps[0].dloads.len(), 4);
+    }
+
+    #[test]
+    fn dynamic_inline_damping_and_step_damping_data_line_parse() {
+        // Second *DYNAMIC data line carries the Rayleigh pair inline.
+        let deck = plate_deck(
+            "",
+            concat!(
+                "*STEP\n*DYNAMIC\n1.0E-3, 0.01\n0.5, 2.0E-6\n",
+                "*BOUNDARY\nBASE, 1, 2\n*END STEP\n"
+            ),
+        );
+        let (m, r) = parse_inp(&deck).unwrap();
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert_eq!(
+            m.steps[0].dynamics,
+            Some(DynamicsSpec {
+                dt: 1.0e-3,
+                duration: 0.01,
+                rayleigh_alpha: 0.5,
+                rayleigh_beta: 2.0e-6,
+            })
+        );
+
+        // *DAMPING data-line form inside the step overrides the
+        // material-level default.
+        let deck = plate_deck(
+            "*DAMPING\n9.0, 9.0E-4\n",
+            concat!(
+                "*STEP\n*DAMPING\n0.25, 1.0E-6\n*DYNAMIC\n5.0E-4, 0.05\n",
+                "*BOUNDARY\nBASE, 1, 2\n*END STEP\n"
+            ),
+        );
+        let (m, r) = parse_inp(&deck).unwrap();
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let d = m.steps[0].dynamics.clone().unwrap();
+        assert_eq!(
+            (d.dt, d.duration, d.rayleigh_alpha, d.rayleigh_beta),
+            (5.0e-4, 0.05, 0.25, 1.0e-6)
+        );
+    }
+
+    #[test]
+    fn dynamic_step_solves_transient() {
+        // End-to-end: parsed *DYNAMIC deck runs through solve_dynamic.
+        let deck = plate_deck(
+            "*DENSITY\n7850.,\n",
+            concat!(
+                "*STEP\n*DYNAMIC\n1.0E-3, 0.01\n",
+                "*BOUNDARY\nBASE, 1, 2\n*CLOAD\n9, 2, -10.0\n*END STEP\n"
+            ),
+        );
+        let (m, r) = parse_inp(&deck).unwrap();
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let sol = solvix_core::solve_dynamic(&m).unwrap();
+        assert_eq!(sol.points.len(), 11);
+        assert_eq!(sol.iterations_total, 10);
+        assert_eq!(sol.points.last().unwrap().time, 0.01);
+    }
+
+    #[test]
+    fn dynamic_errors_and_warnings_carry_line_numbers() {
+        // Outside a step: warning, block skipped.
+        let deck = plate_deck("*DYNAMIC\n1.0E-4, 0.1\n", "");
+        let (m, r) = parse_inp(&deck).unwrap();
+        assert_eq!(r.warnings.len(), 1);
+        assert!(r.warnings[0].contains("*DYNAMIC outside *STEP"));
+        assert!(m.steps.is_empty());
+
+        // Bad data line count: fatal with the data line's number.
+        // plate_deck: steps text starts at line 23 (*STEP), *DYNAMIC at
+        // 24, data at 25.
+        let deck = plate_deck(
+            "",
+            "*STEP\n*DYNAMIC\n1.0E-4\n*BOUNDARY\nBASE, 1, 2\n*END STEP\n",
+        );
+        let e = parse_inp(&deck).unwrap_err();
+        assert_eq!(e.line, 25);
+        assert!(e.message.contains("dt, duration"));
+
+        // *DAMPING without values: fatal.
+        let e = parse_inp(concat!(
+            "*NODE\n1,0,0\n2,1,0\n3,0,1\n",
+            "*ELEMENT, TYPE=CPS3, ELSET=E\n1, 1, 2, 3\n",
+            "*MATERIAL, NAME=M\n*ELASTIC\n1.0E9, 0.3\n*DAMPING\n*BOUNDARY\n1, 1, 2\n"
+        ))
+        .unwrap_err();
+        assert_eq!(e.line, 10);
+        assert!(e.message.contains("*DAMPING needs"));
+
+        // Only ALPHA= given: fatal (needs the pair).
+        let e = parse_inp(concat!(
+            "*NODE\n1,0,0\n2,1,0\n3,0,1\n",
+            "*ELEMENT, TYPE=CPS3, ELSET=E\n1, 1, 2, 3\n",
+            "*MATERIAL, NAME=M\n*ELASTIC\n1.0E9, 0.3\n*DAMPING, ALPHA=1.0\n*BOUNDARY\n1, 1, 2\n"
+        ))
+        .unwrap_err();
+        assert!(e.message.contains("both ALPHA= and BETA="));
+
+        // *DYNAMIC parameters warn (v1: constant dt, implicit only).
+        let deck = plate_deck(
+            "",
+            "*STEP\n*DYNAMIC, EXPLICIT\n1.0E-4, 0.1\n*BOUNDARY\nBASE, 1, 2\n*END STEP\n",
+        );
+        let (m, r) = parse_inp(&deck).unwrap();
+        assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
+        assert!(r.warnings[0].contains("'explicit'"));
+        assert!(m.steps[0].dynamics.is_some());
+
+        // *DAMPING in a step without *DYNAMIC warns and is dropped.
+        let deck = plate_deck(
+            "",
+            "*STEP\n*DAMPING\n1.0, 1.0E-6\n*STATIC\n*BOUNDARY\nBASE, 1, 2\n*END STEP\n",
+        );
+        let (m, r) = parse_inp(&deck).unwrap();
+        assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
+        assert!(r.warnings[0].contains("without *DYNAMIC"));
+        assert!(m.steps[0].dynamics.is_none());
     }
 }

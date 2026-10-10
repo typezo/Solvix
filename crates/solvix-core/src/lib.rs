@@ -14,10 +14,14 @@
 //! [`solve_modal`] (backed by `modal`) extracts the smallest natural
 //! frequencies and mass-normalized mode shapes. [`solve_thermal`] and
 //! [`solve_thermomech`] (backed by `heat`) run steady-state conduction
-//! and the sequential thermal-stress pass.
+//! and the sequential thermal-stress pass. [`solve_dynamic`] (backed by
+//! the `dyn.rs` module) runs implicit Newmark transient dynamics with
+//! Rayleigh damping.
 
 mod assembly;
 pub mod buckle;
+#[path = "dyn.rs"]
+mod dynamics;
 mod element;
 mod heat;
 mod ldl;
@@ -164,6 +168,20 @@ pub struct HeatFlux {
     pub magnitude: f64,
 }
 
+/// Transient dynamics definition of a step (`*DYNAMIC`): implicit
+/// Newmark average-acceleration integration with a constant time step.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DynamicsSpec {
+    /// Constant time increment in seconds.
+    pub dt: f64,
+    /// Total step time in seconds (`duration/dt` steps are taken).
+    pub duration: f64,
+    /// Rayleigh mass damping alpha: `C = alpha M + beta K` (`*DAMPING`).
+    pub rayleigh_alpha: f64,
+    /// Rayleigh stiffness damping beta: `C = alpha M + beta K`.
+    pub rayleigh_beta: f64,
+}
+
 /// One analysis step: its boundary conditions and loads. Steps built by
 /// the `solvix-io` parser carry the ACCUMULATED state at the end of that
 /// step (linear static = superposition): OP=NEW/MOD semantics are
@@ -188,6 +206,11 @@ pub struct Step {
     /// Volumetric heat generation in W/m^3 (`*DFLUX` BN), one value for
     /// the whole model.
     pub heat_source: Option<f64>,
+    /// Transient dynamics (`*DYNAMIC`): when set, the step's loads are
+    /// applied as a step function at t = 0 and held constant, and
+    /// [`solve_dynamic`] integrates the step. Steps only (no legacy
+    /// top-level counterpart).
+    pub dynamics: Option<DynamicsSpec>,
 }
 
 /// A complete, solvable model.
@@ -407,6 +430,7 @@ pub enum Method {
     Ldlt,
 }
 
+pub use dynamics::{solve_dynamic, DynOptions, DynSolution, TimePoint};
 pub use heat::{solve_thermal, solve_thermomech, ThermalSolution};
 pub use modal::{solve_modal, ModalOptions, ModalSolution};
 
