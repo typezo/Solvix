@@ -329,8 +329,8 @@ fn kirsch_deck() -> String {
             fx[i + 1] += sigma * t * 0.5 * (1.0 + s_gp) * nx * ds;
         }
     }
-    for i in 0..=nt {
-        s.push_str(&format!("{}, 1, {:.6}\n", id(i, nr), fx[i]));
+    for (i, f) in fx.iter().enumerate() {
+        s.push_str(&format!("{}, 1, {:.6}\n", id(i, nr), f));
     }
     close_step(&mut s);
     s
