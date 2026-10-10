@@ -32,7 +32,7 @@
             name="path"
             type="text"
             spellcheck="false"
-            value="examples/cantilever.inp"
+            value="examples/cantilever3d.inp"
             aria-describedby="job-bar-help"
           >
           <button class="button primary" type="submit" id="run-button">Run</button>
@@ -209,9 +209,10 @@
             <span class="muted-line">JSON responses · agent-ready REPL</span>
           </div>
           <div class="console-actions">
-            <button type="button" class="button command-hint" data-command="run examples/cantilever.inp">run examples/cantilever.inp</button>
+            <button type="button" class="button command-hint" data-command="run examples/cantilever3d.inp">run cantilever3d</button>
+            <button type="button" class="button command-hint" data-command="model cantilever3d">model cantilever3d</button>
+            <button type="button" class="button command-hint" data-command="results cantilever3d">results cantilever3d</button>
             <button type="button" class="button command-hint" data-command="model cantilever">model cantilever</button>
-            <button type="button" class="button command-hint" data-command="results cantilever">results cantilever</button>
             <button type="button" class="button command-hint" data-command="agent">agent</button>
             <button type="button" class="button ghost copy-button" data-copy="console" title="Copy the complete JSON console transcript">Copy JSON</button>
           </div>
@@ -224,7 +225,7 @@
             class="console-input"
             type="text"
             spellcheck="false"
-            placeholder="run examples/cantilever.inp · model cantilever · results cantilever · agent · help"
+            placeholder="run examples/cantilever3d.inp · model cantilever3d · model cantilever · agent · help"
             aria-describedby="command-hint"
           >
           <button class="button primary" type="submit">Execute</button>

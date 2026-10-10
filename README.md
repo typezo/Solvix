@@ -45,6 +45,7 @@ left, a canvas viewport in the center, and a JSON message console below.
 | Mesh view | Contour view | Deformed shape |
 |:---:|:---:|:---:|
 | ![Mesh view with the model tree populated](docs/screenshots/ui-mesh.png) | ![Von Mises contour with legend](docs/screenshots/ui-contour.png) | ![Deformed shape over the undeformed wireframe](docs/screenshots/ui-deformed.png) |
+| 3D solid elements (C3D8) — `cantilever3d.inp`, arcball view | `docs/screenshots/ui-3d.png` |
 
 - **Mesh view** — the `examples/cantilever.inp` deck loaded through the job
   bar: the model tree (left, like the Abaqus CAE Model DB) lists nodes,

@@ -31,11 +31,69 @@
     residual: 6.933e-11,
   };
 
+  const embeddedModel3D = {
+    ok: true,
+    job: "cantilever3d",
+    nodes: [
+      [1,0.0,0.0,0.0], [2,1.0,0.0,0.0], [3,2.0,0.0,0.0], [4,3.0,0.0,0.0], [5,4.0,0.0,0.0],
+      [6,0.0,1.0,0.0], [7,1.0,1.0,0.0], [8,2.0,1.0,0.0], [9,3.0,1.0,0.0], [10,4.0,1.0,0.0],
+      [11,0.0,0.0,0.5], [12,1.0,0.0,0.5], [13,2.0,0.0,0.5], [14,3.0,0.0,0.5], [15,4.0,0.0,0.5],
+      [16,0.0,1.0,0.5], [17,1.0,1.0,0.5], [18,2.0,1.0,0.5], [19,3.0,1.0,0.5], [20,4.0,1.0,0.5],
+      [21,0.0,0.0,1.0], [22,1.0,0.0,1.0], [23,2.0,0.0,1.0], [24,3.0,0.0,1.0], [25,4.0,0.0,1.0],
+      [26,0.0,1.0,1.0], [27,1.0,1.0,1.0], [28,2.0,1.0,1.0], [29,3.0,1.0,1.0], [30,4.0,1.0,1.0],
+    ],
+    elements: [
+      [1,"c3d8",[1,2,7,6,11,12,17,16]],
+      [2,"c3d8",[2,3,8,7,12,13,18,17]],
+      [3,"c3d8",[3,4,9,8,13,14,19,18]],
+      [4,"c3d8",[4,5,10,9,14,15,20,19]],
+      [5,"c3d8",[11,12,17,16,21,22,27,26]],
+      [6,"c3d8",[12,13,18,17,22,23,28,27]],
+      [7,"c3d8",[13,14,19,18,23,24,29,28]],
+      [8,"c3d8",[14,15,20,19,24,25,30,29]],
+    ],
+    nsets: {
+      FIX: [1,6,11,16,21,26],
+      TIP: [5,10,15,20,25,30],
+    },
+    elsets: { ALL: [1,2,3,4,5,6,7,8] },
+    materials: [{"name": "STEEL","young": 210000000000.0,"poisson": 0.3}],
+    bcs: [{"nodes": [1,6,11,16,21,26],"dofs": [1,2,3]}],
+    cloads: [
+      [5,2,-1666.6666666666667], [10,2,-1666.6666666666667], [15,2,-1666.6666666666667],
+      [20,2,-1666.6666666666667], [25,2,-1666.6666666666667], [30,2,-1666.6666666666667]
+    ],
+  };
+
+  const embeddedResults3D = {
+    ok: true,
+    job: "cantilever3d",
+    displacements: [
+      [-0.0,-0.0,0.0], [-1.0448979591836738e-11,-4.476190476190476e-06,0.0], [-4.179591836734695e-11,-8.38095238095238e-06,0.0],
+      [-9.404081632653064e-11,-1.1142857142857143e-05,0.0], [-1.671836734693878e-10,-1.219047619047619e-05,0.0], [-0.0,-0.0,0.0],
+      [-1.0448979591836738e-11,-4.476190476190476e-06,0.0], [-4.179591836734695e-11,-8.38095238095238e-06,0.0], [-9.404081632653064e-11,-1.1142857142857143e-05,0.0],
+      [-1.671836734693878e-10,-1.219047619047619e-05,0.0], [-0.0,-0.0,0.0], [-1.0448979591836738e-11,-4.476190476190476e-06,0.0],
+      [-4.179591836734695e-11,-8.38095238095238e-06,0.0], [-9.404081632653064e-11,-1.1142857142857143e-05,0.0], [-1.671836734693878e-10,-1.219047619047619e-05,0.0],
+      [-0.0,-0.0,0.0], [-1.0448979591836738e-11,-4.476190476190476e-06,0.0], [-4.179591836734695e-11,-8.38095238095238e-06,0.0],
+      [-9.404081632653064e-11,-1.1142857142857143e-05,0.0], [-1.671836734693878e-10,-1.219047619047619e-05,0.0], [-0.0,-0.0,0.0],
+      [-1.0448979591836738e-11,-4.476190476190476e-06,0.0], [-4.179591836734695e-11,-8.38095238095238e-06,0.0], [-9.404081632653064e-11,-1.1142857142857143e-05,0.0],
+      [-1.671836734693878e-10,-1.219047619047619e-05,0.0], [-0.0,-0.0,0.0], [-1.0448979591836738e-11,-4.476190476190476e-06,0.0],
+      [-4.179591836734695e-11,-8.38095238095238e-06,0.0], [-9.404081632653064e-11,-1.1142857142857143e-05,0.0], [-1.671836734693878e-10,-1.219047619047619e-05,0.0]
+    ],
+    von_mises: [238000.0,171000.0,114000.0,68000.0,221000.0,155000.0,101000.0,57000.0],
+    max_disp_mm: 0.01219047619047619,
+    max_von_mises_mpa: 0.238,
+    iterations: 96,
+    residual: 4.8e-11,
+  };
+
   const scriptUrl =
     (document.currentScript && document.currentScript.src) ||
     new URL("app.js", document.baseURI).href;
   const mockModelUrl = new URL("mock/model.json", scriptUrl);
   const mockResultsUrl = new URL("mock/results.json", scriptUrl);
+  const mockModel3DUrl = new URL("mock/model3d.json", scriptUrl);
+  const mockResults3DUrl = new URL("mock/results3d.json", scriptUrl);
 
   const dom = {};
   const requiredIds = [
@@ -74,9 +132,17 @@
     resultsSource: "not loaded",
     resultsError: null,
     runResponse: null,
-    jobs: ["cantilever"],
+    jobs: ["cantilever3d", "cantilever"],
+    is3D: false,
     modelBounds: null,
     camera: { scale: 100, cx: 0, cy: 0 },
+    camera3D: {
+      scale: 100,
+      cx: 0,
+      cy: 0,
+      cz: 0,
+      rotation: initial3DRotation(),
+    },
     pointer: null,
     cursorWorld: null,
     display: {
@@ -138,11 +204,99 @@
     return `${fmt(meters * 1e9, 3)} nm`;
   }
 
+  const HEX_EDGE_INDICES = Object.freeze([
+    [0, 1], [1, 2], [2, 3], [3, 0],
+    [4, 5], [5, 6], [6, 7], [7, 4],
+    [0, 4], [1, 5], [2, 6], [3, 7],
+  ].map(Object.freeze));
+
+  const TET_EDGE_INDICES = Object.freeze([
+    [0, 1], [1, 2], [2, 0], [0, 3], [1, 3], [2, 3],
+  ].map(Object.freeze));
+
+  function is3DModel(nodes, elements) {
+    for (const node of nodes.values()) {
+      if (Math.abs(node.z) > 1e-12) return true;
+    }
+    for (const element of elements.values()) {
+      if (element.type === "c3d8" || element.type === "c3d4") return true;
+    }
+    return false;
+  }
+
+  function reconstructC3D8Depth(nodes, elements) {
+    // Compatibility for API payloads emitted before issue #6: nodes are
+    // [id,x,y] even for C3D8 decks. Abaqus hex connectivity gives a bottom
+    // face (0..3) followed by its corresponding top face (4..7), so a stack's
+    // missing depth coordinate can be recovered as a one-dimensional level
+    // chain. The in-plane extent supplies a conservative layer spacing.
+    if (nodes.size === 0 || elements.size === 0) return nodes;
+    if (!Array.from(elements.values()).every((element) => element.type === "c3d8")) {
+      return nodes;
+    }
+
+    const parent = new Map();
+    const child = new Map();
+    for (const element of elements.values()) {
+      if (element.connectivity.length !== 8) return nodes;
+      for (let i = 0; i < 4; i += 1) {
+        const lower = element.connectivity[i];
+        const upper = element.connectivity[i + 4];
+        if (!nodes.has(lower) || !nodes.has(upper) || lower === upper) return nodes;
+        if (parent.has(upper) && parent.get(upper) !== lower) return nodes;
+        if (child.has(lower) && child.get(lower) !== upper) return nodes;
+        parent.set(upper, lower);
+        child.set(lower, upper);
+      }
+    }
+
+    const levels = new Map();
+    const visit = (nodeId, level) => {
+      const known = levels.get(nodeId);
+      if (known !== undefined) return known === level;
+      levels.set(nodeId, level);
+      const next = child.get(nodeId);
+      return next === undefined || visit(next, level + 1);
+    };
+
+    const roots = Array.from(nodes.keys()).filter((nodeId) => !parent.has(nodeId));
+    if (!roots.length || !roots.every((nodeId) => visit(nodeId, 0))) return nodes;
+    if (levels.size !== nodes.size) return nodes;
+
+    let maxLevel = 0;
+    levels.forEach((level) => {
+      maxLevel = Math.max(maxLevel, level);
+    });
+    if (maxLevel === 0) return nodes;
+
+    const xs = Array.from(nodes.values(), (node) => node.x);
+    const ys = Array.from(nodes.values(), (node) => node.y);
+    const range = Math.min(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys));
+    const first = elements.values().next().value;
+    const edgeLengths = first.connectivity.slice(0, 4).map((id, index, ids) => {
+      const a = nodes.get(id);
+      const b = nodes.get(ids[(index + 1) % 4]);
+      return Math.hypot(a.x - b.x, a.y - b.y);
+    }).sort((a, b) => a - b);
+    const fallbackSpacing = edgeLengths[Math.floor(edgeLengths.length / 2)] || 1;
+    const spacing = range > 0 ? range / maxLevel : fallbackSpacing;
+    const centerLevel = maxLevel / 2;
+
+    const output = new Map();
+    nodes.forEach((node, id) => {
+      output.set(id, Object.assign({}, node, {
+        z: (levels.get(id) - centerLevel) * spacing,
+      }));
+    });
+    return output;
+  }
+
   function normalizeModel(raw) {
     const nodes = new Map();
     const elements = new Map();
     const nsets = new Map();
     const elsets = new Map();
+    let hasDepthCoordinate = false;
 
     for (const item of Array.isArray(raw.nodes) ? raw.nodes : []) {
       const id = Number(item && item[0]);
@@ -153,6 +307,7 @@
         y: number(item[2]),
         z: number(item[3]),
       });
+      hasDepthCoordinate = hasDepthCoordinate || item.length >= 4;
     }
 
     for (const item of Array.isArray(raw.elements) ? raw.elements : []) {
@@ -165,13 +320,17 @@
       });
     }
 
+    const physicalNodes = hasDepthCoordinate
+      ? nodes
+      : reconstructC3D8Depth(nodes, elements);
+
     const setMapper = (value) => new Set(Array.isArray(value) ? value.map(Number) : []);
     Object.entries(raw.nsets || {}).forEach(([name, value]) => nsets.set(name, setMapper(value)));
     Object.entries(raw.elsets || {}).forEach(([name, value]) => elsets.set(name, setMapper(value)));
 
     return {
       job: String(raw.job || state.job),
-      nodes,
+      nodes: physicalNodes,
       elements,
       nsets,
       elsets,
@@ -215,8 +374,11 @@
       maxX: Math.max(acc.maxX, node.x),
       minY: Math.min(acc.minY, node.y),
       maxY: Math.max(acc.maxY, node.y),
+      minZ: Math.min(acc.minZ, node.z),
+      maxZ: Math.max(acc.maxZ, node.z),
     }), {
       minX: Infinity, maxX: -Infinity, minY: Infinity, maxY: -Infinity,
+      minZ: Infinity, maxZ: -Infinity,
     });
     return bounds;
   }
@@ -229,6 +391,8 @@
       maxX: Math.max(a.maxX, b.maxX),
       minY: Math.min(a.minY, b.minY),
       maxY: Math.max(a.maxY, b.maxY),
+      minZ: Math.min(a.minZ, b.minZ),
+      maxZ: Math.max(a.maxZ, b.maxZ),
     };
   }
 
@@ -263,9 +427,230 @@
     if (!bounds || !state.results || state.display.deformationPercent === 0) return 0;
     const maximum = maxDisplacementMagnitude();
     if (!(maximum > 0)) return 0;
-    const diagonal = Math.hypot(bounds.maxX - bounds.minX, bounds.maxY - bounds.minY);
+    const diagonal = state.is3D
+      ? Math.hypot(bounds.maxX - bounds.minX, bounds.maxY - bounds.minY, bounds.maxZ - bounds.minZ)
+      : Math.hypot(bounds.maxX - bounds.minX, bounds.maxY - bounds.minY);
     if (!(diagonal > 0)) return 0;
     return (state.display.deformationPercent / 100) * diagonal / maximum;
+  }
+
+  function matrixIdentity() {
+    return [1, 0, 0, 0, 1, 0, 0, 0, 1];
+  }
+
+  function matrixMultiply(a, b) {
+    return [
+      a[0] * b[0] + a[1] * b[3] + a[2] * b[6],
+      a[0] * b[1] + a[1] * b[4] + a[2] * b[7],
+      a[0] * b[2] + a[1] * b[5] + a[2] * b[8],
+      a[3] * b[0] + a[4] * b[3] + a[5] * b[6],
+      a[3] * b[1] + a[4] * b[4] + a[5] * b[7],
+      a[3] * b[2] + a[4] * b[5] + a[5] * b[8],
+      a[6] * b[0] + a[7] * b[3] + a[8] * b[6],
+      a[6] * b[1] + a[7] * b[4] + a[8] * b[7],
+      a[6] * b[2] + a[7] * b[5] + a[8] * b[8],
+    ];
+  }
+
+  function matrixTranspose(matrix) {
+    return [
+      matrix[0], matrix[3], matrix[6],
+      matrix[1], matrix[4], matrix[7],
+      matrix[2], matrix[5], matrix[8],
+    ];
+  }
+
+  function matrixVectorMultiply(matrix, vector) {
+    return [
+      matrix[0] * vector[0] + matrix[1] * vector[1] + matrix[2] * vector[2],
+      matrix[3] * vector[0] + matrix[4] * vector[1] + matrix[5] * vector[2],
+      matrix[6] * vector[0] + matrix[7] * vector[1] + matrix[8] * vector[2],
+    ];
+  }
+
+  function rotationAxisAngle(axis, angle) {
+    const length = Math.hypot(axis[0], axis[1], axis[2]);
+    if (!(length > 0) || angle === 0) return matrixIdentity();
+    const [x, y, z] = axis.map((value) => value / length);
+    const cosine = Math.cos(angle);
+    const sine = Math.sin(angle);
+    const oneMinusCosine = 1 - cosine;
+    return [
+      cosine + x * x * oneMinusCosine,
+      x * y * oneMinusCosine - z * sine,
+      x * z * oneMinusCosine + y * sine,
+      y * x * oneMinusCosine + z * sine,
+      cosine + y * y * oneMinusCosine,
+      y * z * oneMinusCosine - x * sine,
+      z * x * oneMinusCosine - y * sine,
+      z * y * oneMinusCosine + x * sine,
+      cosine + z * z * oneMinusCosine,
+    ];
+  }
+
+  function rotationBetweenUnitVectors(a, b) {
+    const dot = Math.min(1, Math.max(-1, a[0] * b[0] + a[1] * b[1] + a[2] * b[2]));
+    const axis = [
+      a[1] * b[2] - a[2] * b[1],
+      a[2] * b[0] - a[0] * b[2],
+      a[0] * b[1] - a[1] * b[0],
+    ];
+    const axisLength = Math.hypot(...axis);
+    if (axisLength > 1e-8) return rotationAxisAngle(axis, Math.atan2(axisLength, dot));
+    if (dot > 0) return matrixIdentity();
+    // A 180-degree rotation is axis-ambiguous. Choose any perpendicular axis.
+    const seed = Math.abs(a[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0];
+    const perpendicular = [
+      a[1] * seed[2] - a[2] * seed[1],
+      a[2] * seed[0] - a[0] * seed[2],
+      a[0] * seed[1] - a[1] * seed[0],
+    ];
+    return rotationAxisAngle(perpendicular, Math.PI);
+  }
+
+  function rotationXY(xAngle, yAngle) {
+    return matrixMultiply(
+      rotationAxisAngle([0, 1, 0], yAngle),
+      rotationAxisAngle([1, 0, 0], xAngle)
+    );
+  }
+
+  function initial3DRotation() {
+    return rotationXY(-22 * Math.PI / 180, -32 * Math.PI / 180);
+  }
+
+  function arcballVector(x, y, width, height) {
+    const radius = Math.max(1, Math.min(width, height) / 2);
+    const vx = (2 * x - width) / radius;
+    const vy = (height - 2 * y) / radius;
+    const lengthSquared = vx * vx + vy * vy;
+    return [vx, vy, lengthSquared <= 1 ? Math.sqrt(1 - lengthSquared) : 0];
+  }
+
+  function projectOrthographic(node, camera, rotation, width, height) {
+    const delta = [node.x - camera.cx, node.y - camera.cy, node.z - camera.cz];
+    const view = matrixVectorMultiply(rotation, delta);
+    return {
+      x: width / 2 + view[0] * camera.scale,
+      y: height / 2 - view[1] * camera.scale,
+      depth: view[2],
+    };
+  }
+
+  function fitOrthographic(bounds, rotation, width, height, margin = 72, legendWidth = 82) {
+    if (!bounds) {
+      return { scale: 100, cx: 0, cy: 0, cz: 0, rotation };
+    }
+    const center = {
+      x: (bounds.minX + bounds.maxX) / 2,
+      y: (bounds.minY + bounds.maxY) / 2,
+      z: (bounds.minZ + bounds.maxZ) / 2,
+    };
+    const camera = { scale: 1, cx: center.x, cy: center.y, cz: center.z, rotation };
+    let minX = Infinity;
+    let maxX = -Infinity;
+    let minY = Infinity;
+    let maxY = -Infinity;
+    const xUnit = [rotation[0], rotation[3], rotation[6]];
+    const yUnit = [rotation[1], rotation[4], rotation[7]];
+    const corner = (dx, dy, dz) => {
+      const point = { x: center.x + dx, y: center.y + dy, z: center.z + dz };
+      const px = (point.x - center.x) * xUnit[0]
+        + (point.y - center.y) * xUnit[1]
+        + (point.z - center.z) * xUnit[2];
+      const py = (point.x - center.x) * yUnit[0]
+        + (point.y - center.y) * yUnit[1]
+        + (point.z - center.z) * yUnit[2];
+      minX = Math.min(minX, px);
+      maxX = Math.max(maxX, px);
+      minY = Math.min(minY, py);
+      maxY = Math.max(maxY, py);
+    };
+    const halfX = Math.max((bounds.maxX - bounds.minX) / 2, 0);
+    const halfY = Math.max((bounds.maxY - bounds.minY) / 2, 0);
+    const halfZ = Math.max((bounds.maxZ - bounds.minZ) / 2, 0);
+    [-1, 1].forEach((sx) => [-1, 1].forEach((sy) => [-1, 1].forEach((sz) => {
+      corner(sx * halfX, sy * halfY, sz * halfZ);
+    })));
+    const availableWidth = Math.max(30, width - margin * 2 - legendWidth);
+    const availableHeight = Math.max(30, height - margin * 2);
+    const scale = Math.min(
+      availableWidth / Math.max(maxX - minX, 1e-12),
+      availableHeight / Math.max(maxY - minY, 1e-12)
+    );
+    return Object.assign({}, camera, { scale: Math.min(1e10, Math.max(1e-6, scale)) });
+  }
+
+  function screenToCenterWorld(x, y, camera, rotation, width, height) {
+    const cameraPoint = [
+      (x - width / 2) / camera.scale,
+      (height / 2 - y) / camera.scale,
+      0,
+    ];
+    const worldDelta = matrixVectorMultiply(matrixTranspose(rotation), cameraPoint);
+    return {
+      x: camera.cx + worldDelta[0],
+      y: camera.cy + worldDelta[1],
+      z: camera.cz + worldDelta[2],
+    };
+  }
+
+  function panOrthographic(camera, rotation, dxScreen, dyScreen) {
+    const cameraDelta = [-dxScreen / camera.scale, dyScreen / camera.scale, 0];
+    const worldDelta = matrixVectorMultiply(matrixTranspose(rotation), cameraDelta);
+    return {
+      scale: camera.scale,
+      cx: camera.cx + worldDelta[0],
+      cy: camera.cy + worldDelta[1],
+      cz: camera.cz + worldDelta[2],
+      rotation,
+    };
+  }
+
+  function zoomOrthographicAt(camera, rotation, x, y, factor, width, height) {
+    const scale = Math.min(1e10, Math.max(1e-6, camera.scale * factor));
+    const target = screenToCenterWorld(x, y, camera, rotation, width, height);
+    const nextCamera = { scale, cx: target.x, cy: target.y, cz: target.z, rotation };
+    const after = screenToCenterWorld(x, y, nextCamera, rotation, width, height);
+    return {
+      scale,
+      cx: nextCamera.cx + target.x - after.x,
+      cy: nextCamera.cy + target.y - after.y,
+      cz: nextCamera.cz + target.z - after.z,
+      rotation,
+    };
+  }
+
+  function edgeIndicesForElement(type) {
+    if (type === "c3d8") return HEX_EDGE_INDICES;
+    if (type === "c3d4") return TET_EDGE_INDICES;
+    return [];
+  }
+
+  function build3DEdgeRecords(elements, projectedNodes, elementValues = []) {
+    const records = [];
+    let elementIndex = 0;
+    for (const element of elements.values()) {
+      const indices = edgeIndicesForElement(element.type);
+      for (const [a, b] of indices) {
+        const start = projectedNodes.get(element.connectivity[a]);
+        const end = projectedNodes.get(element.connectivity[b]);
+        if (!start || !end) continue;
+        records.push({
+          elementId: element.id,
+          value: elementValues[elementIndex],
+          start,
+          end,
+          depth: (start.depth + end.depth) / 2,
+        });
+      }
+      elementIndex += 1;
+    }
+    return records;
+  }
+
+  function painterSortEdges(records) {
+    return records.slice().sort((a, b) => a.depth - b.depth);
   }
 
   async function readJSON(response) {
@@ -299,6 +684,26 @@
     }
   }
 
+  function is3DJob(job) {
+    return /3d$/i.test(String(job || ""));
+  }
+
+  function mockModelFor(job) {
+    return is3DJob(job) ? mockModel3DUrl : mockModelUrl;
+  }
+
+  function mockResultsFor(job) {
+    return is3DJob(job) ? mockResults3DUrl : mockResultsUrl;
+  }
+
+  function embeddedModelFor(job) {
+    return is3DJob(job) ? embeddedModel3D : embeddedModel;
+  }
+
+  function embeddedResultsFor(job) {
+    return is3DJob(job) ? embeddedResults3D : embeddedResults;
+  }
+
   function transportError(error) {
     return {
       ok: false,
@@ -323,7 +728,7 @@
       return true;
     } catch (apiError) {
       try {
-        const payload = await loadMock(mockModelUrl, embeddedModel);
+        const payload = await loadMock(mockModelFor(requestedJob), embeddedModelFor(requestedJob));
         applyModel(payload, "mock");
         state.modelError = transportError(apiError);
         if (!options.silent) {
@@ -358,8 +763,16 @@
       if (!options.silent) logJSON("ok", payload, "GET results");
       return true;
     } catch (apiError) {
+      // Never splice a compact 3D mock result onto a full API-sized model.
+      if (state.modelSource === "api") {
+        state.results = null;
+        state.resultsError = transportError(apiError);
+        updateInterface();
+        render();
+        return false;
+      }
       try {
-        const payload = await loadMock(mockResultsUrl, embeddedResults);
+        const payload = await loadMock(mockResultsFor(requestedJob), embeddedResultsFor(requestedJob));
         applyResults(payload, "mock");
         state.resultsError = transportError(apiError);
         if (!options.silent) {
@@ -384,8 +797,13 @@
     state.modelSource = source;
     state.modelError = null;
     state.job = state.model.job;
+    state.is3D = is3DModel(state.model.nodes, state.model.elements);
     state.modelBounds = boundsOf(state.model.nodes);
     state.selectedSets.clear();
+    state.camera3D.rotation = initial3DRotation();
+    canvas.setAttribute("aria-label", state.is3D
+      ? "Three-dimensional finite element model viewport"
+      : "Finite element model viewport");
     if (!state.jobs.includes(state.job)) {
       state.jobs.push(state.job);
     }
@@ -442,18 +860,25 @@
     dom["step-count"].textContent = model ? model.steps.length : 0;
     dom["job-tree-count"].textContent = state.jobs.length;
     dom["status-job"].textContent = `job: ${state.job}`;
-    dom["status-mesh"].textContent = `nodes: ${model ? model.nodes.size : 0} · elements: ${model ? model.elements.size : 0}`;
-    dom["data-source"].textContent = `model: ${state.modelSource} · results: ${state.resultsSource}`;
-    dom["viewport-mode-label"].textContent = viewportLabel();
-
     const types = model
       ? Array.from(model.elements.values()).reduce((counts, element) => {
         counts[element.type] = (counts[element.type] || 0) + 1;
         return counts;
       }, {})
       : {};
-    dom["element-types"].textContent = Object.keys(types).length
+    const typeText = Object.keys(types).length
       ? Object.entries(types).map(([type, count]) => `${type.toUpperCase()} × ${count}`).join(", ")
+      : "no element kinds";
+    dom["status-mesh"].textContent = model
+      ? `nodes: ${model.nodes.size} · elements: ${model.elements.size} · ${
+        state.is3D ? "3D" : "2D"
+      } · ${typeText}`
+      : "nodes: 0 · elements: 0";
+    dom["data-source"].textContent = `model: ${state.modelSource} · results: ${state.resultsSource}`;
+    dom["viewport-mode-label"].textContent = viewportLabel();
+
+    dom["element-types"].textContent = Object.keys(types).length
+      ? typeText
       : "No elements";
 
     renderSetList();
@@ -620,11 +1045,12 @@
   }
 
   function viewportLabel() {
-    if (!state.results) return "Undeformed";
+    const projection = state.is3D ? "3D · " : "";
+    if (!state.results) return `${projection}Undeformed`;
     const contour = state.display.contourMode === "vm"
       ? "von Mises"
       : state.display.contourMode === "u" ? "|U|" : "no contour";
-    return `Deformed · ${contour}`;
+    return `${projection}Deformed · ${contour}`;
   }
 
   function setStatus(message) {
@@ -734,7 +1160,9 @@
           display: Object.assign({}, state.display, {
             selectedSets: Object.fromEntries(state.selectedSets),
           }),
+          renderer: state.is3D ? "3d-orthographic" : "2d",
           camera: Object.assign({}, state.camera),
+          camera3D: Object.assign({}, state.camera3D),
           canvas: { width: canvas.clientWidth, height: canvas.clientHeight },
           warnings: state.warnings,
           modelSource: state.modelSource,
@@ -788,6 +1216,18 @@
   function fitView() {
     const bounds = currentFitBounds();
     const { width, height } = canvasSize();
+    if (state.is3D) {
+      state.camera3D = fitOrthographic(
+        bounds,
+        state.camera3D.rotation,
+        width,
+        height,
+        62,
+        state.display.contourMode === "none" ? 0 : 82
+      );
+      updateZoomStatus();
+      return;
+    }
     if (!bounds) {
       state.camera = { scale: 100, cx: 0, cy: 0 };
       updateZoomStatus();
@@ -816,32 +1256,72 @@
   }
 
   function updateZoomStatus() {
-    dom["status-zoom"].textContent = `zoom: ${fmt(state.camera.scale, 1)} px/m`;
+    const scale = state.is3D ? state.camera3D.scale : state.camera.scale;
+    dom["status-zoom"].textContent = `zoom: ${fmt(scale, 1)} px/m`;
   }
 
   canvas.addEventListener("pointerdown", (event) => {
     canvas.setPointerCapture(event.pointerId);
+    const rect = canvas.getBoundingClientRect();
+    const pan = event.shiftKey || event.button === 1 || event.button === 2;
+    const localX = event.clientX - rect.left;
+    const localY = event.clientY - rect.top;
+    const { width, height } = canvasSize();
     state.pointer = {
       id: event.pointerId,
       x: event.clientX,
       y: event.clientY,
-      camera: Object.assign({}, state.camera),
+      mode: state.is3D && !pan ? "rotate" : "pan",
+      vector: arcballVector(localX, localY, width, height),
+      camera: Object.assign({}, state.is3D ? state.camera3D : state.camera),
+      rotation: state.camera3D.rotation.slice(),
     };
-    canvas.classList.add("is-panning");
+    event.preventDefault();
+    canvas.classList.add(state.pointer.mode === "rotate" ? "is-rotating" : "is-panning");
   });
 
   canvas.addEventListener("pointermove", (event) => {
     const rect = canvas.getBoundingClientRect();
-    const world = screenToWorld(event.clientX - rect.left, event.clientY - rect.top);
-    state.cursorWorld = world;
-    dom["status-cursor"].textContent = `x: ${fmt(world.x, 5)} y: ${fmt(world.y, 5)}`;
+    const localX = event.clientX - rect.left;
+    const localY = event.clientY - rect.top;
+    const { width, height } = canvasSize();
+    if (state.is3D) {
+      const world = screenToCenterWorld(
+        localX,
+        localY,
+        state.camera3D,
+        state.camera3D.rotation,
+        width,
+        height
+      );
+      state.cursorWorld = world;
+      dom["status-cursor"].textContent =
+        `x: ${fmt(world.x, 5)} y: ${fmt(world.y, 5)} z: ${fmt(world.z, 5)}`;
+    } else {
+      const world = screenToWorld(localX, localY);
+      state.cursorWorld = world;
+      dom["status-cursor"].textContent = `x: ${fmt(world.x, 5)} y: ${fmt(world.y, 5)}`;
+    }
 
     if (!state.pointer || state.pointer.id !== event.pointerId) return;
     event.preventDefault();
     const dxScreen = event.clientX - state.pointer.x;
     const dyScreen = event.clientY - state.pointer.y;
-    state.camera.cx = state.pointer.camera.cx - dxScreen / state.camera.scale;
-    state.camera.cy = state.pointer.camera.cy + dyScreen / state.camera.scale;
+    if (state.pointer.mode === "rotate") {
+      const nextVector = arcballVector(localX, localY, width, height);
+      const delta = rotationBetweenUnitVectors(state.pointer.vector, nextVector);
+      state.camera3D.rotation = matrixMultiply(delta, state.pointer.rotation);
+    } else if (state.is3D) {
+      state.camera3D = panOrthographic(
+        state.pointer.camera,
+        state.pointer.rotation,
+        dxScreen,
+        dyScreen
+      );
+    } else {
+      state.camera.cx = state.pointer.camera.cx - dxScreen / state.camera.scale;
+      state.camera.cy = state.pointer.camera.cy + dyScreen / state.camera.scale;
+    }
     render();
   });
 
@@ -851,15 +1331,17 @@
       canvas.releasePointerCapture(event.pointerId);
     }
     state.pointer = null;
-    canvas.classList.remove("is-panning");
+    canvas.classList.remove("is-panning", "is-rotating");
   }
 
   canvas.addEventListener("pointerup", finishPointer);
   canvas.addEventListener("pointercancel", finishPointer);
   canvas.addEventListener("pointerleave", () => {
     state.cursorWorld = null;
-    dom["status-cursor"].textContent = "x: — y: —";
+    dom["status-cursor"].textContent = state.is3D ? "x: — y: — z: —" : "x: — y: —";
   });
+
+  canvas.addEventListener("contextmenu", (event) => event.preventDefault());
 
   canvas.addEventListener("wheel", (event) => {
     event.preventDefault();
@@ -867,13 +1349,25 @@
     const px = event.clientX - rect.left;
     const py = event.clientY - rect.top;
     const factor = Math.exp(-event.deltaY * 0.0014);
-    const nextScale = Math.min(1e10, Math.max(1e-6, state.camera.scale * factor));
     const { width, height } = canvasSize();
-    const before = screenToWorld(px, py);
-    state.camera.scale = nextScale;
-    // Keep the world point under the cursor fixed as the scale changes.
-    state.camera.cx = before.x - (px - width / 2) / nextScale;
-    state.camera.cy = before.y + (py - height / 2) / nextScale;
+    if (state.is3D) {
+      state.camera3D = zoomOrthographicAt(
+        state.camera3D,
+        state.camera3D.rotation,
+        px,
+        py,
+        factor,
+        width,
+        height
+      );
+    } else {
+      const nextScale = Math.min(1e10, Math.max(1e-6, state.camera.scale * factor));
+      const before = screenToWorld(px, py);
+      state.camera.scale = nextScale;
+      // Keep the world point under the cursor fixed as the scale changes.
+      state.camera.cx = before.x - (px - width / 2) / nextScale;
+      state.camera.cy = before.y + (py - height / 2) / nextScale;
+    }
     updateZoomStatus();
     render();
   }, { passive: false });
@@ -926,6 +1420,205 @@
       if (node) points.push(node);
     }
     return points;
+  }
+
+  function projected3DNodes(nodes) {
+    const { width, height } = canvasSize();
+    const output = new Map();
+    nodes.forEach((node, id) => {
+      output.set(id, Object.assign(
+        { id },
+        projectOrthographic(node, state.camera3D, state.camera3D.rotation, width, height)
+      ));
+    });
+    return output;
+  }
+
+  function draw3DMesh(nodes, deformed) {
+    if (!state.model) return new Map();
+    const projected = projected3DNodes(nodes);
+    const domain = contourDomain();
+    const elementValues = domain && domain.mode === "vm" ? state.results.vonMises : [];
+    const records = painterSortEdges(
+      build3DEdgeRecords(state.model.elements, projected, elementValues)
+    );
+
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    ctx.lineWidth = 1.05;
+    for (const edge of records) {
+      if (domain && domain.mode === "vm" && Number.isFinite(edge.value)) {
+        ctx.strokeStyle = normalizedColor(edge.value, domain);
+        ctx.globalAlpha = 0.94;
+      } else {
+        ctx.strokeStyle = deformed ? "rgba(228, 232, 246, 0.9)" : "#d8c671";
+        ctx.globalAlpha = deformed ? 0.88 : 0.94;
+      }
+      ctx.beginPath();
+      ctx.moveTo(edge.start.x, edge.start.y);
+      ctx.lineTo(edge.end.x, edge.end.y);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+
+    if (state.display.showElementIds) {
+      ctx.fillStyle = "rgba(224, 229, 246, 0.84)";
+      ctx.font = "9px ui-monospace, monospace";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      for (const element of state.model.elements.values()) {
+        let x = 0;
+        let y = 0;
+        let count = 0;
+        for (const nodeId of element.connectivity) {
+          const point = projected.get(nodeId);
+          if (!point) continue;
+          x += point.x;
+          y += point.y;
+          count += 1;
+        }
+        if (count) ctx.fillText(String(element.id), x / count, y / count);
+      }
+    }
+    return projected;
+  }
+
+  function draw3DUndeformedOverlay() {
+    if (!state.model || !state.results || !state.display.undeformedOverlay) return;
+    if (deformationFactor() === 0) return;
+    const projected = projected3DNodes(state.model.nodes);
+    const records = painterSortEdges(build3DEdgeRecords(state.model.elements, projected));
+    ctx.save();
+    ctx.strokeStyle = "rgba(216, 198, 113, 0.58)";
+    ctx.setLineDash([4, 3]);
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (const edge of records) {
+      ctx.moveTo(edge.start.x, edge.start.y);
+      ctx.lineTo(edge.end.x, edge.end.y);
+    }
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function draw3DSelectedSets(projected) {
+    if (!state.model || !state.display.highlightSets || state.selectedSets.size === 0) return;
+    ctx.save();
+    for (const [name, kind] of state.selectedSets) {
+      const set = kind === "nset" ? state.model.nsets.get(name) : state.model.elsets.get(name);
+      if (!set) continue;
+      ctx.fillStyle = "rgba(0, 211, 255, 0.18)";
+      ctx.strokeStyle = "rgba(0, 211, 255, 0.9)";
+      ctx.lineWidth = 1.7;
+      if (kind === "nset") {
+        for (const nodeId of set) {
+          const point = projected.get(nodeId);
+          if (!point) continue;
+          ctx.beginPath();
+          ctx.arc(point.x, point.y, 6, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.stroke();
+        }
+      } else {
+        const records = build3DEdgeRecords(
+          new Map(Array.from(state.model.elements).filter(([id]) => set.has(id))),
+          projected
+        );
+        ctx.beginPath();
+        for (const edge of records) {
+          ctx.moveTo(edge.start.x, edge.start.y);
+          ctx.lineTo(edge.end.x, edge.end.y);
+        }
+        ctx.stroke();
+      }
+    }
+    ctx.restore();
+  }
+
+  function draw3DNodesAndIds(projected) {
+    ctx.textAlign = "left";
+    ctx.textBaseline = "alphabetic";
+    for (const [id, point] of projected) {
+      if (state.display.showNodeDots) {
+        ctx.fillStyle = "#f2f4fb";
+        ctx.beginPath();
+        ctx.arc(point.x, point.y, 2.1, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      if (state.display.showNodeIds) {
+        ctx.fillStyle = "rgba(184, 203, 255, 0.92)";
+        ctx.font = "9px ui-monospace, monospace";
+        ctx.fillText(String(id), point.x + 5, point.y - 5);
+      }
+    }
+  }
+
+  function draw3DNodalContour(projected) {
+    const domain = contourDomain();
+    if (!domain || domain.mode !== "u" || !state.results) return;
+    const values = state.results.displacements.map((item) => Math.hypot(item[0], item[1], item[2] || 0));
+    let index = 0;
+    for (const point of Array.from(projected.values()).sort((a, b) => a.depth - b.depth)) {
+      const value = values[index] || 0;
+      ctx.fillStyle = normalizedColor(value, domain);
+      ctx.beginPath();
+      ctx.arc(point.x, point.y, 2.7, 0, Math.PI * 2);
+      ctx.fill();
+      index += 1;
+    }
+  }
+
+  function draw3DBCsAndLoads(nodes, projected) {
+    if (!state.model) return;
+    if (state.display.showBCs) {
+      ctx.fillStyle = "#ff922b";
+      ctx.strokeStyle = "rgba(255, 146, 43, 0.45)";
+      for (const bc of state.model.bcs) {
+        const ids = Array.isArray(bc && bc.nodes) ? bc.nodes : [];
+        for (const nodeId of ids) {
+          const point = projected.get(Number(nodeId));
+          if (!point) continue;
+          ctx.fillRect(point.x - 4, point.y - 4, 8, 8);
+          ctx.strokeRect(point.x - 4.5, point.y - 4.5, 9, 9);
+        }
+      }
+    }
+
+    if (!state.display.showLoads) return;
+    const rotation = state.camera3D.rotation;
+    ctx.strokeStyle = "#ff4747";
+    ctx.fillStyle = "#ff4747";
+    ctx.lineWidth = 2;
+    for (const load of state.model.cloads) {
+      if (!Array.isArray(load) || load.length < 3) continue;
+      const point = projected.get(Number(load[0]));
+      const node = nodes.get(Number(load[0]));
+      if (!point || !node) continue;
+      const dof = Number(load[1]);
+      const axis = dof === 1 ? [1, 0, 0] : dof === 2 ? [0, 1, 0] : dof === 3 ? [0, 0, 1] : null;
+      if (!axis) continue;
+      const sign = Math.sign(number(load[2])) || 1;
+      const viewDirection = matrixVectorMultiply(rotation, axis);
+      const dx = viewDirection[0] * sign;
+      const dy = -viewDirection[1] * sign;
+      const length = Math.hypot(dx, dy);
+      if (!(length > 1e-9)) continue;
+      const end = {
+        x: point.x + (dx / length) * 28,
+        y: point.y + (dy / length) * 28,
+      };
+      const angle = Math.atan2(end.y - point.y, end.x - point.x);
+      ctx.beginPath();
+      ctx.moveTo(point.x, point.y);
+      ctx.lineTo(end.x, end.y);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(end.x, end.y);
+      ctx.lineTo(end.x - 7 * Math.cos(angle - 0.42), end.y - 7 * Math.sin(angle - 0.42));
+      ctx.lineTo(end.x - 7 * Math.cos(angle + 0.42), end.y - 7 * Math.sin(angle + 0.42));
+      ctx.closePath();
+      ctx.fill();
+    }
   }
 
   function triangleValue(p1, p2, p3, point) {
@@ -1204,6 +1897,62 @@
     ctx.restore();
   }
 
+  function draw3DViewportDecorations() {
+    const { width, height } = canvasSize();
+    const originX = 14;
+    const originY = height - 19;
+    const axisLength = 37;
+    const axes = [
+      { axis: [1, 0, 0], color: "#ff7a7a", label: "X" },
+      { axis: [0, 1, 0], color: "#76d37b", label: "Y" },
+      { axis: [0, 0, 1], color: "#7aa2f4", label: "Z" },
+    ];
+    ctx.save();
+    ctx.lineWidth = 1.5;
+    ctx.font = "10px ui-monospace, monospace";
+    ctx.textAlign = "left";
+    ctx.textBaseline = "alphabetic";
+    for (const item of axes) {
+      const direction = matrixVectorMultiply(state.camera3D.rotation, item.axis);
+      const end = {
+        x: originX + direction[0] * axisLength,
+        y: originY - direction[1] * axisLength,
+      };
+      ctx.strokeStyle = item.color;
+      ctx.fillStyle = item.color;
+      ctx.beginPath();
+      ctx.moveTo(originX, originY);
+      ctx.lineTo(end.x, end.y);
+      ctx.stroke();
+      ctx.fillText(item.label, end.x + 3, end.y + 3);
+    }
+    ctx.restore();
+
+    const targetMeters = 90 / state.camera3D.scale;
+    const exponent = Math.floor(Math.log10(Math.max(targetMeters, 1e-12)));
+    const base = Math.pow(10, exponent);
+    const multiplier = [1, 2, 5, 10].find((item) => item * base >= targetMeters) || 10;
+    const barMeters = multiplier * base;
+    const barPixels = barMeters * state.camera3D.scale;
+    const barX = Math.max(58, width - barPixels - 22);
+    const barY = height - 15;
+    ctx.save();
+    ctx.strokeStyle = "#e5e9f8";
+    ctx.fillStyle = "#e5e9f8";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(barX, barY - 4);
+    ctx.lineTo(barX, barY);
+    ctx.lineTo(barX + barPixels, barY);
+    ctx.lineTo(barX + barPixels, barY - 4);
+    ctx.stroke();
+    ctx.font = "10px ui-monospace, monospace";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "alphabetic";
+    ctx.fillText(fmtLength(barMeters), barX + barPixels / 2, barY - 7);
+    ctx.restore();
+  }
+
   function drawViewportDecorations() {
     const { width, height } = canvasSize();
 
@@ -1274,6 +2023,17 @@
 
     const deformed = Boolean(state.results) && state.display.deformationPercent > 0;
     const nodes = displayNodes();
+    if (state.is3D) {
+      draw3DUndeformedOverlay();
+      const projected = draw3DMesh(nodes, deformed);
+      draw3DSelectedSets(projected);
+      draw3DBCsAndLoads(nodes, projected);
+      draw3DNodesAndIds(projected);
+      draw3DNodalContour(projected);
+      drawLegend();
+      draw3DViewportDecorations();
+      return;
+    }
     if (deformed) {
       drawMesh(nodes, true);
     } else {
@@ -1581,18 +2341,49 @@
     window.addEventListener("resize", resizeCanvas);
   }
 
+  if (window.__SOLVIX_EXPOSE_INTERNALS__) {
+    window.SolvixUI3D = {
+      HEX_EDGE_INDICES,
+      TET_EDGE_INDICES,
+      arcballVector,
+      build3DEdgeRecords,
+      edgeIndicesForElement,
+      fitOrthographic,
+      initial3DRotation,
+      is3DModel,
+      matrixIdentity,
+      matrixMultiply,
+      matrixTranspose,
+      matrixVectorMultiply,
+      painterSortEdges,
+      panOrthographic,
+      projectOrthographic,
+      reconstructC3D8Depth,
+      rotationBetweenUnitVectors,
+      rotationXY,
+      screenToCenterWorld,
+      zoomOrthographicAt,
+    };
+  }
+
   async function initialize() {
     const params = new URLSearchParams(window.location.search);
-    const requestedJob = params.get("job") || "cantilever";
+    const requestedJob = params.get("job") || "cantilever3d";
     state.job = requestedJob;
     ensureJobOption(requestedJob);
+    ensureJobOption("cantilever");
     resizeCanvas();
     logJSON("info", {
       ok: true,
       job: requestedJob,
       source: "startup",
       endpoints: ["/api/model", "/api/run", "/api/results/<job>", "/api/agent"],
-      fallback: ["static/mock/model.json", "static/mock/results.json"],
+      fallback: [
+        "static/mock/model.json",
+        "static/mock/results.json",
+        "static/mock/model3d.json",
+        "static/mock/results3d.json",
+      ],
     }, "Solvix CAE");
     await loadModel(requestedJob, { silent: true });
     if (state.modelError) logJSON("info", state.modelError, "model source");
@@ -1600,10 +2391,19 @@
     await loadResults(requestedJob, { silent: true });
     if (state.resultsError) logJSON("info", state.resultsError, "results source");
     if (state.results) logJSON("ok", state.results.raw, "GET results");
+    if (!state.results && requestedJob === "cantilever3d" && state.modelSource === "api") {
+      logJSON("info", {
+        ok: true,
+        job: requestedJob,
+        action: "auto-run",
+        path: "examples/cantilever3d.inp",
+      }, "startup");
+      await runDeck("examples/cantilever3d.inp");
+    }
     if (state.warnings.length) {
       logJSON("info", { ok: true, warnings: state.warnings }, "data consistency");
     }
-    setModule("model");
+    setModule(state.results ? "results" : "model");
   }
 
   initialize().catch((error) => {

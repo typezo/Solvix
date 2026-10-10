@@ -490,6 +490,10 @@ input[type="checkbox"] {
   cursor: grabbing;
 }
 
+#viewport.is-rotating {
+  cursor: move;
+}
+
 .result-chips {
   position: absolute;
   top: 8px;
