@@ -1,8 +1,8 @@
-** Quarter plate with a circular hole, SI units (m, Pa, N).
-** Kirsch benchmark: sigma_max is approximately 3 MPa at the hole
-** for a nominal far-field sigma of 1 MPa.
+** Quarter plate with circular hole - quarter symmetry, SI units (m, Pa, N).
+** Far-field uniaxial 1 MPa via consistent arc traction (total 1e4 N).
+** Kirsch: max nodal von Mises ~2.9 MPa at hole edge (analytical 3.0 MPa).
 *HEADING
-    plate_with_hole plane-stress CPS4 benchmark
+    bench kirsch
 *NODE
 1, 0.200000, 0.000000
 2, 0.196157, 0.039018
@@ -150,17 +150,15 @@
 62, 69, 78, 79, 70
 63, 70, 79, 80, 71
 64, 71, 80, 81, 72
+*ELSET, ELSET=ALL, GENERATE
+1, 64, 1
 *NSET, NSET=YSYM
 1, 10, 19, 28, 37, 46, 55, 64, 73
 *NSET, NSET=XSYM
 9, 18, 27, 36, 45, 54, 63, 72, 81
-*NSET, NSET=FAR_EDGE
-73, 74, 75, 76, 77, 78, 79, 80, 81
-*ELSET, ELSET=ALL, GENERATE
-1, 64, 1
 *MATERIAL, NAME=STEEL
 *ELASTIC
-210e9, 0.3
+210.0E9, 0.3
 *SOLID SECTION, ELSET=ALL, MATERIAL=STEEL
 0.01
 *STEP
@@ -169,13 +167,13 @@
 YSYM, 2, 2
 XSYM, 1, 1
 *CLOAD
-73, 1, 1111.111
-74, 1, 1111.111
-75, 1, 1111.111
-76, 1, 1111.111
-77, 1, 1111.111
-78, 1, 1111.111
-79, 1, 1111.111
-80, 1, 1111.111
-81, 1, 1111.111
+73, 1, 978.598645
+74, 1, 1919.590294
+75, 1, 1808.214518
+76, 1, 1627.350073
+77, 1, 1383.947476
+78, 1, 1087.360555
+79, 1, 748.986977
+80, 1, 381.830250
+81, 1, 64.117767
 *END STEP

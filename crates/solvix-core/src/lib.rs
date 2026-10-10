@@ -179,6 +179,10 @@ pub struct Solution {
     pub displacements: Vec<[f64; 3]>,
     /// Von Mises stress at each element centroid (Pa).
     pub von_mises: Vec<f64>,
+    /// Von Mises stress per node (Pa): element Gauss-point stresses
+    /// extrapolated to nodes and averaged over contributing elements.
+    /// Parallel to `mesh.nodes`.
+    pub nodal_von_mises: Vec<f64>,
     pub reactions: Vec<Reaction>,
     pub iterations: usize,
     pub final_residual: f64,
@@ -235,11 +239,13 @@ pub fn solve(model: &Model) -> Result<Solution, SolveError> {
         .map(|(i, _)| [u[2 * i], u[2 * i + 1], 0.0])
         .collect();
     let von_mises = stress::von_mises_at_centroids(&u, &elems);
+    let nodal_von_mises = stress::nodal_von_mises(&u, &elems, model.mesh.nodes.len());
     let reactions = stress::reactions(&k_orig, &u, &f_orig, &constrained);
 
     Ok(Solution {
         displacements,
         von_mises,
+        nodal_von_mises,
         reactions,
         iterations,
         final_residual,
@@ -346,6 +352,13 @@ mod tests {
         let sol = solve(&model).unwrap();
         // Bilinear quad reproduces constant strain exactly.
         assert!((sol.von_mises[0] - sigma).abs() / sigma < 1e-6);
+        // Uniform field: nodal recovery is exact at every node and agrees
+        // with the centroid value (extrapolation patch test).
+        assert_eq!(sol.nodal_von_mises.len(), model.mesh.nodes.len());
+        for (i, &nvm) in sol.nodal_von_mises.iter().enumerate() {
+            assert!((nvm - sigma).abs() / sigma < 1e-6, "node {i}: vM={nvm}");
+            assert!((nvm - sol.von_mises[0]).abs() / sigma < 1e-6);
+        }
         let ux_right = sigma / E;
         assert!((sol.displacements[1][0] - ux_right).abs() / ux_right < 1e-6);
         assert!((sol.displacements[3][0] - ux_right).abs() / ux_right < 1e-6);
@@ -387,6 +400,12 @@ mod tests {
         let sol = solve(&model).unwrap();
         for (i, &vm) in sol.von_mises.iter().enumerate() {
             assert!((vm - sigma).abs() / sigma < 2e-2, "element {i}: vM={vm}");
+        }
+        // Shared (interior) nodes average several contributions and stay
+        // uniform: nodal == centroid == exact within the same tolerance.
+        assert_eq!(sol.nodal_von_mises.len(), model.mesh.nodes.len());
+        for (i, &nvm) in sol.nodal_von_mises.iter().enumerate() {
+            assert!((nvm - sigma).abs() / sigma < 2e-2, "node {i}: vM={nvm}");
         }
         let rx: f64 = sol
             .reactions
@@ -468,6 +487,10 @@ mod tests {
         for (i, &vm) in sol.von_mises.iter().enumerate() {
             assert!((vm - sigma).abs() / sigma < 1e-6, "element {i}: vM={vm}");
         }
+        // Constant-stress triangle: nodal value equals the exact stress.
+        for (i, &nvm) in sol.nodal_von_mises.iter().enumerate() {
+            assert!((nvm - sigma).abs() / sigma < 1e-6, "node {i}: vM={nvm}");
+        }
         let ux_right = sigma / E;
         assert!((sol.displacements[1][0] - ux_right).abs() / ux_right < 1e-6);
         let uy_top = -NU * sigma / E;
@@ -518,6 +541,109 @@ mod tests {
             .map(|r| r.value)
             .sum();
         assert!((ry + p).abs() < 1e-6 * p.abs());
+    }
+
+    #[test]
+    fn cantilever_root_nodal_von_mises_peak() {
+        // 40x4; beam theory peak 6PL/h^2 = 120 MPa at the clamped edge.
+        // Extrapolated nodal values capture the boundary peak that the
+        // element-centroid average smears (centroid reads ~half of it).
+        let nx = 40;
+        let ny = 4;
+        let (l, h) = (1.0, 0.1);
+        let mut model = quad_model(nx, ny, l, h);
+        let root: Vec<u32> = (0..=ny).map(|j| (j * (nx + 1) + 1) as u32).collect();
+        model.boundary_conditions.push(BoundaryCondition {
+            node_ids: root,
+            dofs: vec![1, 2],
+        });
+        let p = 200_000.0; // 6PL/h^2 = 120 MPa
+        let tip = (2 * (nx + 1) + nx + 1) as u32;
+        model.cloads = vec![ConcentratedLoad {
+            node_id: tip,
+            dof: 2,
+            value: -p,
+        }];
+        let sol = solve(&model).unwrap();
+        assert_eq!(sol.nodal_von_mises.len(), model.mesh.nodes.len());
+        let peak = sol.nodal_von_mises.iter().cloned().fold(0.0, f64::max);
+        assert!(
+            peak > 100e6,
+            "max nodal von Mises {peak:.3e} Pa, want > 100 MPa (beam peak 120 MPa)"
+        );
+    }
+
+    #[test]
+    fn kirsch_quarter_plate_nodal_hole_edge() {
+        // Radial mesh matching examples/plate_hole.inp: 8x8 CPS4 over the
+        // quarter annulus, r = 0.2..1.0, theta = 0..pi/2, t = 0.01.
+        // Nominal far-field 1 MPa -> Kirsch hole-edge peak 3 MPa.
+        let (nr, nt) = (8, 8);
+        let nid = |i: usize, j: usize| (j * (nt + 1) + i + 1) as u32;
+        let mut nodes = Vec::new();
+        for j in 0..=nr {
+            for i in 0..=nt {
+                let theta = i as f64 * std::f64::consts::FRAC_PI_2 / nt as f64;
+                let r = 0.2 + 0.8 * j as f64 / nr as f64;
+                nodes.push(Node {
+                    id: nid(i, j),
+                    coords: [r * theta.cos(), r * theta.sin(), 0.0],
+                });
+            }
+        }
+        let elements: Vec<Element> = (0..nr)
+            .flat_map(|j| {
+                (0..nt).map(move |i| Element {
+                    id: (j * nt + i + 1) as u32,
+                    kind: ElemKind::Cps4,
+                    connectivity: vec![nid(i, j), nid(i, j + 1), nid(i + 1, j + 1), nid(i + 1, j)],
+                })
+            })
+            .collect();
+        let mut model = Model {
+            mesh: Mesh { nodes, elements },
+            thickness: 0.01,
+            materials: vec![steel()],
+            elsets: vec![ElementSet {
+                name: "all".into(),
+                element_ids: (1..=(nr * nt) as u32).collect(),
+            }],
+            mat_assignments: vec![("all".into(), "steel".into())],
+            ..Default::default()
+        };
+        // y-symmetry on theta=0, x-symmetry on theta=pi/2.
+        model.boundary_conditions = vec![
+            BoundaryCondition {
+                node_ids: (0..=nr).map(|j| nid(0, j)).collect(),
+                dofs: vec![2],
+            },
+            BoundaryCondition {
+                node_ids: (0..=nr).map(|j| nid(nt, j)).collect(),
+                dofs: vec![1],
+            },
+        ];
+        // Far-edge x-traction, nominal 1 MPa: consistent nodal loads
+        // sigma*t*ds*cos(theta), half weight at the two end nodes.
+        let ds = std::f64::consts::FRAC_PI_2 / nt as f64;
+        model.cloads = (0..=nt)
+            .filter_map(|i| {
+                let theta = i as f64 * std::f64::consts::FRAC_PI_2 / nt as f64;
+                let w = if i == 0 || i == nt { 0.5 } else { 1.0 };
+                let f = 1e6 * 0.01 * ds * theta.cos() * w;
+                (f > 0.0).then(|| ConcentratedLoad {
+                    node_id: nid(i, nr),
+                    dof: 1,
+                    value: f,
+                })
+            })
+            .collect();
+        let sol = solve(&model).unwrap();
+        assert_eq!(sol.nodal_von_mises.len(), model.mesh.nodes.len());
+        let peak = sol.nodal_von_mises.iter().cloned().fold(0.0, f64::max);
+        assert!(
+            peak > 2.4e6,
+            "max nodal von Mises {peak:.4e} Pa, want > 2.4 MPa (Kirsch 3.0 MPa)"
+        );
     }
 
     #[test]

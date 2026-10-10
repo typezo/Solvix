@@ -1039,6 +1039,7 @@ mod tests {
         let sol = Solution {
             displacements: vec![[0.0, 0.0, 0.0], [4.0e-6, -8.0e-6, 0.0]],
             von_mises: vec![120.0e6, 119.0e6],
+            nodal_von_mises: vec![120.0e6, 119.0e6],
             reactions: vec![],
             iterations: 390,
             final_residual: 6.933e-11,

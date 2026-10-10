@@ -13,10 +13,15 @@ pub(crate) fn d_matrix(e: f64, nu: f64) -> [[f64; 3]; 3] {
     ]
 }
 
-/// Strain-displacement matrix kept per element for centroid stress recovery.
+/// Strain-displacement matrices kept per element for stress recovery:
+/// the centroid matrix, plus the 2x2 Gauss-point matrices for quads
+/// (ordering matches the stiffness loop: xi-major over (-,+), then (+,+)).
 pub(crate) enum CentroidB {
     Tri([[f64; 6]; 3]),
-    Quad([[f64; 8]; 3]),
+    Quad {
+        center: [[f64; 8]; 3],
+        gauss: Box<[[[f64; 8]; 3]; 4]>,
+    },
 }
 
 /// CPS3 stiffness. Returns `None` for a zero-area (degenerate) triangle.
@@ -104,14 +109,24 @@ pub(crate) fn cps4_stiffness(
 ) -> Option<([[f64; 8]; 8], CentroidB)> {
     let g = 1.0f64 / (3.0f64).sqrt();
     let mut ke = [[0.0; 8]; 8];
+    let mut gauss = [[[0.0; 8]; 3]; 4];
+    let mut k = 0;
     for &xi in &[-g, g] {
         for &eta in &[-g, g] {
             let (bm, detj) = quad_b(coords, xi, eta)?;
             btdb(&mut ke, &bm, d, t * detj); // unit Gauss weights
+            gauss[k] = bm;
+            k += 1;
         }
     }
     let (center, _) = quad_b(coords, 0.0, 0.0)?; // centroid is interior if GPs are
-    Some((ke, CentroidB::Quad(center)))
+    Some((
+        ke,
+        CentroidB::Quad {
+            center,
+            gauss: Box::new(gauss),
+        },
+    ))
 }
 
 /// ke += w * B^T D B for a 3xN strain-displacement matrix.
@@ -133,17 +148,57 @@ fn btdb<const N: usize>(ke: &mut [[f64; N]; N], b: &[[f64; N]; 3], d: &[[f64; 3]
     }
 }
 
+/// Stress components (sxx, syy, sxy) from a strain-displacement matrix,
+/// the constitutive matrix and the element nodal displacements.
+pub(crate) fn stress_components<const N: usize>(
+    b: &[[f64; N]; 3],
+    d: &[[f64; 3]; 3],
+    ue: &[f64],
+) -> [f64; 3] {
+    let (exx, eyy, gxy) = strain(b, ue);
+    [
+        d[0][0] * exx + d[0][1] * eyy,
+        d[1][0] * exx + d[1][1] * eyy,
+        d[2][2] * gxy,
+    ]
+}
+
+/// Von Mises from plane-stress components (sxx, syy, sxy).
+pub(crate) fn von_mises(s: &[f64; 3]) -> f64 {
+    (s[0] * s[0] - s[0] * s[1] + s[1] * s[1] + 3.0 * s[2] * s[2]).sqrt()
+}
+
 /// Von Mises stress from a centroid strain-displacement matrix, the
 /// constitutive matrix and the element nodal displacements.
 pub(crate) fn centroid_von_mises(b: &CentroidB, d: &[[f64; 3]; 3], ue: &[f64]) -> f64 {
-    let (exx, eyy, gxy) = match b {
-        CentroidB::Tri(bm) => strain(bm, ue),
-        CentroidB::Quad(bm) => strain(bm, ue),
-    };
-    let sxx = d[0][0] * exx + d[0][1] * eyy;
-    let syy = d[1][0] * exx + d[1][1] * eyy;
-    let sxy = d[2][2] * gxy;
-    (sxx * sxx - sxx * syy + syy * syy + 3.0 * sxy * sxy).sqrt()
+    match b {
+        CentroidB::Tri(bm) => von_mises(&stress_components(bm, d, ue)),
+        CentroidB::Quad { center, .. } => von_mises(&stress_components(center, d, ue)),
+    }
+}
+
+/// Gauss-point sign pairs in stiffness-loop order (xi-major), matching
+/// the `gauss` slot ordering of [`CentroidB::Quad`].
+const GP_SIGNS: [(f64, f64); 4] = [(-1.0, -1.0), (-1.0, 1.0), (1.0, -1.0), (1.0, 1.0)];
+
+/// Extrapolate 2x2 Gauss-point values to the 4 corner nodes: bilinear
+/// shape functions inverted at the Gauss points (Abaqus-style). The
+/// equivalent 4x4 matrix is [[a,b,c,b],[b,a,b,c],[c,b,a,b],[b,c,b,a]]
+/// with a = 1 + sqrt(3)/2, b = -1/2, c = 1 - sqrt(3)/2 (rows sum to 1;
+/// the b = -1/2 sign is what makes constant and bilinear fields exact).
+pub(crate) fn extrapolate_to_corners<const M: usize>(gp: &[[f64; M]; 4]) -> [[f64; M]; 4] {
+    let sqrt3 = (3.0f64).sqrt();
+    let h = |s: f64| 0.5 * (1.0 + s * sqrt3);
+    let mut out = [[0.0; M]; 4];
+    for (i, &(cx, cy)) in QUAD_CORNERS.iter().enumerate() {
+        for (j, &(gx, gy)) in GP_SIGNS.iter().enumerate() {
+            let w = h(cx * gx) * h(cy * gy);
+            for k in 0..M {
+                out[i][k] += w * gp[j][k];
+            }
+        }
+    }
+    out
 }
 
 fn strain<const N: usize>(b: &[[f64; N]; 3], ue: &[f64]) -> (f64, f64, f64) {
@@ -187,6 +242,25 @@ mod tests {
             let ku: f64 = row.iter().zip(u).map(|(k, ui)| k * ui).sum();
             assert!(ku.abs() < 1e-12, "row {a} not translation-invariant");
         }
+    }
+
+    #[test]
+    fn extrapolation_to_corners_is_exact_for_bilinear_fields() {
+        let f = |xi: f64, eta: f64| 2.0 + 3.0 * xi - 5.0 * eta + 1.5 * xi * eta;
+        let g = 1.0f64 / (3.0f64).sqrt();
+        let gp = [[f(-g, -g)], [f(-g, g)], [f(g, -g)], [f(g, g)]];
+        let corners = extrapolate_to_corners(&gp);
+        for (i, &(cx, cy)) in QUAD_CORNERS.iter().enumerate() {
+            assert!(
+                (corners[i][0] - f(cx, cy)).abs() < 1e-12,
+                "corner {i}: {} != {}",
+                corners[i][0],
+                f(cx, cy)
+            );
+        }
+        // Constant field: every row of the extrapolation matrix sums to 1.
+        let c = extrapolate_to_corners(&[[7.0]; 4]);
+        assert!(c.iter().all(|&v| (v[0] - 7.0).abs() < 1e-12));
     }
 
     #[test]

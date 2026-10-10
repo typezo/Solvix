@@ -1,8 +1,9 @@
 //! # solvix — the agent-era FEA CLI
 //!
-//! Implementation owned by issue #3. Subcommands:
+//! Implementation owned by issue #3; `bench` by issue #17. Subcommands:
 //!   solvix run <job.inp> [-o outdir] [--json]
 //!   solvix info <job.inp> [--json]
+//!   solvix bench [--json]
 //!
 //! Exit codes: 0 ok · 1 usage/IO · 2 parse error · 3 solve error.
 //! stdout carries the payload (human table or single-line JSON), stderr
@@ -14,6 +15,8 @@ use std::time::Instant;
 use solvix_core::{ElemKind, Model, Solution, SolveError};
 use solvix_io::ParseReport;
 
+mod bench;
+
 const USAGE: &str = "\
 solvix 0.1.0 — the agent-era FEA CLI
 
@@ -22,6 +25,7 @@ solvix is designed for AI agents: all subcommands accept --json and exit 0/1/2/3
 Usage:
   solvix run <job.inp> [-o outdir] [--json]   parse, solve, write <jobname>.vtu
   solvix info <job.inp> [--json]              parse-only model report, never solves
+  solvix bench [--json]                       built-in verification suite (all-pass exit 0, else 3)
   solvix help | --help | -h                   show this text
 
 Exit codes: 0 ok · 1 usage/IO · 2 parse error · 3 solve error.
@@ -65,6 +69,9 @@ enum Command {
     },
     Info {
         inp: String,
+        json: bool,
+    },
+    Bench {
         json: bool,
     },
     Help,
@@ -116,6 +123,16 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
             } else {
                 Ok(Command::Info { inp, json })
             }
+        }
+        "bench" => {
+            let mut json = false;
+            for a in it {
+                match a.as_str() {
+                    "--json" => json = true,
+                    other => return Err(format!("unexpected argument for bench: {other}")),
+                }
+            }
+            Ok(Command::Bench { json })
         }
         other => Err(format!("unknown subcommand: {other}")),
     }
@@ -496,6 +513,7 @@ fn cli(args: &[String]) -> i32 {
         }
         Command::Info { inp, json } => finish(do_info(&inp, json), json),
         Command::Run { inp, outdir, json } => finish(do_run(&inp, &outdir, json), json),
+        Command::Bench { json } => bench::run(json),
     }
 }
 
@@ -561,6 +579,7 @@ mod tests {
         Solution {
             displacements: vec![[0.0, 0.0, 0.0], [0.0047619, 0.0, 0.0]],
             von_mises: vec![38.2e6],
+            nodal_von_mises: vec![38.2e6, 38.2e6],
             reactions: vec![],
             iterations: 42,
             final_residual: 1.5e-12,
@@ -628,6 +647,20 @@ mod tests {
                 json: true
             })
         );
+    }
+
+    #[test]
+    fn args_bench() {
+        assert_eq!(
+            parse_args(&sv(&["bench"])),
+            Ok(Command::Bench { json: false })
+        );
+        assert_eq!(
+            parse_args(&sv(&["bench", "--json"])),
+            Ok(Command::Bench { json: true })
+        );
+        assert!(parse_args(&sv(&["bench", "extra"])).is_err());
+        assert!(parse_args(&sv(&["bench", "-o", "x"])).is_err());
     }
 
     #[test]
