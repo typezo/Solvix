@@ -4,6 +4,7 @@
 //!
 //! Implementation owned by issue #2 (parser) — this file fixes the interface.
 
+mod msh;
 mod parser;
 mod vtu;
 
@@ -25,6 +26,15 @@ pub struct ParseError {
 /// Parse an Abaqus input deck (v0.1 keyword subset, see issue #2).
 pub fn parse_inp(text: &str) -> Result<(Model, ParseReport), ParseError> {
     parser::parse_inp(text)
+}
+
+/// Parse a Gmsh ASCII `.msh` mesh (MSH 2.2 or 4.1).
+///
+/// Mesh import creates a default material and element sets from physical
+/// groups. It intentionally creates no boundary conditions or loads; add
+/// those to the returned model before solving.
+pub fn parse_msh(text: &str) -> Result<(Model, ParseReport), ParseError> {
+    msh::parse_msh(text)
 }
 
 /// Write nodal displacements and element von Mises stress as an
