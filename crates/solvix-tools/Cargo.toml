@@ -1,0 +1,19 @@
+[package]
+name = "solvix-tools"
+description = "Migration tools: abaqus2solvix — Abaqus Python script to Solvix deck translator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "solvix_tools"
+path = "src/lib.rs"
+
+[[bin]]
+name = "abaqus2solvix"
+path = "src/main.rs"
+
+[dependencies]
+solvix-core = { path = "../solvix-core" }
+solvix-io = { path = "../solvix-io" }

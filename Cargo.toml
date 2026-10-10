@@ -4,6 +4,7 @@ members = [
     "crates/solvix-core",
     "crates/solvix-io",
     "crates/solvix-cli",
+    "crates/solvix-tools",
     "crates/solvix-ui",
 ]
 

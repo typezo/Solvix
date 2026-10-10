@@ -22,6 +22,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "solvix-tools"
+version = "0.1.0"
+dependencies = [
+ "solvix-core",
+ "solvix-io",
+]
+
+[[package]]
 name = "solvix-ui"
 version = "0.1.0"
 dependencies = [
