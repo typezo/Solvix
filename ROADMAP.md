@@ -33,18 +33,18 @@ CPS3/CPS4 plane stress · `.inp` subset parser · VTU out · `solvix run/info --
 - [x] UI 3D viewport: software renderer, rotate/pan/zoom (#20)
 
 ### v0.2.x — Real Abaqus decks
-- [ ] `*DLOAD` edge pressure, gravity, `*NSET/*ELSET` hardening, multi-step (#9)
-- [ ] Gmsh `.msh` import (#19)
+- [x] `*DLOAD` edge pressure, gravity, multi-step OP=NEW/MOD, *DENSITY (#26)
+- [x] Gmsh `.msh` import (#19)
 - [x] MCP server crate: tools run/info/model/results/bench (#8)
 - [ ] Keyword coverage matrix auto-published to docs (#32)
 
 ### v0.3.0 — Dynamics of structures
-- [ ] Modal: shift-invert Lanczos, consistent mass, mode shapes in UI/VTU (#7→#31)
-- [ ] Buckling: linear eigenvalue on prestressed K (#21)
+- [x] Modal: subspace iteration, consistent mass, mode shapes in UI + CLI (#23 #40)
+- [x] Buckling: linear eigenvalue on prestressed K (#24)
 - [ ] Restart: binary state files, resume jobs
 
 ### v0.3.x — Element library breadth
-- [ ] B31 beam, CPS8/CPE8 quadratic, C3D20 when quad routines generalize (#23)
+- [x] B31 beam, CPS8/CPE8 quadratic plane strain (#25)
 - [ ] Plane strain/axisymmetric element families
 - [ ] Orthotropic + thermal expansion material models (#22)
 
