@@ -1,0 +1,10 @@
+{
+  "ok": true,
+  "job": "cantilever",
+  "displacements": [[0.0, 0.0], [0.000004, -0.000008]],
+  "von_mises": [120000000.0, 119000000.0],
+  "max_disp_mm": 13.832,
+  "max_von_mises_mpa": 79.483,
+  "iterations": 390,
+  "residual": 6.933e-11
+}

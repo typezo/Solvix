@@ -1,0 +1,11 @@
+{
+  "ok": true,
+  "job": "cantilever",
+  "nodes": [[1, 0.0, 0.0], [2, 0.0, 0.05]],
+  "elements": [[1, "cps4", [1, 2, 5, 4]]],
+  "nsets": { "FIX": [1, 2, 3], "TIP": [41, 82, 123, 164, 205] },
+  "elsets": { "ALL": [1, 2, 3] },
+  "materials": [{ "name": "STEEL", "young": 210000000000.0, "poisson": 0.3 }],
+  "bcs": [{ "nodes": [1, 2, 3], "dofs": [1, 2] }],
+  "cloads": [[205, 2, -200.0]]
+}
