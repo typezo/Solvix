@@ -66,20 +66,33 @@ CPS3/CPS4 plane stress · `.inp` subset parser · VTU out · `solvix run/info --
 - [ ] UI: XY plots, animations, PNG export (#24)
 - [ ] Multithreaded assembly + PCG (std threads)
 
-### v0.7.0 — CAE Part module parity
+### v0.7.0 — Scale + hardening (shipped ahead of plan)
+
+- [x] Threaded assembly + SpMV, bit-identical (#42)
+- [x] NAFEMS-style manifest benchmarks + CI regression gate (#34)
+- [x] Binary VTU appended format (#43)
+- [x] Abaqus `.frd` reader (#37) · keyword matrix + error taxonomy (#22)
+- [x] Gallery site (#10) · examples gallery (#44)
+
+### v0.7.x — Parked-solution upgrades
+
+- [ ] Plane-stress J2 return, Timoshenko, friction, free-free shift (#55 #56)
+- [ ] *AMPLITUDE, *INITIAL CONDITIONS, restart files (#57)
+
+### v0.8.0 — CAE Part module parity
 - [ ] Parametric geometry: 2D sketch booleans, extrude
 - [ ] Meshing: Delaunay 2D + structured 3D, size control
 - [ ] Assembly instances, display groups in UI
 
 ### v0.8.0 — Migration path for Abaqus users
-- [ ] `abaqus2solvix`: translate Abaqus Python script subset → Solvix JSON jobs
-- [ ] `.frd`/`.fil` readers for post-processing existing results (#26)
+- [x] `abaqus2solvix`: script translator with --validate (#35, pulled ahead from v0.8)
+- [x] `.frd` reader for post-processing existing results (#37)
 - [ ] Error taxonomy: agent-readable failure codes (#32)
 
 ### v0.9.0 — Scale
 - [ ] Direct sparse solver with pivoting, out-of-core option
 - [ ] Domain decomposition + threaded solve at scale
-- [ ] NAFEMS benchmark suite as regression gate in CI (#25)
+- [x] NAFEMS-style benchmark suite as CI regression gate (#34)
 
 ### v1.0.0 — Parity declaration
 Full docs, tutorial gallery, published benchmark comparisons vs Abaqus
