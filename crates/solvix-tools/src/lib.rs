@@ -13,9 +13,15 @@
 //!   `solvix_core::Model` (structured mesh with poor-man's circular
 //!   holes, materials, sections, steps/BCs/loads);
 //! * [`meshgen`] — the structured CPS4 grid generator;
+//! * [`geom`] + [`meshgen2`] — the v0.8 geometry kernel: sketch
+//!   primitives, circle-subtract booleans and conformal triangular
+//!   (constrained Delaunay, CPS3) meshing, selected by
+//!   `abaqus2solvix --mesh2d`;
 //! * [`deck`] — the `.inp` writer (inverse of `solvix_io`'s parser).
 
 pub mod deck;
+pub mod geom;
 pub mod meshgen;
+pub mod meshgen2;
 pub mod python_parse;
 pub mod translate;

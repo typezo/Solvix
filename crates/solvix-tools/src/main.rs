@@ -2,10 +2,14 @@
 //!
 //! Usage:
 //!   abaqus2solvix <input.py> [-o <out.inp>] [--json] [--validate]
+//!                 [--mesh2d]
 //!
 //! `--validate` re-parses the generated deck with `solvix_io` and, when
 //! solvable, solves it with `solvix_core` — the migration confidence
-//! check.
+//! check. `--mesh2d` meshes the sketch with the v0.8 geometry kernel
+//! (conformal CPS3 Delaunay triangles following arbitrary line/arc
+//! profiles and circular holes) instead of the structured CPS4 grid
+//! with poor-man's holes. Flag-gated v1; the default path is unchanged.
 //!
 //! JSON-first UX: `--json` prints `{"ok":true,"output":...,
 //! "warnings":[...],"unsupported":[...]}` (plus a `validate` object
@@ -17,18 +21,24 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use solvix_tools::deck::write_deck;
-use solvix_tools::translate::translate;
+use solvix_tools::translate::{translate_with, Options};
 
 const USAGE: &str = "\
 abaqus2solvix — translate a bounded subset of Abaqus Python scripts to Solvix decks
 
 Usage:
   abaqus2solvix <input.py> [-o <out.inp>] [--json] [--validate]
-                                             translate the script to a .inp deck.
-                                             Default output: <input stem>.inp next
-                                             to the input. --validate re-parses the
-                                             deck with solvix_io and solves it when
-                                             solvable (migration confidence check).
+                                              translate the script to a .inp deck.
+                                              Default output: <input stem>.inp next
+                                              to the input. --validate re-parses the
+                                              deck with solvix_io and solves it when
+                                              solvable (migration confidence check).
+  abaqus2solvix <input.py> --mesh2d [...]    conformal CPS3 Delaunay mesh from the
+                                              sketch geometry (v0.8 geometry kernel)
+                                              instead of the structured CPS4 grid
+                                              (flag-gated v1; falls back to the grid
+                                              with a warning if the sketch is
+                                              rejected).
   abaqus2solvix help | --help | -h           show this text
 
 Exit codes: 0 ok · 1 usage/IO/validate failure · 2 script parse/translate error.
@@ -64,6 +74,7 @@ struct Args {
     output: PathBuf,
     json: bool,
     validate: bool,
+    mesh2d: bool,
 }
 
 fn parse_args(argv: &[String]) -> Result<Args, String> {
@@ -71,6 +82,7 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
     let mut output: Option<PathBuf> = None;
     let mut json = false;
     let mut validate = false;
+    let mut mesh2d = false;
     let mut it = argv.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -80,6 +92,7 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
             }
             "--json" => json = true,
             "--validate" => validate = true,
+            "--mesh2d" => mesh2d = true,
             "-o" | "--output" => match it.next() {
                 Some(o) => output = Some(PathBuf::from(o)),
                 None => return Err(format!("{a} needs a value")),
@@ -113,6 +126,7 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
         output,
         json,
         validate,
+        mesh2d,
     })
 }
 
@@ -155,7 +169,12 @@ fn main() -> ExitCode {
         }
     };
 
-    let tr = match translate(&src) {
+    let tr = match translate_with(
+        &src,
+        &Options {
+            mesh2d: args.mesh2d,
+        },
+    ) {
         Ok(t) => t,
         Err(e) => return fail("parse", &format!("{e}"), 2, args.json),
     };

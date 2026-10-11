@@ -18,6 +18,14 @@
 //!   the rectangle boundary sides; vertices to the nearest mesh node.
 //!   Keyword arguments only — positional arguments beyond `findAt`
 //!   data are warned and ignored.
+//!
+//! Meshing: the default path is the structured CPS4 grid from
+//! [`crate::meshgen`] (poor-man's holes). With
+//! [`Options::mesh2d`] the sketch is instead meshed by the v0.8
+//! geometry kernel ([`crate::geom`] + [`crate::meshgen2`]):
+//! conformal CPS3 triangles that follow arbitrary line/arc profiles
+//! and exact circular hole boundaries. Flag-gated v1; the structured
+//! grid remains the default.
 
 use std::collections::{HashMap, HashSet};
 
@@ -26,7 +34,9 @@ use solvix_core::{
     Model, Step,
 };
 
+use crate::geom::{Primitive, Sketch};
 use crate::meshgen::{self, Hole};
+use crate::meshgen2;
 use crate::python_parse::{eval_expr, Expr, Script, Stmt, StmtKind, Value};
 
 /// Fatal translation error (nothing solvable can be produced).
@@ -34,6 +44,14 @@ use crate::python_parse::{eval_expr, Expr, Script, Stmt, StmtKind, Value};
 pub struct TranslateError {
     pub line: usize,
     pub message: String,
+}
+
+/// Translation options.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Options {
+    /// Mesh with the v0.8 geometry kernel (conformal CPS3 triangles
+    /// via [`crate::meshgen2`]) instead of the structured CPS4 grid.
+    pub mesh2d: bool,
 }
 
 impl std::fmt::Display for TranslateError {
@@ -63,11 +81,18 @@ pub struct Translation {
 }
 
 pub fn translate(src: &str) -> Result<Translation, TranslateError> {
+    translate_with(src, &Options::default())
+}
+
+pub fn translate_with(src: &str, opts: &Options) -> Result<Translation, TranslateError> {
     let script: Script = crate::python_parse::parse_script(src).map_err(|e| TranslateError {
         line: e.line,
         message: e.message,
     })?;
-    let mut t = Translator::default();
+    let mut t = Translator {
+        opts: *opts,
+        ..Default::default()
+    };
     for st in &script.stmts {
         t.stmt(st)?;
     }
@@ -167,6 +192,7 @@ struct Call<'a> {
 
 #[derive(Default)]
 struct Translator {
+    opts: Options,
     data: HashMap<String, Value>,
     objs: HashMap<String, Obj>,
     mats: Vec<MatAcc>,
@@ -1056,7 +1082,10 @@ impl Translator {
                 _ => self.warn(line, "SectionAssignment without sectionName — ignored"),
             },
             "setelementtype" => {
-                self.unsupp(line, "setElementType ignored (v1: CPS4 structured grid)");
+                self.unsupp(
+                    line,
+                    "setElementType ignored (structured CPS4 grid or --mesh2d CPS3 triangles)",
+                );
             }
             _ => {
                 self.unsupp(line, format!("part method '{method}' unsupported"));
@@ -1174,10 +1203,31 @@ impl Translator {
                 w.max(h) / 8.0
             }
         };
-        let nx = mesh_count(w, seed);
-        let ny = mesh_count(h, seed);
 
-        let (mesh, notes) = meshgen::grid(x0, y0, w, h, nx, ny, &holes);
+        let (mesh, cell, notes) = if self.opts.mesh2d {
+            match self.conformal_mesh(&sk, seed) {
+                Some((mesh, notes)) => (mesh, seed, notes),
+                None => {
+                    self.report.warnings.push(
+                        "geometry kernel rejected the sketch — falling back to the structured CPS4 grid"
+                            .into(),
+                    );
+                    let nx = mesh_count(w, seed);
+                    let ny = mesh_count(h, seed);
+                    let (mesh, _) = meshgen::grid(x0, y0, w, h, nx, ny, &holes);
+                    (
+                        mesh,
+                        (w / nx as f64).max(h / ny as f64),
+                        vec!["structured fallback mesh in use (--mesh2d failed)".into()],
+                    )
+                }
+            }
+        } else {
+            let nx = mesh_count(w, seed);
+            let ny = mesh_count(h, seed);
+            let (mesh, notes) = meshgen::grid(x0, y0, w, h, nx, ny, &holes);
+            (mesh, (w / nx as f64).max(h / ny as f64), notes)
+        };
         self.report.warnings.extend(notes);
 
         let mut materials: Vec<Material> = Vec::new();
@@ -1252,7 +1302,7 @@ impl Translator {
             y1,
             // Boundary classification must not swallow a whole cell.
             tol: 1e-7 * w.max(h).abs().max(1.0),
-            cell: (w / nx as f64).max(h / ny as f64),
+            cell,
         };
 
         let steps = std::mem::take(&mut self.steps);
@@ -1311,6 +1361,40 @@ impl Translator {
             model,
             report: self.report,
         })
+    }
+
+    /// Conformal CPS3 mesh from the sketch (--mesh2d path). `None`
+    /// when the geometry kernel rejects the sketch; the caller falls
+    /// back to the structured grid.
+    fn conformal_mesh(
+        &mut self,
+        sk: &SketchData,
+        seed: f64,
+    ) -> Option<(solvix_core::Mesh, Vec<String>)> {
+        let sketch: Sketch = sk
+            .segments
+            .iter()
+            .map(|(a, b)| Primitive::Line {
+                x1: a[0],
+                y1: a[1],
+                x2: b[0],
+                y2: b[1],
+            })
+            .chain(
+                sk.circles
+                    .iter()
+                    .map(|&(cx, cy, r)| Primitive::Circle { cx, cy, r }),
+            )
+            .collect();
+        let result = meshgen2::mesh_sketch(&sketch, seed).ok()?;
+        let notes = vec![format!(
+            "conformal mesh (--mesh2d): {} nodes, {} CPS3 triangles, min angle {:.1} deg, max aspect {:.2}",
+            result.nodes.len(),
+            result.tris.len(),
+            result.quality.min_angle_deg,
+            result.quality.max_aspect
+        )];
+        Some((meshgen2::to_cps3_mesh(&result), notes))
     }
 
     /// Resolve a region against the generated mesh.
@@ -1418,8 +1502,9 @@ impl Translator {
         }
         let mut out = Vec::new();
         for e in &mesh.elements {
-            for i in 0..4 {
-                let (a, b) = (e.connectivity[i], e.connectivity[(i + 1) % 4]);
+            let nn = e.kind.node_count();
+            for i in 0..nn {
+                let (a, b) = (e.connectivity[i], e.connectivity[(i + 1) % nn]);
                 let (na, nb) = match (mesh.node_index(a), mesh.node_index(b)) {
                     (Some(ia), Some(ib)) => (&mesh.nodes[ia], &mesh.nodes[ib]),
                     _ => continue,
