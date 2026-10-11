@@ -233,8 +233,15 @@ fn element_entry(
             if a <= 0.0 || inertia <= 0.0 {
                 return Err(invalid(e.id, "beam section needs positive A and I"));
             }
-            let (ke, b) = b31_stiffness(&coords, mat.youngs_modulus, a, inertia)
-                .ok_or_else(|| invalid(e.id, "zero-length beam"))?;
+            let (ke, b) = b31_stiffness(
+                &coords,
+                mat.youngs_modulus,
+                mat.poisson_ratio,
+                a,
+                inertia,
+                model.beam_shear,
+            )
+            .ok_or_else(|| invalid(e.id, "zero-length beam"))?;
             scatter(trips, &node_idx, &ke, ndof);
             (
                 b,

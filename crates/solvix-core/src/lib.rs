@@ -65,8 +65,10 @@ pub enum ElemKind {
     C3d8,
     /// 4-node constant-strain tetrahedron.
     C3d4,
-    /// 2-node Euler-Bernoulli beam in the xy-plane (ux, uy, rotz);
-    /// section A and I from [`Model::beam_sections`].
+    /// 2-node beam in the xy-plane (ux, uy, rotz); section A and I
+    /// from [`Model::beam_sections`]. Euler-Bernoulli (Hermite) by
+    /// default; [`Model::beam_shear`] switches to the shear-flexible
+    /// Timoshenko variant.
     B31,
 }
 
@@ -272,6 +274,22 @@ pub struct Model {
     /// (elset name, area A, second moment I) pairs from `*BEAM SECTION`
     /// (B31 elements).
     pub beam_sections: Vec<(String, f64, f64)>,
+    /// B31 formulation switch: `false` (the default) = cubic-Hermite
+    /// Euler-Bernoulli stiffness; `true` = shear-flexible Timoshenko
+    /// (linear v/rotz interpolation, kappa = 5/6, G = E/(2(1+nu)),
+    /// 1-point reduced integration on the shear term — see
+    /// [`element::b31_stiffness`](crate::element) docs). For squat
+    /// beams (h/L approaching 1) the Euler-Bernoulli form ignores the
+    /// PL/(kappa*GA) shear contribution and reads substantially stiff.
+    pub beam_shear: bool,
+    /// Coulomb friction coefficient mu for [`Model::contact_pairs`].
+    /// `None` (the default) keeps contact frictionless. `Some(mu)`
+    /// activates the tangential penalty stick/slip law: stick carries
+    /// `k_t = penalty/1000`, slip returns the force to the friction
+    /// cone `|F_t| = mu * F_n` (explicit v1 — see
+    /// [`contact`](crate::contact) for the formulation, the k_t
+    /// rationale and the implicit upgrade path).
+    pub friction_coeff: Option<f64>,
     pub boundary_conditions: Vec<BoundaryCondition>,
     pub cloads: Vec<ConcentratedLoad>,
     /// Node-to-surface contact pairs (`*CONTACT PAIR`). A model with a
@@ -304,6 +322,8 @@ impl Default for Model {
             elsets: Vec::new(),
             mat_assignments: Vec::new(),
             beam_sections: Vec::new(),
+            beam_shear: false,
+            friction_coeff: None,
             boundary_conditions: Vec::new(),
             cloads: Vec::new(),
             contact_pairs: Vec::new(),
@@ -1501,6 +1521,58 @@ mod tests {
                 .map(|r| r.value)
                 .sum();
             assert!((rm - p.abs() * l).abs() < 1e-6 * p.abs() * l);
+        }
+    }
+
+    #[test]
+    fn timoshenko_thick_cantilever_h_over_l_half() {
+        // Squat cantilever, h/L = 0.5, square 0.5x0.5 section: the
+        // shear-flexible B31 variant must land within 5% of
+        // delta = PL^3/(3EI) + PL/(kappa*GA), while the default
+        // Hermite Euler-Bernoulli element — which ignores the
+        // PL/(kappa*GA) term — reads >15% stiff at this aspect ratio
+        // (3EI/(kappa*GAL^2) = 0.195 of extra compliance missing).
+        let l = 1.0;
+        let h = 0.5;
+        let (a, inertia) = (h * h, h * h * h * h / 12.0);
+        let p = -1.0e4;
+        let kappa_ga = (5.0 / 6.0) * (E / (2.0 * (1.0 + NU))) * a;
+        let exact = p * l * l * l / (3.0 * E * inertia) + p * l / kappa_ga;
+        let mut model = beam_model(8, l);
+        model.beam_sections = vec![("all".into(), a, inertia)];
+        model.boundary_conditions = vec![BoundaryCondition {
+            node_ids: vec![1],
+            dofs: vec![1, 2, 3],
+        }];
+        model.cloads = vec![ConcentratedLoad {
+            node_id: 9,
+            dof: 2,
+            value: p,
+        }];
+        for method in BOTH_METHODS {
+            model.beam_shear = true;
+            let sol = solve_with_method(&model, method).unwrap();
+            let delta = sol.displacements[8][1];
+            let rel_t = (delta - exact) / exact;
+            assert!(
+                rel_t.abs() < 0.05,
+                "{method:?}: Timoshenko tip off by {:.2}% ({delta:.6e} vs {exact:.6e})",
+                100.0 * rel_t
+            );
+            model.beam_shear = false;
+            let sol = solve_with_method(&model, method).unwrap();
+            let delta = sol.displacements[8][1];
+            let rel_e = (delta - exact) / exact;
+            eprintln!(
+                "thick cantilever h/L=0.5: Timoshenko {:+.2}%, Euler-Bernoulli {:+.2}%",
+                100.0 * rel_t,
+                100.0 * rel_e
+            );
+            assert!(
+                rel_e < -0.15,
+                "{method:?}: Euler-Bernoulli only {:.2}% stiff, want > 15%",
+                -100.0 * rel_e
+            );
         }
     }
 

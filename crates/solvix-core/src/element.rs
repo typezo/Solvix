@@ -642,21 +642,34 @@ fn rotate_beam(kl: &[[f64; 6]; 6], c: f64, s: f64) -> [[f64; 6]; 6] {
     out
 }
 
-/// B31 stiffness: 2-node Euler-Bernoulli beam with cubic (Hermite)
-/// transverse interpolation, in-plane dofs [u1, v1, rotz1, u2, v2,
-/// rotz2]. Closed forms of EA*int(B_a^T B_a) + EI*int(B_b^T B_b) (the
-/// integral is exact for the Hermite basis). The local x-axis runs
-/// node 1 -> node 2.
+/// B31 stiffness: 2-node beam, in-plane dofs [u1, v1, rotz1, u2, v2,
+/// rotz2]; the local x-axis runs node 1 -> node 2.
 ///
-/// ponytail: shear-free Euler-Bernoulli — exact for point-load linear
-/// static; Timoshenko (shear-flexible) upgrade needed once squat beams
-/// matter; add GA_s/L terms + reduced integration here.
-/// Returns `None` for a zero-length beam.
+/// `shear = false` (the [`crate::Model::beam_shear`] default):
+/// Euler-Bernoulli with cubic (Hermite) transverse interpolation —
+/// closed forms of EA*int(B_a^T B_a) + EI*int(B_b^T B_b), exact for
+/// the Hermite basis.
+///
+/// `shear = true`: Timoshenko (B31 shear-flexible variant) with
+/// LINEAR interpolation of both transverse displacement and rotation,
+/// kappa = 5/6, G = E/(2(1+nu)):
+/// `K = EI*int(B_b^T B_b) + kappa*GA*int(B_s^T B_s)` with curvature
+/// `chi = d(rotz)/dx` and shear strain `gamma = dv/dx - rotz`. The
+/// shear term uses ONE-POINT (element-midpoint) reduced integration:
+/// gamma is linear in the dofs, so exact integration evaluates it at
+/// two stations and over-constrains the v-th pair (shear locking —
+/// the slender limit forces gamma = 0 at both stations, killing the
+/// bending subspace). Midpoint-only integration leaves a single
+/// constraint per element, the classic cure; the bending term is
+/// constant-strain and stays exact. Returns `None` for a zero-length
+/// beam.
 pub(crate) fn b31_stiffness(
     coords: &[[f64; 2]; 2],
     e: f64,
+    nu: f64,
     area: f64,
     inertia: f64,
+    shear: bool,
 ) -> Option<([[f64; 6]; 6], CentroidB)> {
     let (dx, dy) = (coords[1][0] - coords[0][0], coords[1][1] - coords[0][1]);
     let l = (dx * dx + dy * dy).sqrt();
@@ -671,18 +684,37 @@ pub(crate) fn b31_stiffness(
     kl[0][3] = -ea_l;
     kl[3][0] = -ea_l;
     kl[3][3] = ea_l;
-    let her = [
-        [12.0, 6.0 * l, -12.0, 6.0 * l],
-        [6.0 * l, 4.0 * l * l, -6.0 * l, 2.0 * l * l],
-        [-12.0, -6.0 * l, 12.0, -6.0 * l],
-        [6.0 * l, 2.0 * l * l, -6.0 * l, 4.0 * l * l],
-    ];
     // Bending dofs are (v1, th1, v2, th2) = dofs 1, 2, 4, 5 — not a
     // contiguous block (dof 0/3 are axial).
     const BDOF: [usize; 4] = [1, 2, 4, 5];
-    for (i, &di) in BDOF.iter().enumerate() {
-        for (j, &dj) in BDOF.iter().enumerate() {
-            kl[di][dj] = w * her[i][j];
+    if shear {
+        // Timoshenko: chi = (th2 - th1)/L constant; gamma at the
+        // midpoint = (v2 - v1)/L - (th1 + th2)/2 (see the doc comment
+        // for why the shear term is 1-point).
+        let bend = e * inertia / l;
+        kl[2][2] += bend;
+        kl[2][5] -= bend;
+        kl[5][2] -= bend;
+        kl[5][5] += bend;
+        let g = e / (2.0 * (1.0 + nu));
+        let kga = (5.0 / 6.0) * g * area;
+        let bs = [-1.0 / l, -0.5, 1.0 / l, -0.5];
+        for (i, &di) in BDOF.iter().enumerate() {
+            for (j, &dj) in BDOF.iter().enumerate() {
+                kl[di][dj] += kga * l * bs[i] * bs[j];
+            }
+        }
+    } else {
+        let her = [
+            [12.0, 6.0 * l, -12.0, 6.0 * l],
+            [6.0 * l, 4.0 * l * l, -6.0 * l, 2.0 * l * l],
+            [-12.0, -6.0 * l, 12.0, -6.0 * l],
+            [6.0 * l, 2.0 * l * l, -6.0 * l, 4.0 * l * l],
+        ];
+        for (i, &di) in BDOF.iter().enumerate() {
+            for (j, &dj) in BDOF.iter().enumerate() {
+                kl[di][dj] = w * her[i][j];
+            }
         }
     }
 
@@ -693,13 +725,18 @@ pub(crate) fn b31_stiffness(
         let ba_l = [-1.0 / l, 0.0, 0.0, 1.0 / l, 0.0, 0.0];
         let t = x / l;
         // Curvature row on the four bending dofs (v1, th1, v2, th2) =
-        // local dofs 1, 2, 4, 5.
-        let bb4 = [
-            (-6.0 + 12.0 * t) / (l * l),
-            (-4.0 + 6.0 * t) / l,
-            (6.0 - 12.0 * t) / (l * l),
-            (-2.0 + 6.0 * t) / l,
-        ];
+        // local dofs 1, 2, 4, 5. Euler-Bernoulli: d2v/dx2 of the
+        // Hermite basis; Timoshenko: d(rotz)/dx of the linear basis.
+        let bb4 = if shear {
+            [0.0, -1.0 / l, 0.0, 1.0 / l]
+        } else {
+            [
+                (-6.0 + 12.0 * t) / (l * l),
+                (-4.0 + 6.0 * t) / l,
+                (6.0 - 12.0 * t) / (l * l),
+                (-2.0 + 6.0 * t) / l,
+            ]
+        };
         let mut bb_l = [0.0; 6];
         for (loc, &v) in [1usize, 2, 4, 5].iter().zip(&bb4) {
             bb_l[*loc] = v;
@@ -728,7 +765,9 @@ pub(crate) fn b31_stiffness(
 
 /// B31 consistent mass: translational only (axial + Hermite bending,
 /// no rotary inertia — the Euler-Bernoulli-consistent choice), rotated
-/// into global dofs. `None` for a zero-length beam.
+/// into global dofs. Also used for the Timoshenko variant (v1: the
+/// shear-flexible switch changes the stiffness only). `None` for a
+/// zero-length beam.
 pub(crate) fn b31_mass(coords: &[[f64; 2]; 2], rho: f64, area: f64) -> Option<[[f64; 6]; 6]> {
     let (dx, dy) = (coords[1][0] - coords[0][0], coords[1][1] - coords[0][1]);
     let l = (dx * dx + dy * dy).sqrt();
@@ -1278,7 +1317,7 @@ mod tests {
     #[test]
     fn b31_stiffness_kills_rigid_translation_and_is_symmetric() {
         let coords = [[0.0, 0.0], [2.0, 1.0]]; // angled beam
-        let (ke, _) = b31_stiffness(&coords, 1.0e6, 0.05, 1.0e-4).unwrap();
+        let (ke, _) = b31_stiffness(&coords, 1.0e6, 0.3, 0.05, 1.0e-4, false).unwrap();
         for (a, row) in ke.iter().enumerate() {
             for (c, &v) in row.iter().enumerate() {
                 assert!((v - ke[c][a]).abs() < 1e-9 * ke[c][a].abs().max(1.0));
@@ -1292,10 +1331,38 @@ mod tests {
     }
 
     #[test]
+    fn b31_timoshenko_kills_rigid_motion_and_is_symmetric() {
+        // Same invariances in the shear-flexible branch: rigid
+        // translation and rigid rotation produce zero nodal forces
+        // (gamma = dv/dx - rotz vanishes for rigid rotation).
+        let (ke, _) =
+            b31_stiffness(&[[0.0, 0.0], [2.0, 1.0]], 1.0e6, 0.3, 0.05, 1.0e-4, true).unwrap();
+        for (a, row) in ke.iter().enumerate() {
+            for (c, &v) in row.iter().enumerate() {
+                assert!((v - ke[c][a]).abs() < 1e-9 * ke[c][a].abs().max(1.0));
+            }
+        }
+        let u = [0.4, -0.7, 0.0, 0.4, -0.7, 0.0];
+        for (a, row) in ke.iter().enumerate() {
+            let ku: f64 = row.iter().zip(u).map(|(k, ui)| k * ui).sum();
+            assert!(ku.abs() < 1e-9, "row {a} not translation-invariant");
+        }
+        let (kv, _) =
+            b31_stiffness(&[[0.0, 0.0], [0.0, 3.0]], 1.0e6, 0.3, 0.05, 1.0e-4, true).unwrap();
+        // Rigid rotation about the origin: ux = -y, uy = x, rotz = 1.
+        let r = [0.0, 0.0, 1.0, -3.0, 0.0, 1.0];
+        for (a, row) in kv.iter().enumerate() {
+            let kr: f64 = row.iter().zip(r).map(|(k, ri)| k * ri).sum();
+            assert!(kr.abs() < 1e-6, "row {a}: {kr}");
+        }
+    }
+
+    #[test]
     fn b31_stiffness_kills_rigid_rotation_for_vertical_beam() {
         // Beam along +y: a rigid rotation about the origin (ux = -y,
         // uy = x, rotz = 1) must produce zero nodal forces.
-        let (ke, _) = b31_stiffness(&[[0.0, 0.0], [0.0, 3.0]], 1.0e6, 0.05, 1.0e-4).unwrap();
+        let (ke, _) =
+            b31_stiffness(&[[0.0, 0.0], [0.0, 3.0]], 1.0e6, 0.3, 0.05, 1.0e-4, false).unwrap();
         let u = [0.0, 0.0, 1.0, -3.0, 0.0, 1.0];
         for (a, row) in ke.iter().enumerate() {
             let ku: f64 = row.iter().zip(u).map(|(k, ui)| k * ui).sum();

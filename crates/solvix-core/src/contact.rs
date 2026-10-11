@@ -1,4 +1,5 @@
-//! # 2D node-to-surface penalty contact (small sliding, frictionless)
+//! # 2D node-to-surface penalty contact (small sliding, optional
+//! Coulomb friction)
 //!
 //! v1 formulation (issue #31), plugged into the Newton machinery of
 //! [`crate::nl`] as an active-set strategy:
@@ -24,6 +25,32 @@
 //!   ~100x a typical adjacent element stiffness, giving ~1e-12 m
 //!   penetration under gravity-scale loads without wrecking the
 //!   tangent's conditioning.
+//! - **Friction** ([`Model::friction_coeff`] = `Some(mu)`, issue #56):
+//!   tangential penalty stick/slip on penetrating nodes. STICK: the
+//!   tangential spring uses `k_t = penalty/1000` — deliberately below
+//!   the normal penalty, which is calibrated for ~1e-12 m penetration;
+//!   at the normal value the stick spring shear-lags the surface nodes
+//!   (host in-plane stiffness ~E*t) and concentrates the tangential
+//!   load at the patch ends far past their `mu*F_n` caps, parking the
+//!   corners in a permanent slip state that Newton crawls through. At
+//!   `penalty/1000` the stick slip stays ~1e-9 m (zero at contact
+//!   scale). The slip s is the relative tangential displacement
+//!   `s = (u_s - sum N_i u_mi) . t_hat` from the UNSTRESSED initial
+//!   contact point — an EXPLICIT v1 law (total-slip anchor). SLIP when
+//!   `|k_t s| > mu * F_n`; the force returns to the friction cone,
+//!   `F_t = mu * F_n * sign(s)` opposing the slip direction. The
+//!   implicit upgrade (documented, not built): track the slip
+//!   incrementally from the point of first contact with a
+//!   return-mapping algorithm and the consistent (asymmetric) slip
+//!   tangent d|F_t|/du through F_n — the exact tangent is asymmetric
+//!   and even its symmetrization is indefinite, unusable under the
+//!   symmetric LDLT, so the v1 tangent keeps the STICK blocks
+//!   `k_t c_i c_j (t outer t)` active for slipping nodes too (the
+//!   standard symmetric-solver approximation). Consequences: explicit
+//!   slip states floor the Newton residual at the cap-rounding level
+//!   (~5e-6 relative on the bench ramp), and a sliding body finds no
+//!   static equilibrium at all — the solve fails with `NotConverged`
+//!   after its cutbacks, the reported "slides" signal.
 //! - **Cold start**: a node is LINEARIZED as in contact when
 //!   `g < activation_gap` (= 1e-9 * mesh diagonal) but only carries
 //!   force for `g < 0`. The band exists so a block resting exactly on
@@ -39,10 +66,10 @@
 //!   set/Uzawa scheme would be needed).
 //! - **Tangent**: penalty normal stiffness only, with the consistent
 //!   slave/master coupling blocks `k t c_i c_j n n^T` (`c` from the
-//!   projection shape functions). The normal is held FIXED over an
+//!   projection shape functions; the friction stick blocks add the
+//!   matching `k t c_i c_j t t^T`). The normal is held FIXED over an
 //!   iteration (small sliding): the `g dn/du` rotation term is dropped,
-//!   the standard small-slip node-to-segment linearization. Friction
-//!   (`*FRICTION`) is not formulated.
+//!   the standard small-slip node-to-segment linearization.
 //! - Contact models ride [`crate::nl::solve_nl`]; plasticity + contact
 //!   and thermomechanics + contact are rejected/ignored (v1 ceilings).
 //!   A zero-load contact model returns the zero solution (initial
@@ -54,6 +81,9 @@ use crate::{ContactForce, Model, SolveError};
 /// the penalty stiffness. Built once per solve from [`Model::contact_pairs`].
 pub(crate) struct ContactCtx {
     penalty: f64,
+    /// Coulomb friction coefficient when [`crate::Model::friction_coeff`]
+    /// is set; `None` keeps contact frictionless.
+    friction: Option<f64>,
     /// Nodes linearized as in-contact when g < activation_gap; zero
     /// force unless g < 0 (see module docs).
     activation_gap: f64,
@@ -138,6 +168,14 @@ pub(crate) fn build_ctx(model: &Model) -> Result<ContactCtx, SolveError> {
             "contact penalty must be positive (materials need a Young's modulus)".into(),
         ));
     }
+    let friction = model.friction_coeff;
+    if let Some(mu) = friction {
+        if !mu.is_finite() || mu < 0.0 {
+            return Err(SolveError::InvalidModel(
+                "friction coefficient must be finite and non-negative".into(),
+            ));
+        }
+    }
     let mut pairs = Vec::with_capacity(model.contact_pairs.len());
     for (pi, p) in model.contact_pairs.iter().enumerate() {
         let slave = node_indices(model, &p.slave, &format!("{} slave", pi + 1))?;
@@ -175,6 +213,7 @@ pub(crate) fn build_ctx(model: &Model) -> Result<ContactCtx, SolveError> {
     let diag = ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt();
     Ok(ContactCtx {
         penalty,
+        friction,
         activation_gap: 1e-9 * diag,
         pairs,
         n_slave_slots,
@@ -202,6 +241,17 @@ pub(crate) fn contact_terms(ctx: &ContactCtx, model: &Model, u: &[f64]) -> Conta
         active: vec![false; ctx.n_slave_slots],
     };
     let k = ctx.penalty * model.thickness;
+    // Tangential stick stiffness: a fixed 1e-3 fraction of the normal
+    // penalty. The normal penalty (100*E) is calibrated for penetration
+    // (~1e-12 m); the same value as k_t over-constrains the tangential
+    // direction — the host element's in-plane stiffness is ~E*t, so a
+    // 100*E stick spring shear-lags the surface nodes and concentrates
+    // the tangential load at the patch ends far past their mu*F_n caps
+    // (measured: a 2.1e13 k_t parks the corner nodes in a permanent
+    // slip state that Newton crawls through). At penalty/1000 the
+    // stick slip stays ~1e-9 m (still "zero" at contact scale) and the
+    // fair-share distribution sticks cleanly.
+    let kt = k * 1e-3;
     let xy0 = |i: usize| {
         let c = model.mesh.nodes[i].coords;
         [c[0] + u[2 * i], c[1] + u[2 * i + 1]]
@@ -271,6 +321,7 @@ pub(crate) fn contact_terms(ctx: &ContactCtx, model: &Model, u: &[f64]) -> Conta
             // PENETRATING nodes only — the activation band is tangent-
             // only (zero force, no adhesion).
             let (w0, w1) = (1.0 - sp, sp);
+            let tang = [n[1], -n[0]];
             if g < 0.0 {
                 for (row, fx, fy) in [
                     (2 * s, k * g * n[0], k * g * n[1]),
@@ -281,16 +332,50 @@ pub(crate) fn contact_terms(ctx: &ContactCtx, model: &Model, u: &[f64]) -> Conta
                     terms.f.push((row + 1, fy));
                 }
                 // Physical force ON the slave (pushes it out of master).
+                let (mut cfx, mut cfy) = (-k * g * n[0], -k * g * n[1]);
+                // Coulomb friction (explicit v1, see module docs): stick
+                // spring anchored at the initial contact point, slip
+                // returns |F_t| to mu * F_n. f_int mirrors the normal
+                // pattern: slave +F_t*t_hat, masters -N_i*F_t*t_hat.
+                if let Some(mu) = ctx.friction {
+                    let slip = (u[2 * s] - w0 * u[2 * m0] - w1 * u[2 * m1]) * tang[0]
+                        + (u[2 * s + 1] - w0 * u[2 * m0 + 1] - w1 * u[2 * m1 + 1]) * tang[1];
+                    let f_n = -k * g;
+                    let sticking = (kt * slip).abs() <= mu * f_n;
+                    let ft = if sticking {
+                        kt * slip // stick
+                    } else {
+                        mu * f_n * slip.signum() // slip: back on the cone
+                    };
+                    for (row, fx, fy) in [
+                        (2 * s, ft * tang[0], ft * tang[1]),
+                        (2 * m0, -w0 * ft * tang[0], -w0 * ft * tang[1]),
+                        (2 * m1, -w1 * ft * tang[0], -w1 * ft * tang[1]),
+                    ] {
+                        terms.f.push((row, fx));
+                        terms.f.push((row + 1, fy));
+                    }
+                    cfx -= ft * tang[0];
+                    cfy -= ft * tang[1];
+                }
                 terms.forces.push(ContactForce {
                     node_id: model.mesh.nodes[s].id,
-                    fx: -k * g * n[0],
-                    fy: -k * g * n[1],
+                    fx: cfx,
+                    fy: cfy,
                     penetration: -g,
                 });
             }
             // Consistent tangent k*t*c_i*c_j*(n outer n), fixed normal —
             // active band nodes included (that is the band's purpose:
-            // normal support from the first iteration).
+            // normal support from the first iteration). Friction adds
+            // the matching (t outer t) blocks with the same penalty
+            // stiffness for EVERY friction-active node, slipping ones
+            // included: the exact slip tangent is asymmetric
+            // (d|F_t|/du flows through F_n and the penetration), whose
+            // symmetrization is indefinite — unusable under the
+            // symmetric LDLT. Keeping the stick tangent in slip is the
+            // standard symmetric-solver approximation (documented v1
+            // ceiling alongside the implicit return-mapping upgrade).
             let blocks = [
                 (2 * s, 2 * s, 1.0),
                 (2 * s, 2 * m0, -w0),
@@ -302,10 +387,17 @@ pub(crate) fn contact_terms(ctx: &ContactCtx, model: &Model, u: &[f64]) -> Conta
                 (2 * m1, 2 * m0, w1 * w0),
                 (2 * m1, 2 * m1, w1 * w1),
             ];
+            let dirs: [[f64; 2]; 2] = if ctx.friction.is_some() {
+                [n, tang]
+            } else {
+                [n, [0.0, 0.0]]
+            };
             for (r, c, cf) in blocks {
-                for (i, ni) in n.iter().enumerate() {
-                    for (j, nj) in n.iter().enumerate() {
-                        terms.trips.push((r + i, c + j, k * cf * ni * nj));
+                for (stiff, dir) in [(k, dirs[0]), (kt, dirs[1])] {
+                    for (i, ni) in dir.iter().enumerate() {
+                        for (j, nj) in dir.iter().enumerate() {
+                            terms.trips.push((r + i, c + j, stiff * cf * ni * nj));
+                        }
                     }
                 }
             }
@@ -763,6 +855,111 @@ mod tests {
                 f.load_fraction,
                 f.solution.iterations
             );
+        }
+    }
+
+    #[test]
+    fn friction_block_on_30deg_ramp_sticks_or_slides() {
+        // Block on a fixed 30-degree ramp under gravity. With
+        // mu = 0.8 > tan(30deg) = 0.577 the block STICKS: static
+        // equilibrium with (penetration-scale) zero displacement and
+        // contact resultant = W*(cos30*n + sin30*t). With mu = 0.4 the
+        // friction cone cannot hold the tangential drive (0.4*cos30 =
+        // 0.346 < sin30 = 0.5) — the block slides, no static
+        // equilibrium exists, and the solve reports NotConverged.
+        // Flat slab (w/h = 8): the friction/gravity couple tilts the
+        // patch and unloads the downhill corner; a wide flat block
+        // keeps every node's mu*F_n above its fair tangential share.
+        let (nx, ny) = (12usize, 2);
+        let (w, h) = (0.24, 0.03);
+        let mesh = quad_mesh(nx, ny, w, h);
+        let theta = std::f64::consts::PI / 6.0;
+        let (c, s) = (theta.cos(), theta.sin());
+        let t_hat = [c, s];
+        let n_hat = [-s, c];
+        let c0 = [0.0, 0.02];
+        let mut nodes = Vec::with_capacity(mesh.nodes.len() + 5);
+        for nd in &mesh.nodes {
+            let (lx, ly) = (nd.coords[0], nd.coords[1]);
+            nodes.push(crate::Node {
+                id: nd.id,
+                coords: [
+                    c0[0] + lx * t_hat[0] + ly * n_hat[0],
+                    c0[1] + lx * t_hat[1] + ly * n_hat[1],
+                    0.0,
+                ],
+            });
+        }
+        let ramp_pos = [-0.04, 0.08, 0.14, 0.2, 0.28];
+        let mut ramp_ids = Vec::new();
+        for (i, &u) in ramp_pos.iter().enumerate() {
+            let id = 1000 + i as u32;
+            nodes.push(crate::Node {
+                id,
+                coords: [c0[0] + u * t_hat[0], c0[1] + u * t_hat[1], 0.0],
+            });
+            ramp_ids.push(id);
+        }
+        let mut model = steel_model(
+            crate::Mesh {
+                nodes,
+                elements: mesh.elements,
+            },
+            1.0,
+        );
+        let slave: Vec<u32> = (1..=(nx + 1) as u32).collect(); // local y=0 edge
+        model.contact_pairs = vec![ContactPair {
+            slave,
+            master: ramp_ids.clone(),
+        }];
+        model.steps = vec![Step {
+            name: "ramp".into(),
+            boundary_conditions: vec![fixed(&ramp_ids)],
+            gravity: Some((G, [0.0, -1.0, 0.0])),
+            ..Step::default()
+        }];
+        let w_block = RHO * w * h * model.thickness * G;
+
+        model.friction_coeff = Some(0.8);
+        // Explicit slip states floor the residual at the cap-rounding
+        // level (~5e-6 here, one corner node riding its cone): solve at
+        // 1e-5 — still far tighter than the physics needs.
+        let frames = solve_nl(
+            &model,
+            &NlOptions {
+                tolerance: 1e-5,
+                ..NlOptions::default()
+            },
+        )
+        .unwrap();
+        let sol = frames.last().unwrap().solution.clone();
+        let max_disp = sol
+            .displacements
+            .iter()
+            .map(|d| d[0].abs().max(d[1].abs()))
+            .fold(0.0f64, f64::max);
+        eprintln!("friction mu=0.8: max |u| = {max_disp:.3e} m");
+        // Stick-slip against k_t = penalty/1000 sets the scale (~1e-9 m);
+        // 1e-8 m is 4 orders below the block's smallest feature.
+        assert!(max_disp < 1e-8, "stuck block moved {max_disp:.3e} m");
+        let fx: f64 = sol.contact_forces.iter().map(|cf| cf.fx).sum();
+        let fy: f64 = sol.contact_forces.iter().map(|cf| cf.fy).sum();
+        let n_comp = fx * n_hat[0] + fy * n_hat[1];
+        let t_comp = fx * t_hat[0] + fy * t_hat[1];
+        eprintln!(
+            "friction mu=0.8: normal {n_comp:.2} (want {:.2}), tangential {t_comp:.2} (want {:.2} = W sin30)",
+            w_block * c,
+            w_block * s
+        );
+        assert!((n_comp - w_block * c).abs() / (w_block * c) < 1e-3);
+        assert!((t_comp - w_block * s).abs() / (w_block * s) < 1e-3);
+
+        model.friction_coeff = Some(0.4);
+        match solve(&model) {
+            Err(SolveError::NotConverged { iterations, .. }) => {
+                eprintln!("friction mu=0.4: slides (not converged after {iterations} iterations)");
+            }
+            other => panic!("mu=0.4 on a 30deg ramp must slide, got {other:?}"),
         }
     }
 
