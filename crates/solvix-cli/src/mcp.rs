@@ -413,14 +413,17 @@ fn tool_run(args: &Json) -> Result<String, (Stage, String)> {
     let (model, _) = parse_deck(&text)?;
     let t0 = std::time::Instant::now();
     let outcome = solve_auto(&model).map_err(|e| (Stage::Solve, solve_error_message(e)))?;
-    let frequencies_hz = match arg_modes(args) {
-        Some(n) => {
+    let modal = match arg_modes(args) {
+        Some(n) => Some(
             solvix_core::solve_modal(&model, &solvix_core::ModalOptions { num_modes: n })
-                .map_err(|e| (Stage::Solve, solve_error_message(e)))?
-                .frequencies_hz
-        }
-        None => Vec::new(),
+                .map_err(|e| (Stage::Solve, solve_error_message(e)))?,
+        ),
+        None => None,
     };
+    let frequencies_hz = modal
+        .as_ref()
+        .map(|m| m.frequencies_hz.clone())
+        .unwrap_or_default();
     let solve_ms = t0.elapsed().as_millis() as u64;
     std::fs::create_dir_all(&outdir)
         .map_err(|e| (Stage::Io, format!("cannot create directory {outdir}: {e}")))?;
@@ -429,7 +432,12 @@ fn tool_run(args: &Json) -> Result<String, (Stage, String)> {
         crate::AutoOutcome::Static { sol, .. } => sol,
         crate::AutoOutcome::Dynamic { final_sol, .. } => final_sol,
     };
-    solvix_io::write_vtu(&vtu, &model, sol_for_vtu)
+    let extra = crate::vtu_extra(&model, &outcome, modal.as_ref());
+    let extra_refs: Vec<(&str, &[f64])> = extra
+        .iter()
+        .map(|(name, values)| (*name, values.as_slice()))
+        .collect();
+    solvix_io::write_vtu_ex(&vtu, &model, sol_for_vtu, &extra_refs)
         .map_err(|e| (Stage::Io, format!("cannot write {}: {e}", vtu.display())))?;
     let mut outputs = vec![vtu.display().to_string()];
     if matches!(args.get("odb"), Some(Json::Bool(true))) {
@@ -1003,6 +1011,28 @@ COLD, 0.0
         assert_eq!(freqs.len(), 2, "{payload}");
         assert!(freqs[0] > 0.0 && freqs[1] > freqs[0], "{payload}");
         assert!(payload.ends_with(r#"}"#), "{payload}");
+        // Issue #52: the VTU carries a normalized mode-1 PointData field.
+        let stem = std::path::Path::new(&p)
+            .file_stem()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let xml =
+            std::fs::read_to_string(std::path::Path::new(&outdir).join(format!("{stem}.vtu")))
+                .unwrap();
+        assert!(xml.contains(r#"Name="Mode1""#), "{xml}");
+        let after = xml.split(r#"Name="Mode1""#).nth(1).unwrap();
+        let body = &after[..after.find("</DataArray>").unwrap()];
+        let nums: Vec<f64> = body
+            .lines()
+            .filter_map(|l| l.trim().parse::<f64>().ok())
+            .collect();
+        assert_eq!(nums.len(), 6, "one value per node, {xml}");
+        assert!(
+            (nums.iter().copied().fold(f64::NEG_INFINITY, f64::max) - 1.0).abs() < 1e-9,
+            "normalized max = 1, {nums:?}"
+        );
+        assert!(!xml.contains(r#"Name="Temperature""#), "{xml}");
         std::fs::remove_file(p).ok();
         std::fs::remove_dir_all(outdir).ok();
     }
@@ -1079,6 +1109,28 @@ COLD, 0.0
             "{payload}"
         );
         assert!(!payload.contains(r#""dynamic""#), "{payload}");
+        // Issue #52: the VTU carries the nodal temperature PointData field.
+        let stem = std::path::Path::new(&p)
+            .file_stem()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let xml =
+            std::fs::read_to_string(std::path::Path::new(&outdir).join(format!("{stem}.vtu")))
+                .unwrap();
+        assert!(xml.contains(r#"Name="Temperature""#), "{xml}");
+        let after = xml.split(r#"Name="Temperature""#).nth(1).unwrap();
+        let body = &after[..after.find("</DataArray>").unwrap()];
+        let nums: Vec<f64> = body
+            .lines()
+            .filter_map(|l| l.trim().parse::<f64>().ok())
+            .collect();
+        assert_eq!(nums.len(), 6, "one value per node, {xml}");
+        assert!(
+            (nums.iter().copied().fold(f64::NEG_INFINITY, f64::max) - 100.0).abs() < 1e-6,
+            "hot end = 100, {nums:?}"
+        );
+        assert!(!xml.contains(r#"Name="Mode1""#), "{xml}");
         std::fs::remove_file(p).ok();
         std::fs::remove_dir_all(outdir).ok();
     }

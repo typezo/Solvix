@@ -6,6 +6,17 @@ use std::path::Path;
 use solvix_core::{ElemKind, Model, Solution};
 
 pub(super) fn write_vtu(path: &Path, model: &Model, solution: &Solution) -> std::io::Result<()> {
+    write_vtu_ex(path, model, solution, &[])
+}
+
+/// `write_vtu` plus extra scalar PointData arrays (one value per node,
+/// issue #52: mode shapes, temperatures). Shorter arrays pad with 0.
+pub(super) fn write_vtu_ex(
+    path: &Path,
+    model: &Model,
+    solution: &Solution,
+    extra: &[(&str, &[f64])],
+) -> std::io::Result<()> {
     let nodes = &model.mesh.nodes;
     let elements = &model.mesh.elements;
     let index: HashMap<u32, usize> = nodes.iter().enumerate().map(|(i, n)| (n.id, i)).collect();
@@ -75,6 +86,20 @@ pub(super) fn write_vtu(path: &Path, model: &Model, solution: &Solution) -> std:
         s.push_str(&format!("          {} {} {}\n", d[0], d[1], d[2]));
     }
     s.push_str("        </DataArray>\n      </PointData>\n");
+
+    for (name, values) in extra {
+        s.push_str(&format!(
+            "      <PointData>\n        <DataArray type=\"Float64\" Name=\"{}\" format=\"ascii\">\n",
+            name
+        ));
+        for i in 0..nodes.len() {
+            s.push_str(&format!(
+                "          {}\n",
+                values.get(i).copied().unwrap_or(0.0)
+            ));
+        }
+        s.push_str("        </DataArray>\n      </PointData>\n");
+    }
 
     s.push_str("      <CellData>\n        <DataArray type=\"Float64\" Name=\"VonMises\" format=\"ascii\">\n");
     for i in 0..elements.len() {
@@ -424,6 +449,67 @@ mod tests {
         assert!(xml.contains("42.5"));
         assert!(xml.contains("7.25"));
         assert!(xml.trim_end().ends_with("</VTKFile>"));
+    }
+
+    #[test]
+    fn vtu_extra_point_data_arrays() {
+        let model = Model {
+            mesh: Mesh {
+                nodes: vec![
+                    Node {
+                        id: 1,
+                        coords: [0.0, 0.0, 0.0],
+                    },
+                    Node {
+                        id: 2,
+                        coords: [1.0, 0.0, 0.0],
+                    },
+                ],
+                elements: vec![Element {
+                    id: 1,
+                    kind: ElemKind::B31,
+                    connectivity: vec![1, 2],
+                }],
+            },
+            thickness: 1.0,
+            ..Model::default()
+        };
+        let path =
+            std::env::temp_dir().join(format!("solvix_io_vtu_extra_{}.vtu", std::process::id()));
+        write_vtu_ex(
+            &path,
+            &model,
+            &Solution::default(),
+            &[("Mode1", &[0.25, 1.0]), ("Temperature", &[100.0, 0.5])],
+        )
+        .unwrap();
+        let xml = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        for (name, values) in [("Mode1", [0.25, 1.0]), ("Temperature", [100.0, 0.5])] {
+            let after = xml.split(&format!("Name=\"{name}\"")).nth(1).unwrap_or("");
+            let body = &after[..after.find("</DataArray>").unwrap_or(0)];
+            let nums: Vec<f64> = body
+                .lines()
+                .filter_map(|l| l.trim().parse::<f64>().ok())
+                .collect();
+            assert_eq!(nums.len(), 2, "{name}: wrong node count, {xml}");
+            for (got, want) in nums.iter().zip(values) {
+                assert!((got - want).abs() < 1e-12, "{name}: {nums:?}");
+            }
+        }
+        // The stock writer stays byte-identical to the empty-extra call.
+        let plain =
+            std::env::temp_dir().join(format!("solvix_io_vtu_plain_{}.vtu", std::process::id()));
+        write_vtu_ex(&plain, &model, &Solution::default(), &[]).unwrap();
+        let plain_xml = std::fs::read_to_string(&plain).unwrap();
+        std::fs::remove_file(&plain).unwrap();
+        let stock =
+            std::env::temp_dir().join(format!("solvix_io_vtu_stock_{}.vtu", std::process::id()));
+        write_vtu(&stock, &model, &Solution::default()).unwrap();
+        let stock_xml = std::fs::read_to_string(&stock).unwrap();
+        std::fs::remove_file(&stock).unwrap();
+        assert_eq!(plain_xml, stock_xml);
     }
 
     #[test]

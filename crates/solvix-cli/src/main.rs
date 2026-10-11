@@ -39,8 +39,10 @@ solvix is designed for AI agents: all subcommands accept --json and exit 0/1/2/3
 Usage:
   solvix run <job.inp> [-o outdir] [--modes N] [--odb] [--json]
                                                parse, solve, write <jobname>.vtu;
-                                               --modes N also extracts the N lowest
-                                               natural frequencies (modal analysis).
+                                                 --modes N also extracts the N lowest
+                                                 natural frequencies (modal analysis;
+                                                 the VTU gains a normalized mode-1
+                                                 \"Mode1\" field).
                                                --odb also writes <jobname>.solvix, a
                                                binary output database (frames with
                                                displacements, von Mises, temperatures
@@ -54,9 +56,10 @@ Usage:
                                                is the max over all time points); step
                                                temperature data (*HEAT TRANSFER,
                                                *TEMPERATURE, *DFLUX) without dynamics
-                                               runs a thermal-stress pass (JSON gains
-                                               \"thermal\":true, max_temperature_c);
-                                               anything else is linear statics
+                                                runs a thermal-stress pass (JSON gains
+                                                \"thermal\":true, max_temperature_c;
+                                                the VTU gains a \"Temperature\" field);
+                                                anything else is linear statics
   solvix info <job.inp> [--json]              parse-only model report, never solves
   solvix odb <file.solvix> [--inspect | --frame N] [--json]
                                                binary output database reader: default
@@ -546,6 +549,37 @@ fn final_frame_solution(model: &Model, dyn_sol: &DynSolution) -> Solution {
         contact_forces: Vec::new(),
         cond_estimate: 0.0,
     }
+}
+
+/// Extra scalar PointData for the VTU writer (issue #52): a mode-1
+/// per-node |component| normalized to max 1 for modal runs, nodal
+/// temperatures for thermal jobs.
+fn vtu_extra(
+    model: &Model,
+    outcome: &AutoOutcome,
+    modal: Option<&solvix_core::ModalSolution>,
+) -> Vec<(&'static str, Vec<f64>)> {
+    let mut extra: Vec<(&'static str, Vec<f64>)> = Vec::new();
+    if let Some(mode1) = modal.and_then(|m| m.modes.first()) {
+        let nodes = model.mesh.nodes.len();
+        let ndof = mode1.len().checked_div(nodes.max(1)).unwrap_or(2).max(1);
+        let peak = max_abs_u(mode1, ndof);
+        let inv = if peak > 0.0 { 1.0 / peak } else { 0.0 };
+        extra.push((
+            "Mode1",
+            mode1
+                .chunks(ndof)
+                .map(|c| inv * c.iter().map(|v| v * v).sum::<f64>().sqrt())
+                .collect(),
+        ));
+    }
+    if let AutoOutcome::Static {
+        temps: Some(temps), ..
+    } = outcome
+    {
+        extra.push(("Temperature", temps.clone()));
+    }
+    extra
 }
 
 /// The `run` pipeline's analysis-type dispatch (issues #46/#47): detect
@@ -1145,17 +1179,19 @@ fn do_run(
     let outcome = solve_auto(&model).map_err(|e| (Stage::Solve, solve_error_message(e)))?;
     let solve_ms = t0.elapsed().as_millis() as u64;
     // Modal pass (issue #40): after the solve, extract the N lowest
-    // natural frequencies. VTU mode-shape output is deferred: solvix-io is
-    // owned by issue #25 (write_vtu extension is a #25-followup item), as
-    // is temperature PointData for thermal jobs (issue #46 follow-up).
-    let frequencies_hz = match modes {
-        Some(n) => {
+    // natural frequencies and the mode-1 shape (extra VTU PointData,
+    // issue #52, alongside temperatures for thermal jobs).
+    let modal = match modes {
+        Some(n) => Some(
             solvix_core::solve_modal(&model, &solvix_core::ModalOptions { num_modes: n })
-                .map_err(|e| (Stage::Solve, solve_error_message(e)))?
-                .frequencies_hz
-        }
-        None => Vec::new(),
+                .map_err(|e| (Stage::Solve, solve_error_message(e)))?,
+        ),
+        None => None,
     };
+    let frequencies_hz = modal
+        .as_ref()
+        .map(|m| m.frequencies_hz.clone())
+        .unwrap_or_default();
     let job = job_name(inp);
     std::fs::create_dir_all(outdir)
         .map_err(|e| (Stage::Io, format!("cannot create directory {outdir}: {e}")))?;
@@ -1164,7 +1200,12 @@ fn do_run(
         AutoOutcome::Static { sol, .. } => sol,
         AutoOutcome::Dynamic { final_sol, .. } => final_sol,
     };
-    solvix_io::write_vtu(&vtu, &model, sol_for_vtu)
+    let extra = vtu_extra(&model, &outcome, modal.as_ref());
+    let extra_refs: Vec<(&str, &[f64])> = extra
+        .iter()
+        .map(|(name, values)| (*name, values.as_slice()))
+        .collect();
+    solvix_io::write_vtu_ex(&vtu, &model, sol_for_vtu, &extra_refs)
         .map_err(|e| (Stage::Io, format!("cannot write {}: {e}", vtu.display())))?;
     let mut outputs = vec![vtu.display().to_string()];
     if odb {
@@ -1919,6 +1960,64 @@ COLD, 0.0
         let j = success_json(&s);
         assert!(!j.contains("thermal"), "{j}");
         assert!(!j.contains("dynamic"), "{j}");
+    }
+
+    // ---- issue #52: VTU extra PointData (mode shape, temperatures) ----
+
+    #[test]
+    fn vtu_extra_mode1_and_temperature() {
+        // fake_model: 2 nodes x 2 dofs; mode-1 [3,4, 0,0] normalizes
+        // to per-node magnitudes [1, 0].
+        let modal = solvix_core::ModalSolution {
+            frequencies_hz: vec![12.5],
+            modes: vec![vec![3.0, 4.0, 0.0, 0.0]],
+            iterations: 3,
+        };
+        let extra = vtu_extra(&fake_model(), &static_outcome(), Some(&modal));
+        assert_eq!(extra.len(), 1);
+        assert_eq!(extra[0].0, "Mode1");
+        assert_eq!(extra[0].1, vec![1.0, 0.0]);
+
+        let (model, _) = solvix_io::parse_inp(THERMAL_DECK).unwrap();
+        let outcome = solve_auto(&model).unwrap();
+        let extra = vtu_extra(&model, &outcome, None);
+        assert_eq!(extra.len(), 1);
+        assert_eq!(extra[0].0, "Temperature");
+        assert_eq!(extra[0].1.len(), model.mesh.nodes.len());
+        assert!(
+            (extra[0].1.iter().copied().fold(f64::NEG_INFINITY, f64::max) - 100.0).abs() < 1e-6
+        );
+    }
+
+    #[test]
+    fn do_run_modal_and_thermal_write_extra_vtu_fields() {
+        let dir = std::env::temp_dir().join(format!("solvix_cli_run52_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let inp = dir.join("job52.inp");
+        std::fs::write(&inp, THERMAL_DECK).unwrap();
+        let out = dir.display().to_string();
+        let inp = inp.display().to_string();
+
+        do_run(&inp, &out, Some(2), false, true).unwrap();
+        let xml = std::fs::read_to_string(dir.join("job52.vtu")).unwrap();
+        assert!(xml.contains(r#"Name="Mode1""#), "{xml}");
+        assert!(xml.contains(r#"Name="Temperature""#), "{xml}");
+        for name in ["Mode1", "Temperature"] {
+            let after = xml.split(&format!(r#"Name="{name}""#)).nth(1).unwrap();
+            let body = &after[..after.find("</DataArray>").unwrap()];
+            let nums: Vec<f64> = body
+                .lines()
+                .filter_map(|l| l.trim().parse::<f64>().ok())
+                .collect();
+            assert_eq!(nums.len(), 6, "{name}: one value per node, {xml}");
+        }
+
+        std::fs::remove_file(dir.join("job52.vtu")).unwrap();
+        do_run(&inp, &out, None, false, true).unwrap();
+        let xml = std::fs::read_to_string(dir.join("job52.vtu")).unwrap();
+        assert!(!xml.contains(r#"Name="Mode1""#), "{xml}");
+        assert!(xml.contains(r#"Name="Temperature""#), "{xml}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

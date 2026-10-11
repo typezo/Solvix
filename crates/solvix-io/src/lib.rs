@@ -52,6 +52,17 @@ pub fn write_vtu(
     vtu::write_vtu(path, model, solution)
 }
 
+/// [`write_vtu`] plus extra scalar PointData arrays, one value per node
+/// (issue #52: mode shapes, temperatures). Shorter arrays pad with 0.
+pub fn write_vtu_ex(
+    path: &std::path::Path,
+    model: &Model,
+    solution: &Solution,
+    extra: &[(&str, &[f64])],
+) -> std::io::Result<()> {
+    vtu::write_vtu_ex(path, model, solution, extra)
+}
+
 /// Write nodal displacements and element von Mises stress as a binary
 /// appended-data VTK UnstructuredGrid `.vtu` file (ParaView-ready).
 pub fn write_vtu_binary(
