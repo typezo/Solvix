@@ -8,20 +8,33 @@
 //! (not the elastic secant), so full Newton retains its local convergence
 //! rate after yield.
 //!
-//! Element support is deliberately explicit.  C3D8/C3D4 and plane-strain
-//! CPE4/CPE8 can use the direct six-component return.  Plane-stress
-//! CPS3/CPS4/CPS8 is rejected with `InvalidModel`: the return surface is
-//! not closed under a plain six-component return because `sigma_zz = 0`
-//! must be enforced while `eps_zz` evolves.  A dedicated three-component
-//! fixed-point plane-stress return is the upgrade path.  Plasticity also
-//! takes precedence over NLGEOM and uses the small-strain branch documented
-//! here.
+//! Element support is deliberate.  C3D8/C3D4 use the direct six-component
+//! return.  Plane elements carry three B rows `(eps_xx, eps_yy, gamma_xy)`
+//! mapped into the six-component order's in-plane slots `[0, 1, 3]`:
+//! plane-strain CPE4/CPE8 (eps_zz = 0) reuse the six-component return,
+//! plane-stress CPS3/CPS4/CPS8 use the dedicated three-component
+//! fixed-point return below that enforces `sigma_zz = 0`.  B31 remains
+//! rejected.  Plasticity also takes precedence over NLGEOM and uses the
+//! small-strain branch documented here.
 
 use crate::assembly::{self, Csr};
-use crate::element::{d3_matrix, hex_b, quad8_b, quad_b, tet_gradients, von_mises, G3, W3};
+use crate::element::{
+    cps3_b_matrix, d3_matrix, d_matrix, hex_b, quad8_b, quad_b, tet_gradients, von_mises, G3, W3,
+};
 use crate::ldl::Ldlt;
 use crate::solver::{apply_dirichlet, constrained_dofs};
 use crate::{ElemKind, Model, NlFrame, NlOptions, PlasticitySpec, Reaction, Solution, SolveError};
+
+/// Strain slots of the six-component order `(xx, yy, zz, xy, yz, xz)`
+/// that plane elements' three B rows occupy.
+const IN_PLANE_SLOTS: [usize; 3] = [0, 1, 3];
+/// All six slots, in order (solid elements).
+const SOLID_SLOTS: [usize; 6] = [0, 1, 2, 3, 4, 5];
+/// Plane-stress fixed-point convergence tolerance, relative to the
+/// current yield stress.
+const PS_TOL: f64 = 1.0e-10;
+/// Plane-stress fixed-point iteration cap (3-5 passes is typical).
+const PS_MAX_ITER: usize = 50;
 
 /// One integration point's flattened B matrix (row-major) and integration
 /// weight (including thickness for plane elements).
@@ -42,9 +55,13 @@ struct PlasticElem {
     points: Vec<IntegrationPoint>,
     /// Full 3D elastic matrix; plane-strain elements feed only their
     /// in-plane strain components into the six-component return.
+    /// Plane-stress elements instead carry the plane-stress 3x3
+    /// embedded at the in-plane slots (their elastic-fallback tangent).
     d: [[f64; 6]; 6],
     youngs_modulus: f64,
     poisson_ratio: f64,
+    /// CPS elements route to the plane-stress fixed-point return.
+    plane_stress: bool,
     history: Vec<HistoryPoint>,
 }
 
@@ -191,6 +208,136 @@ fn radial_return(
     }
 }
 
+/// One pass of the classical plane-stress fixed-point return: the
+/// three-component J2 update enforcing `sigma_zz = 0` by iterating the
+/// out-of-plane strain increment (de Souza Neto, Peric & Owen style).
+///
+/// Each pass builds the six-component trial with the current `d_eps_zz`
+/// (seeded with the elastic elimination
+/// `-lambda/(lambda+2G) * (d_eps_xx + d_eps_yy)`), performs the standard
+/// radial return, and corrects `d_eps_zz` by the `sigma_zz` the return
+/// leaves behind, scaled by `1/(lambda + 2G)`.  The plastic flow's zz
+/// component is what moves the constraint around, so the iteration
+/// converges when the returned `sigma_zz` does; 3-5 passes is typical
+/// for hardening plastics (`PS_TOL` relative to the current yield
+/// stress, `PS_MAX_ITER` cap).  In-plane strain components are read
+/// from slots `[0, 1, 3]` of `strain_increment`; the returned stress
+/// carries `sigma_yz = sigma_xz = 0`.  Returns the stress, the new
+/// equivalent plastic strain, and whether the step stayed elastic.
+fn plane_stress_core(
+    spec: PlasticitySpec,
+    youngs_modulus: f64,
+    poisson_ratio: f64,
+    old: HistoryPoint,
+    strain_increment: [f64; 6],
+) -> ([f64; 6], f64, bool) {
+    let shear = youngs_modulus / (2.0 * (1.0 + poisson_ratio));
+    let lambda =
+        youngs_modulus * poisson_ratio / ((1.0 + poisson_ratio) * (1.0 - 2.0 * poisson_ratio));
+    let zz_stiffness = lambda + 2.0 * shear;
+    let current_yield = spec.yield_stress + spec.hardening_modulus * old.equivalent_plastic_strain;
+    // Elastic d_eps_zz eliminating sigma_zz; the old.sigma[2] term keeps
+    // any converged fixed-point residual from accumulating across steps.
+    let elastic_dzz =
+        -(lambda * (strain_increment[0] + strain_increment[1]) + old.sigma[2]) / zz_stiffness;
+    let trial_at = |d_eps_zz: f64| {
+        let mut trial = old.sigma;
+        trial[0] += zz_stiffness * strain_increment[0] + lambda * (strain_increment[1] + d_eps_zz);
+        trial[1] += zz_stiffness * strain_increment[1] + lambda * (strain_increment[0] + d_eps_zz);
+        trial[2] += lambda * (strain_increment[0] + strain_increment[1]) + zz_stiffness * d_eps_zz;
+        trial[3] += shear * strain_increment[3];
+        trial
+    };
+
+    let mut d_eps_zz = elastic_dzz;
+    let mut sigma = old.sigma;
+    let mut equivalent_plastic_strain = old.equivalent_plastic_strain;
+    let mut elastic = false;
+    for _ in 0..PS_MAX_ITER {
+        let trial = trial_at(d_eps_zz);
+        let s_trial = deviator(&trial);
+        let q_trial = equivalent_stress(&s_trial);
+        if q_trial <= current_yield {
+            sigma = trial_at(elastic_dzz);
+            elastic = true;
+            break;
+        }
+        let delta_lambda = (q_trial - current_yield) / (3.0 * shear + spec.hardening_modulus);
+        let scale = 3.0 * shear * delta_lambda / q_trial;
+        let mut returned = trial;
+        for (sigma_i, s_i) in returned.iter_mut().zip(s_trial) {
+            *sigma_i -= scale * s_i;
+        }
+        sigma = returned;
+        equivalent_plastic_strain = old.equivalent_plastic_strain + delta_lambda;
+        if returned[2].abs() <= PS_TOL * current_yield {
+            break;
+        }
+        d_eps_zz -= returned[2] / zz_stiffness;
+    }
+    // ponytail: a non-converged fixed point (perfect plasticity at
+    // extreme nu is the known slow case) accepts the last iterate; the
+    // line-searched outer Newton still enforces equilibrium.
+    (sigma, equivalent_plastic_strain, elastic)
+}
+
+/// Embed a 3x3 in-plane `(xx, yy, xy)` matrix into the six-component
+/// order at slots `[0, 1, 3]`.
+fn embed_in_plane(d: &[[f64; 3]; 3]) -> [[f64; 6]; 6] {
+    let mut out = [[0.0; 6]; 6];
+    for (i, &si) in IN_PLANE_SLOTS.iter().enumerate() {
+        for (j, &sj) in IN_PLANE_SLOTS.iter().enumerate() {
+            out[si][sj] = d[i][j];
+        }
+    }
+    out
+}
+
+/// Plane-stress J2 return with the numerical consistent tangent.
+///
+/// The tangent is formed by three extra fixed-point returns per Gauss
+/// point: forward differences (h = 1e-9) of the returned in-plane stress
+/// with respect to the three in-plane strain components, symmetrized.
+/// Documented v1 choice — it preserves Newton's quadratic convergence in
+/// practice at a fraction of the derivation risk of the closed-form
+/// plane-stress algorithmic tangent (with its delta-lambda correction
+/// terms), which is the upgrade path.
+fn plane_stress_return(
+    spec: PlasticitySpec,
+    youngs_modulus: f64,
+    poisson_ratio: f64,
+    old: HistoryPoint,
+    strain_increment: &[f64; 6],
+) -> ReturnResult {
+    let (sigma, equivalent_plastic_strain, elastic) =
+        plane_stress_core(spec, youngs_modulus, poisson_ratio, old, *strain_increment);
+    let mut c = [[0.0f64; 3]; 3];
+    if !elastic {
+        let h = 1.0e-9;
+        for (j, &slot) in IN_PLANE_SLOTS.iter().enumerate() {
+            let mut perturbed = *strain_increment;
+            perturbed[slot] += h;
+            let (sigma_p, _, _) =
+                plane_stress_core(spec, youngs_modulus, poisson_ratio, old, perturbed);
+            for (i, &row_slot) in IN_PLANE_SLOTS.iter().enumerate() {
+                c[i][j] = (sigma_p[row_slot] - sigma[row_slot]) / h;
+            }
+        }
+        for &(i, j) in &[(0, 1), (0, 2), (1, 2)] {
+            let average = 0.5 * (c[i][j] + c[j][i]);
+            c[i][j] = average;
+            c[j][i] = average;
+        }
+    } else {
+        c = d_matrix(youngs_modulus, poisson_ratio);
+    }
+    ReturnResult {
+        sigma,
+        equivalent_plastic_strain,
+        tangent: embed_in_plane(&c),
+    }
+}
+
 fn element_points(
     model: &Model,
     element: &crate::Element,
@@ -199,7 +346,7 @@ fn element_points(
     let invalid =
         |message: &str| SolveError::InvalidModel(format!("element {}: {message}", element.id));
     match element.kind {
-        ElemKind::Cpe4 => {
+        ElemKind::Cpe4 | ElemKind::Cps4 => {
             let coords: [[f64; 2]; 4] = core::array::from_fn(|i| {
                 let coordinates = model.mesh.nodes[node_idx[i]].coords;
                 [coordinates[0], coordinates[1]]
@@ -218,7 +365,7 @@ fn element_points(
             }
             Ok(out)
         }
-        ElemKind::Cpe8 => {
+        ElemKind::Cpe8 | ElemKind::Cps8 => {
             let coords: [[f64; 2]; 8] = core::array::from_fn(|i| {
                 let coordinates = model.mesh.nodes[node_idx[i]].coords;
                 [coordinates[0], coordinates[1]]
@@ -279,12 +426,22 @@ fn element_points(
                 weight: determinant.abs() / 6.0,
             }])
         }
-        ElemKind::Cps3 | ElemKind::Cps4 | ElemKind::Cps8 | ElemKind::B31 => {
-            Err(SolveError::InvalidModel(format!(
-                "J2 plasticity is not yet supported for plane-stress kind {:?}",
-                element.kind
-            )))
+        ElemKind::Cps3 => {
+            let coords: [[f64; 2]; 3] = core::array::from_fn(|i| {
+                let coordinates = model.mesh.nodes[node_idx[i]].coords;
+                [coordinates[0], coordinates[1]]
+            });
+            let (b, two_a) =
+                cps3_b_matrix(&coords).ok_or_else(|| invalid("degenerate (zero-area) triangle"))?;
+            Ok(vec![IntegrationPoint {
+                b: b.iter().map(|r| r.to_vec()).collect(),
+                weight: model.thickness * two_a.abs() / 2.0,
+            }])
         }
+        ElemKind::B31 => Err(SolveError::InvalidModel(format!(
+            "element {}: J2 plasticity is not supported for beam kind {:?}",
+            element.id, element.kind
+        ))),
     }
 }
 
@@ -298,6 +455,10 @@ fn build_elements(model: &Model, ndof: usize) -> Result<Vec<PlasticElem>, SolveE
             SolveError::InvalidModel(format!("no material for element {}", element.id))
         })?;
         let points = element_points(model, element, &info.node_idx)?;
+        let plane_stress = matches!(
+            element.kind,
+            ElemKind::Cps3 | ElemKind::Cps4 | ElemKind::Cps8
+        );
         let history = points
             .iter()
             .map(|_| HistoryPoint {
@@ -308,9 +469,14 @@ fn build_elements(model: &Model, ndof: usize) -> Result<Vec<PlasticElem>, SolveE
         out.push(PlasticElem {
             node_idx: info.node_idx.clone(),
             points,
-            d: d3_matrix(material.youngs_modulus, material.poisson_ratio),
+            d: if plane_stress {
+                embed_in_plane(&d_matrix(material.youngs_modulus, material.poisson_ratio))
+            } else {
+                d3_matrix(material.youngs_modulus, material.poisson_ratio)
+            },
             youngs_modulus: material.youngs_modulus,
             poisson_ratio: material.poisson_ratio,
+            plane_stress,
             history,
         });
     }
@@ -347,9 +513,16 @@ fn evaluate_with_tangent(
         let mut element_force = vec![0.0; element.node_idx.len() * ndof];
 
         for (point, old) in element.points.iter().zip(&element.history) {
+            // Plane elements carry three B rows (eps_xx, eps_yy,
+            // gamma_xy) in the in-plane slots; solids carry six in order.
+            let slots: &[usize] = if point.b.len() == 3 {
+                &IN_PLANE_SLOTS
+            } else {
+                &SOLID_SLOTS
+            };
             let mut strain = [0.0; 6];
-            for (b_row, strain_component) in point.b.iter().zip(strain.iter_mut()) {
-                *strain_component = b_row
+            for (r, b_row) in point.b.iter().enumerate() {
+                strain[slots[r]] = b_row
                     .iter()
                     .enumerate()
                     .map(|(column, b)| {
@@ -358,14 +531,24 @@ fn evaluate_with_tangent(
                     })
                     .sum();
             }
-            let returned = radial_return(
-                spec,
-                &element.d,
-                element.youngs_modulus,
-                element.poisson_ratio,
-                *old,
-                &strain,
-            );
+            let returned = if element.plane_stress {
+                plane_stress_return(
+                    spec,
+                    element.youngs_modulus,
+                    element.poisson_ratio,
+                    *old,
+                    &strain,
+                )
+            } else {
+                radial_return(
+                    spec,
+                    &element.d,
+                    element.youngs_modulus,
+                    element.poisson_ratio,
+                    *old,
+                    &strain,
+                )
+            };
             new_history.push(HistoryPoint {
                 sigma: returned.sigma,
                 equivalent_plastic_strain: returned.equivalent_plastic_strain,
@@ -376,9 +559,10 @@ fn evaluate_with_tangent(
                 returned.tangent
             };
 
-            for (a, force) in element_force.iter_mut().enumerate() {
-                for (b_row, sigma) in point.b.iter().zip(returned.sigma) {
-                    *force += point.weight * b_row[a] * sigma;
+            for (r, b_row) in point.b.iter().enumerate() {
+                let sigma_r = returned.sigma[slots[r]];
+                for (a, force) in element_force.iter_mut().enumerate() {
+                    *force += point.weight * b_row[a] * sigma_r;
                 }
             }
             for a in 0..element_force.len() {
@@ -387,7 +571,7 @@ fn evaluate_with_tangent(
                     for (r, b_row) in point.b.iter().enumerate() {
                         let mut db = 0.0;
                         for (k, b_k) in point.b.iter().enumerate() {
-                            db += tangent[r][k] * b_k[c];
+                            db += tangent[slots[r]][slots[k]] * b_k[c];
                         }
                         value += b_row[a] * db;
                     }
@@ -559,11 +743,6 @@ fn solve_targets(
 
     for &target in targets {
         let f_ext: Vec<f64> = f_full.iter().map(|value| value * target).collect();
-        let prescribed_delta = |u: &[f64], out: &mut Vec<f64>| {
-            for (row, value) in &prescribed_rows {
-                out[*row] = target * value - u[*row];
-            }
-        };
         let free_norm = |values: &[f64]| {
             values
                 .iter()
@@ -581,11 +760,22 @@ fn solve_targets(
         let mut residual = f64::NAN;
         let mut cond = 1.0;
         let mut converged: Option<Evaluation> = None;
+        // The candidate FULL increment for this target, measured from
+        // the committed state `u`; the element history stays frozen at
+        // the increment start until convergence.  Every Newton and
+        // line-search iterate is re-evaluated from that start, so the
+        // path-dependent return sees one clean strain path per
+        // increment — committing intermediate iterates would let an
+        // overshoot-and-correct cycle of the free dofs leave permanent
+        // plastic strain behind (visible as drift in quadratic
+        // elements).
+        let mut step_total = vec![0.0; u.len()];
         for iteration in 1..=opts.max_iterations {
             iterations = iteration;
-            let mut trial_step = vec![0.0; u.len()];
-            prescribed_delta(&u, &mut trial_step);
-            let ev = evaluate(model, ndof, &elements, &trial_step)?;
+            for (row, value) in &prescribed_rows {
+                step_total[*row] = target * value - u[*row];
+            }
+            let ev = evaluate(model, ndof, &elements, &step_total)?;
             if reference_norm == 0.0 {
                 reference_norm = free_norm(&f_ext).max(free_norm(&ev.f_int));
             }
@@ -621,12 +811,12 @@ fn solve_targets(
             let factorization = match Ldlt::factorize(&k) {
                 Ok(factorization) => factorization,
                 Err(_) => {
-                    // The closed-form consistent tangent is used whenever
-                    // it factors.  At a very large plastic increment its
+                    // The consistent tangent is used whenever it
+                    // factors.  At a very large plastic increment its
                     // strongly softened directional curvature can be
                     // indefinite; an elastic fallback direction is still a
                     // descent direction and preserves incrementation.
-                    let elastic = evaluate_with_tangent(model, ndof, &elements, &trial_step, true)?;
+                    let elastic = evaluate_with_tangent(model, ndof, &elements, &step_total, true)?;
                     let mut k = elastic.kt;
                     let mut rhs: Vec<f64> = f_ext
                         .iter()
@@ -645,25 +835,14 @@ fn solve_targets(
             for (row, _) in &prescribed_rows {
                 newton_step[*row] = 0.0;
             }
-            let mut delta = vec![0.0; u.len()];
-            prescribed_delta(&u, &mut delta);
 
             let mut accepted: Option<(Vec<f64>, Evaluation)> = None;
             let mut alpha = 1.0;
             for _ in 0..13 {
-                let trial: Vec<f64> = newton_step
+                let trial: Vec<f64> = step_total
                     .iter()
-                    .enumerate()
-                    .map(|(row, value)| {
-                        if prescribed_rows
-                            .iter()
-                            .any(|(prescribed, _)| *prescribed == row)
-                        {
-                            delta[row]
-                        } else {
-                            alpha * value
-                        }
-                    })
+                    .zip(&newton_step)
+                    .map(|(total, value)| total + alpha * value)
                     .collect();
                 let trial_ev = evaluate(model, ndof, &elements, &trial)?;
                 let norm = reference_norm;
@@ -681,15 +860,10 @@ fn solve_targets(
                 }
                 alpha *= 0.5;
             }
-            let Some((trial, trial_ev)) = accepted else {
+            let Some((trial, _)) = accepted else {
                 break;
             };
-            for (u_i, trial_i) in u.iter_mut().zip(trial) {
-                *u_i += trial_i;
-            }
-            for (element, history) in elements.iter_mut().zip(&trial_ev.history) {
-                element.history = history.clone();
-            }
+            step_total = trial;
         }
 
         let Some(ev) = converged else {
@@ -698,6 +872,12 @@ fn solve_targets(
                 residual,
             });
         };
+        for (u_i, step_i) in u.iter_mut().zip(&step_total) {
+            *u_i += step_i;
+        }
+        for (element, history) in elements.iter_mut().zip(&ev.history) {
+            element.history = history.clone();
+        }
         frames.push(NlFrame {
             load_fraction: target,
             solution: stress_solution(
@@ -1024,12 +1204,11 @@ mod tests {
     }
 
     #[test]
-    fn plane_stress_is_explicitly_rejected() {
+    fn b31_plasticity_is_rejected() {
         let mut model = cube(YIELD);
-        model.mesh.elements[0].kind = ElemKind::Cps4;
-        model.mesh.elements[0].connectivity.truncate(4);
-        model.boundary_conditions[2].dofs = vec![2];
-        model.boundary_conditions[3].dofs = vec![2];
+        model.mesh.elements[0].kind = ElemKind::B31;
+        model.mesh.elements[0].connectivity.truncate(2);
+        model.beam_sections = vec![("all".into(), 1.0, 1.0)];
         match solve_displacement_path(
             &model,
             &NlOptions::default(),
@@ -1041,9 +1220,402 @@ mod tests {
             }],
         ) {
             Err(SolveError::InvalidModel(message)) => {
-                assert!(message.contains("plane-stress"), "{message}")
+                assert!(message.contains("B31"), "{message}")
             }
             other => panic!("expected InvalidModel, got {other:?}"),
+        }
+    }
+
+    /// Single-element (or two-triangle) plane models under uniaxial
+    /// displacement control: ux fixed on x=0, ux prescribed on x=1,
+    /// uy fixed on y=0 only, so sigma_yy = 0 settles on the free edge.
+    fn plane_model(
+        yield_stress: f64,
+        coords: &[[f64; 2]],
+        elements: Vec<(ElemKind, Vec<u32>)>,
+        fixed_x: &[u32],
+        prescribed_x: &[u32],
+        fixed_y: &[u32],
+    ) -> Model {
+        let count = elements.len() as u32;
+        Model {
+            mesh: crate::Mesh {
+                nodes: coords
+                    .iter()
+                    .enumerate()
+                    .map(|(index, xy)| crate::Node {
+                        id: index as u32 + 1,
+                        coords: [xy[0], xy[1], 0.0],
+                    })
+                    .collect(),
+                elements: elements
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, (kind, connectivity))| crate::Element {
+                        id: index as u32 + 1,
+                        kind,
+                        connectivity,
+                    })
+                    .collect(),
+            },
+            thickness: 1.0,
+            materials: vec![Material {
+                name: "steel".into(),
+                youngs_modulus: E,
+                poisson_ratio: NU,
+            }],
+            elsets: vec![ElementSet {
+                name: "all".into(),
+                element_ids: (1..=count).collect(),
+            }],
+            mat_assignments: vec![("all".into(), "steel".into())],
+            boundary_conditions: vec![
+                BoundaryCondition {
+                    node_ids: fixed_x.to_vec(),
+                    dofs: vec![1],
+                },
+                BoundaryCondition {
+                    node_ids: prescribed_x.to_vec(),
+                    dofs: vec![1],
+                },
+                BoundaryCondition {
+                    node_ids: fixed_y.to_vec(),
+                    dofs: vec![2],
+                },
+            ],
+            plasticity: Some(PlasticitySpec {
+                yield_stress,
+                hardening_modulus: HARDENING,
+            }),
+            ..Model::default()
+        }
+    }
+
+    fn uniaxial_prescribed(nodes: &[u32]) -> Vec<PrescribedDof> {
+        nodes
+            .iter()
+            .map(|&node_id| PrescribedDof {
+                node_id,
+                dof: 1,
+                value: 1.0,
+            })
+            .collect()
+    }
+
+    fn solve_last_von_mises(model: &Model, target: f64, prescribed: &[PrescribedDof]) -> f64 {
+        let factors = (1..=20)
+            .map(|increment| target * increment as f64 / 20.0)
+            .collect::<Vec<_>>();
+        let frames =
+            solve_displacement_path(model, &NlOptions::default(), &factors, prescribed).unwrap();
+        frames.last().unwrap().solution.von_mises[0]
+    }
+
+    fn plane_stress_return_for(
+        spec: PlasticitySpec,
+        old: HistoryPoint,
+        strain: [f64; 6],
+    ) -> ReturnResult {
+        plane_stress_return(spec, E, NU, old, &strain)
+    }
+
+    #[test]
+    fn plane_stress_return_stays_on_surface_with_zero_sigma_zz() {
+        let spec = PlasticitySpec {
+            yield_stress: YIELD,
+            hardening_modulus: HARDENING,
+        };
+        let mut old = HistoryPoint {
+            sigma: [0.0; 6],
+            equivalent_plastic_strain: 0.0,
+        };
+        // Load into yield, keep loading with shear, unload (elastic),
+        // then reload past yield again: every plastic step must sit on
+        // sigma_zz = 0 and on the hardened surface.
+        let steps = [
+            [0.002, -0.0003, 0.0, 0.001, 0.0, 0.0],
+            [0.0012, -0.0002, 0.0, -0.0007, 0.0, 0.0],
+            [-0.0015, 0.0003, 0.0, 0.0002, 0.0, 0.0],
+            [0.0035, -0.0005, 0.0, -0.0018, 0.0, 0.0],
+        ];
+        for (step, strain) in steps.iter().enumerate() {
+            let returned = plane_stress_return_for(spec, old, *strain);
+            let plastic = returned.equivalent_plastic_strain > old.equivalent_plastic_strain;
+            old = HistoryPoint {
+                sigma: returned.sigma,
+                equivalent_plastic_strain: returned.equivalent_plastic_strain,
+            };
+            assert!(
+                returned.sigma[2].abs() <= 1.0e-8 * YIELD,
+                "step {step}: sigma_zz={:.3e}",
+                returned.sigma[2]
+            );
+            assert_eq!(returned.sigma[4], 0.0);
+            assert_eq!(returned.sigma[5], 0.0);
+            let surface = YIELD + HARDENING * returned.equivalent_plastic_strain;
+            let actual = von_mises(&returned.sigma);
+            if plastic {
+                assert!(
+                    (actual - surface).abs() <= 1.0e-8 * surface,
+                    "step {step}: von Mises={actual:.9e}, surface={surface:.9e}"
+                );
+            } else {
+                assert!(
+                    actual <= surface * (1.0 + 1.0e-8),
+                    "step {step}: {actual:.9e}"
+                );
+            }
+        }
+        assert!(old.equivalent_plastic_strain > 0.0);
+    }
+
+    #[test]
+    fn plane_stress_return_tangent_matches_finite_difference() {
+        let spec = PlasticitySpec {
+            yield_stress: YIELD,
+            hardening_modulus: HARDENING,
+        };
+        // Elastic: the tangent is the plane-stress elastic matrix.
+        let elastic = plane_stress_return_for(
+            spec,
+            HistoryPoint {
+                sigma: [0.0; 6],
+                equivalent_plastic_strain: 0.0,
+            },
+            [0.0002, -0.00005, 0.0, 0.00003, 0.0, 0.0],
+        );
+        let d = d_matrix(E, NU);
+        for (i, &si) in IN_PLANE_SLOTS.iter().enumerate() {
+            for (j, &sj) in IN_PLANE_SLOTS.iter().enumerate() {
+                assert!(
+                    (elastic.tangent[si][sj] - d[i][j]).abs() <= 1.0e-9 * d[i][j].abs().max(1.0),
+                    "C[{si}][{sj}]={}",
+                    elastic.tangent[si][sj]
+                );
+            }
+        }
+
+        // Plastic: central differences of the return map (the shipped
+        // tangent itself uses forward differences, h = 1e-9).
+        let old = HistoryPoint {
+            sigma: [1.0e8, 2.0e7, 0.0, 3.0e7, 0.0, 0.0],
+            equivalent_plastic_strain: 0.0004,
+        };
+        let strain = [0.0008, -0.0002, 0.0, 0.0005, 0.0, 0.0];
+        let returned = plane_stress_return_for(spec, old, strain);
+        let h = 1.0e-9;
+        for &slot in IN_PLANE_SLOTS.iter() {
+            let mut forward = strain;
+            let mut backward = strain;
+            forward[slot] += h;
+            backward[slot] -= h;
+            let plus = plane_stress_return_for(spec, old, forward);
+            let minus = plane_stress_return_for(spec, old, backward);
+            for &row in IN_PLANE_SLOTS.iter() {
+                let finite_difference = (plus.sigma[row] - minus.sigma[row]) / (2.0 * h);
+                assert!(
+                    (finite_difference - returned.tangent[row][slot]).abs()
+                        < 1.0e-3 * returned.tangent[row][slot].abs().max(1.0),
+                    "C[{row}][{slot}]={} vs fd={finite_difference}",
+                    returned.tangent[row][slot]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cps4_uniaxial_displacement_control_follows_elastic_plastic_curve() {
+        let model = plane_model(
+            YIELD,
+            &[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            vec![(ElemKind::Cps4, vec![1, 2, 3, 4])],
+            &[1, 4],
+            &[2, 3],
+            &[1, 2],
+        );
+        let prescribed = uniaxial_prescribed(&[2, 3]);
+        let tangent = E * HARDENING / (E + HARDENING);
+        let cases = [
+            (0.0003, E * 0.0003),
+            (0.001, YIELD + tangent * (0.001 - YIELD / E)),
+            (0.002, YIELD + tangent * (0.002 - YIELD / E)),
+        ];
+        for (strain, expected) in cases {
+            let actual = solve_last_von_mises(&model, strain, &prescribed);
+            eprintln!(
+                "J2 CPS4: eps={strain:.6}, sigma={actual:.6e} Pa, expected={expected:.6e} Pa"
+            );
+            assert!(
+                (actual - expected).abs() / expected < 0.015,
+                "eps={strain}, sigma={actual:.6e}, expected={expected:.6e}"
+            );
+        }
+    }
+
+    #[test]
+    fn cps3_and_cps8_match_the_plane_stress_uniaxial_curve() {
+        let tangent = E * HARDENING / (E + HARDENING);
+        let expected = YIELD + tangent * (0.002 - YIELD / E);
+        let cases = [
+            (
+                plane_model(
+                    YIELD,
+                    &[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+                    vec![
+                        (ElemKind::Cps3, vec![1, 2, 3]),
+                        (ElemKind::Cps3, vec![1, 3, 4]),
+                    ],
+                    &[1, 4],
+                    &[2, 3],
+                    &[1, 2],
+                ),
+                "CPS3",
+                uniaxial_prescribed(&[2, 3]),
+            ),
+            (
+                plane_model(
+                    YIELD,
+                    &[
+                        [0.0, 0.0],
+                        [1.0, 0.0],
+                        [1.0, 1.0],
+                        [0.0, 1.0],
+                        [0.5, 0.0],
+                        [1.0, 0.5],
+                        [0.5, 1.0],
+                        [0.0, 0.5],
+                    ],
+                    vec![(ElemKind::Cps8, (1..=8).collect())],
+                    &[1, 4, 8],
+                    &[2, 3, 6],
+                    &[1, 2, 5],
+                ),
+                "CPS8",
+                uniaxial_prescribed(&[2, 3, 6]),
+            ),
+        ];
+        for (model, name, loaded) in cases {
+            let factors: Vec<f64> = (1..=20)
+                .map(|increment| 0.002 * increment as f64 / 20.0)
+                .collect();
+            let frames =
+                solve_displacement_path(&model, &NlOptions::default(), &factors, &loaded).unwrap();
+            if name == "CPS8" {
+                eprintln!(
+                    "{name} final u: {:?}",
+                    frames.last().unwrap().solution.displacements
+                );
+                eprintln!(
+                    "{name} residual: {}",
+                    frames.last().unwrap().solution.final_residual
+                );
+            }
+            let actual = frames.last().unwrap().solution.von_mises[0];
+            assert!(
+                (actual - expected).abs() / expected < 0.015,
+                "{name}: sigma={actual:.6e}, expected={expected:.6e}"
+            );
+        }
+    }
+
+    #[test]
+    fn cps4_unload_path_reaches_zero_stress() {
+        let model = plane_model(
+            YIELD,
+            &[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            vec![(ElemKind::Cps4, vec![1, 2, 3, 4])],
+            &[1, 4],
+            &[2, 3],
+            &[1, 2],
+        );
+        let prescribed = uniaxial_prescribed(&[2, 3]);
+        let loaded_sigma = solve_last_von_mises(&model, 0.002, &prescribed);
+        let permanent_set = (loaded_sigma - YIELD) / HARDENING;
+        let mut factors = (1..=20)
+            .map(|increment| 0.002 * increment as f64 / 20.0)
+            .collect::<Vec<_>>();
+        factors.extend(
+            (1..=20).map(|increment| 0.002 + (permanent_set - 0.002) * increment as f64 / 20.0),
+        );
+        let frames =
+            solve_displacement_path(&model, &NlOptions::default(), &factors, &prescribed).unwrap();
+        assert!(
+            (frames[19].solution.von_mises[0] - 1.2909090909e8).abs() < 1.0e6,
+            "loaded sigma={:.9e}",
+            frames[19].solution.von_mises[0]
+        );
+        let last = frames.last().unwrap();
+        assert!(
+            last.solution.von_mises[0] < 1.0e-3 * YIELD,
+            "residual sigma={:.6e}",
+            last.solution.von_mises[0]
+        );
+        assert!(last.solution.final_residual < 1.0e-6);
+    }
+
+    #[test]
+    fn plane_shear_plasticity_matches_gh_over_3g_plus_h() {
+        // Homogeneous pure shear imposed by full Dirichlet: ux = g/2*y,
+        // uy = g/2*x (the symmetric split of the engineering shear g).
+        // The state sigma = (0, 0, 0, tau) is then exact for both plane
+        // stress and plane strain, with tau(g) = G*g while elastic and
+        // slope G*H/(3G + H) after yield — q = sqrt(3)*tau = sigma_y +
+        // H*p and g = tau/G + sqrt(3)*p.
+        let shear = E / (2.0 * (1.0 + NU));
+        let sqrt3 = (3.0f64).sqrt();
+        let plastic =
+            |gamma: f64| (gamma + sqrt3 * YIELD / HARDENING) / (1.0 / shear + 3.0 / HARDENING);
+        let cases = [
+            (2.0e-4, shear * 2.0e-4),
+            (1.5e-3, plastic(1.5e-3)),
+            (3.0e-3, plastic(3.0e-3)),
+        ];
+        for kind in [ElemKind::Cps4, ElemKind::Cpe4] {
+            let mut model = plane_model(
+                YIELD,
+                &[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+                vec![(kind, vec![1, 2, 3, 4])],
+                &[1, 2],
+                &[3, 4],
+                &[1, 4],
+            );
+            // uy = gamma/2 on the right edge too (full Dirichlet).
+            model.boundary_conditions.push(BoundaryCondition {
+                node_ids: vec![2, 3],
+                dofs: vec![2],
+            });
+            let prescribed = [
+                PrescribedDof {
+                    node_id: 3,
+                    dof: 1,
+                    value: 0.5,
+                },
+                PrescribedDof {
+                    node_id: 4,
+                    dof: 1,
+                    value: 0.5,
+                },
+                PrescribedDof {
+                    node_id: 2,
+                    dof: 2,
+                    value: 0.5,
+                },
+                PrescribedDof {
+                    node_id: 3,
+                    dof: 2,
+                    value: 0.5,
+                },
+            ];
+            for (gamma, tau) in cases {
+                let actual = solve_last_von_mises(&model, gamma, &prescribed) / sqrt3;
+                eprintln!(
+                    "J2 shear {kind:?}: gamma={gamma:.6}, tau={actual:.6e}, expected={tau:.6e}"
+                );
+                assert!(
+                    (actual - tau).abs() / tau < 0.01,
+                    "{kind:?}: gamma={gamma}, tau={actual:.6e}, expected={tau:.6e}"
+                );
+            }
         }
     }
 }

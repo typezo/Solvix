@@ -85,14 +85,10 @@ pub(crate) enum CentroidB {
     },
 }
 
-/// CPS3 stiffness. Returns `None` for a zero-area (degenerate) triangle.
-/// Works for either node ordering: the barycentric identity behind `B`
-/// holds with the signed area, and the integral uses `|A|`.
-pub(crate) fn cps3_stiffness(
-    coords: &[[f64; 2]; 3],
-    d: &[[f64; 3]; 3],
-    t: f64,
-) -> Option<([[f64; 6]; 6], CentroidB)> {
+/// CPS3 constant strain-displacement matrix (3x6) and the signed 2*area.
+/// `None` for a zero-area (degenerate) triangle. Works for either node
+/// ordering (barycentric identity holds with the signed area).
+pub(crate) fn cps3_b_matrix(coords: &[[f64; 2]; 3]) -> Option<([[f64; 6]; 3], f64)> {
     let b = [
         coords[1][1] - coords[2][1],
         coords[2][1] - coords[0][1],
@@ -115,6 +111,18 @@ pub(crate) fn cps3_stiffness(
         bm[2][2 * i] = c[i] * inv;
         bm[2][2 * i + 1] = b[i] * inv;
     }
+    Some((bm, two_a))
+}
+
+/// CPS3 stiffness. Returns `None` for a zero-area (degenerate) triangle.
+/// Works for either node ordering: the barycentric identity behind `B`
+/// holds with the signed area, and the integral uses `|A|`.
+pub(crate) fn cps3_stiffness(
+    coords: &[[f64; 2]; 3],
+    d: &[[f64; 3]; 3],
+    t: f64,
+) -> Option<([[f64; 6]; 6], CentroidB)> {
+    let (bm, two_a) = cps3_b_matrix(coords)?;
     let mut ke = [[0.0; 6]; 6];
     btdb(&mut ke, &bm, d, t * two_a.abs() / 2.0);
     Some((ke, CentroidB::Tri(bm)))
